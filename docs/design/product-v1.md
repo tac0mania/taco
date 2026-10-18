@@ -13,7 +13,7 @@ the two profiles (`text` and `logs`).
 | Machines | macOS (ARM, x86), Linux (x86, ARM), Windows (x86). The user installs nothing except a normal GPU driver. |
 | Large files | Streaming: memory does not grow with the file size. Many blocks in parallel. |
 | Format | Container version 2 frozen. Every later version reads version 2. |
-| Models | `text` and `logs` model files, with hashes. A model file is never changed after release. |
+| Models | `text` and `logs` model files, with hashes. A model file is never changed after release. The converter is exact, so anyone can make the identical file again from the published inputs (ADR 0014). |
 | Usability | Clear errors, progress output, `taco --version`, man page, README with the measured benchmark. |
 | Release | Signed binaries for each platform, a changelog, a licence. |
 
@@ -34,6 +34,7 @@ the two profiles (`text` and `logs`).
 | 11 | Profiles in the CLI (`--profile text|logs|auto`), model files found by hash | 5, 8 | 1 day |
 | 12 | Builds and tests on all platforms (CI), cross-machine check on 3 or more machines | 9 | 2 days |
 | 13 | Packaging: binaries, model distribution, docs, benchmark page | 12 | 2 days |
+| 14 | **Exact model conversion (ADR 0014, owner requirement)**: weights, scales and tables in exact arithmetic; the same model file on every machine; self-check of the hash | — | 3 to 6 hours |
 
 Total: about 3 to 4 weeks of agent time, with several items in parallel (est.).
 

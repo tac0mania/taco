@@ -126,6 +126,10 @@ finished (best float val 0.217 bits per byte), but the model was lost with the V
 the free tier for long jobs. Keep job outputs on a machine we control. Next: wire the logs profile into fold/unfold (ADR 0010, 0012), then
 speculative decoding and the skip rule, then the number/field model for logs.
 
+**Owner requirement (ADR 0014, 2026-10-19, important):** model conversion must be exact and
+give the same model file on every machine. The current converter uses floats; it gave the same
+hash on the Mac and devbox, but that is not guaranteed. Implement ADR 0014 before version 1.
+
 ## 5. Next steps, in order
 
 1. **Phase 2 gate: passed** on 2026-10-18 (`docs/research/2026-10-18-cross-machine.md`). Run
