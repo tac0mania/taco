@@ -1,0 +1,187 @@
+//! Round trips of every input class of plan §11.2 through `fold` and `unfold`, with the tiny
+//! model of `common`.
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // Tests fail loudly.
+#![allow(clippy::print_stderr, clippy::cast_possible_truncation)] // Measurements, test data.
+
+mod common;
+
+use common::{ARABIC, CHINESE, CODE, ENGLISH, HINDI, JSON, LOGS, Rng, mixed, random_letters, tiny};
+use proptest::prelude::*;
+use taco::{BlockSize, FoldOptions, Folded, Threads, UnfoldOptions, fold, unfold};
+use taco_format::{HEADER_LEN, TABLE_ENTRY_LEN, worst_case_len};
+
+fn options(block_size: u32) -> FoldOptions {
+    FoldOptions::new().with_block_size(BlockSize::new(block_size).unwrap())
+}
+
+fn fold_with(data: &[u8], block_size: u32) -> Folded {
+    let t = tiny();
+    fold(&t.model, &t.tokenizer, data, &options(block_size)).unwrap()
+}
+
+/// Folds and unfolds `data`, checks the output and the growth bound, and gives the result.
+fn round_trip(data: &[u8], block_size: u32) -> Folded {
+    let t = tiny();
+    let folded = fold_with(data, block_size);
+    let restored = unfold(Some(&t.model), &folded.container, &UnfoldOptions::new()).unwrap();
+    assert_eq!(restored, data, "block size {block_size}");
+    let bound = worst_case_len(data.len() as u64, BlockSize::new(block_size).unwrap()).unwrap();
+    assert!(folded.container.len() as u64 <= bound);
+    assert_eq!(folded.stats.container_len, folded.container.len() as u64);
+    folded
+}
+
+/// Each class with the default block size and with small blocks (many blocks and restarts).
+fn check_class(data: &[u8]) {
+    for bs in [16 * 1024, 1000, 64, 7, 1] {
+        round_trip(data, bs);
+    }
+}
+
+#[test]
+fn empty_input_is_the_header_only() {
+    let f = round_trip(b"", 16 * 1024);
+    assert_eq!(f.container.len(), HEADER_LEN);
+    assert_eq!(f.stats.blocks, 0);
+}
+
+#[test]
+fn one_byte_round_trips_raw() {
+    for b in [0u8, b'a', 0xFF] {
+        let f = round_trip(&[b], 16 * 1024);
+        assert_eq!(f.stats.coded_blocks, 0);
+    }
+}
+
+#[test]
+fn english_round_trips_and_codes_smaller() {
+    let data = ENGLISH.repeat(8);
+    check_class(data.as_bytes());
+    let f = round_trip(data.as_bytes(), 16 * 1024);
+    assert_eq!(f.stats.coded_blocks, 1);
+    assert!(f.container.len() < data.len(), "{} >= {}", f.container.len(), data.len());
+    eprintln!(
+        "English: {} bytes -> {} bytes, {} tokens",
+        data.len(),
+        f.container.len(),
+        f.stats.tokens
+    );
+}
+
+#[test]
+fn other_languages_round_trip() {
+    for s in [HINDI, CHINESE, ARABIC] {
+        check_class(s.repeat(3).as_bytes());
+    }
+}
+
+#[test]
+fn code_json_and_logs_round_trip() {
+    for s in [CODE, JSON, LOGS] {
+        check_class(s.repeat(3).as_bytes());
+    }
+}
+
+#[test]
+fn repeated_text_round_trips() {
+    check_class(b"dasdasdasdada");
+    check_class("dasdasdasdada".repeat(100).as_bytes());
+}
+
+#[test]
+fn random_letters_round_trip() {
+    check_class(&random_letters(5, 3000));
+}
+
+#[test]
+fn random_bytes_are_stored_raw() {
+    let data = Rng::new(9).bytes(40_000);
+    let f = round_trip(&data, 16 * 1024);
+    assert_eq!(f.stats.coded_blocks, 0);
+    // Plan §3 rule 6: the growth is the header and 5 bytes for each block only.
+    assert_eq!(f.container.len(), HEADER_LEN + TABLE_ENTRY_LEN * 3 + data.len());
+    check_class(&data[..3000]);
+}
+
+#[test]
+fn all_256_byte_values_round_trip() {
+    let all: Vec<u8> = (0..=255u8).collect();
+    check_class(&all);
+    let mut rev = all.clone();
+    rev.reverse();
+    check_class(&[all, rev].concat());
+}
+
+#[test]
+fn invalid_utf8_round_trips() {
+    let mut data = ENGLISH.as_bytes().to_vec();
+    for (i, b) in [(3, 0xFF), (40, 0xC3), (41, 0x28), (100, 0xED), (101, 0xA0), (102, 0x80)] {
+        data.insert(i, b);
+    }
+    check_class(&data);
+    // A UTF-8 character cut by a block boundary.
+    let s = CHINESE.repeat(4);
+    for bs in [2, 4, 5, 100] {
+        round_trip(s.as_bytes(), bs);
+    }
+}
+
+#[test]
+fn large_mixed_file_round_trips() {
+    let start = std::time::Instant::now();
+    let data = mixed(256 * 1024);
+    // PERF: the debug build of HardShell takes about 300 us for each step of the tiny model
+    // (measured: 126 s for this test with one thread; 3.8 s in a release build). Thus the test
+    // uses all threads of the machine. The output does not depend on the thread count.
+    let t = tiny();
+    let threads = Threads::available();
+    let f = fold(&t.model, &t.tokenizer, &data, &options(16 * 1024).with_threads(threads)).unwrap();
+    let uopts = UnfoldOptions::new().with_threads(threads);
+    assert_eq!(unfold(Some(&t.model), &f.container, &uopts).unwrap(), data);
+    assert!(f.stats.coded_blocks > 0);
+    assert!(f.stats.coded_blocks < f.stats.blocks);
+    let bound = worst_case_len(data.len() as u64, BlockSize::new(16 * 1024).unwrap()).unwrap();
+    assert!(f.container.len() as u64 <= bound);
+    eprintln!(
+        "mixed: {} bytes -> {} bytes, {} of {} blocks coded, {} tokens, {:?}",
+        data.len(),
+        f.container.len(),
+        f.stats.coded_blocks,
+        f.stats.blocks,
+        f.stats.tokens,
+        start.elapsed()
+    );
+}
+
+#[test]
+fn output_is_the_same_for_one_and_many_threads() {
+    let t = tiny();
+    let data = mixed(12 * 1024);
+    let one = fold(&t.model, &t.tokenizer, &data, &options(1024)).unwrap();
+    assert_eq!(one.stats.blocks, 12);
+    for n in [2, 3, 8] {
+        let opts = options(1024).with_threads(Threads::new(n).unwrap());
+        let many = fold(&t.model, &t.tokenizer, &data, &opts).unwrap();
+        assert_eq!(many, one, "{n} threads");
+        let uopts = UnfoldOptions::new().with_threads(Threads::new(n).unwrap());
+        assert_eq!(unfold(Some(&t.model), &one.container, &uopts).unwrap(), data);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    #[test]
+    fn fuzz_bytes_round_trip(
+        data in proptest::collection::vec(any::<u8>(), 0..400),
+        bs in 1u32..300,
+    ) {
+        round_trip(&data, bs);
+    }
+
+    #[test]
+    fn fuzz_text_round_trips(s in "[a-z ,.'\n]{0,300}|\\PC{0,120}", bs in 1u32..200) {
+        round_trip(s.as_bytes(), bs);
+    }
+}

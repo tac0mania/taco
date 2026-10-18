@@ -782,6 +782,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "taco"
+version = "0.1.0"
+dependencies = [
+ "hardshell",
+ "proptest",
+ "serde_json",
+ "sha2",
+ "taco-coder",
+ "taco-format",
+ "thiserror",
+]
+
+[[package]]
 name = "taco-coder"
 version = "0.1.0"
 dependencies = [
