@@ -87,6 +87,19 @@ Owner requirements for speed work: users install nothing except a normal GPU dri
 NVIDIA, Intel and Apple GPUs must work; kernels are one op each (design in
 `docs/design/anymodel.md`). Every fast path gives the same bits as the reference path.
 
+Owner decisions of 2026-10-18 evening (Rohit):
+
+- **Speed gate first.** Build a CUDA backend for NVIDIA (`crates/hardshell-cuda`, int8 tensor
+  cores, kernels precompiled, the driver only at run time). Gate: GPT-2 small at 10,000 tokens/s
+  or more on the RTX 3060 (batched decode), bit-identical to the CPU. If it fails, stop and
+  rethink before more model work. First portable GPU result (GL on D3D12 in WSL, measured): 106,
+  751, 1,311 and 1,166 tokens/s at batch 1, 8, 32 and 128.
+- **Then Route A on the RTX 3060:** fine-tune distilgpt2 (GPT-2 architecture, 82M) on Loghub
+  logs, convert it with `tools/convert`, and measure on log systems that the model did not see
+  in training, and on English-heavy lines. PyTorch in `tools/` is permitted for this.
+- Later ideas for speed (not started): speculative decoding with the match model, a skip of the
+  model for very confident tokens, small specialist models (5M to 20M).
+
 ## 5. Next steps, in order
 
 1. **Phase 2 gate: passed** on 2026-10-18 (`docs/research/2026-10-18-cross-machine.md`). Run
