@@ -1,0 +1,22 @@
+# GPT-2 small model files for the phase 0 and phase 1 baseline (plan §6, §12).
+# The files are not committed. `python -m baseline.fetch` downloads them to tools/data/model
+# and checks the SHA-256 and the size below (measured on 2026-10-18).
+
+[source]
+base_url = "https://huggingface.co/openai-community/gpt2/resolve/main/"
+licence = "MIT (published)"
+
+[[file]]
+name = "model.safetensors"
+size = 548105171
+sha256 = "248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707"
+
+[[file]]
+name = "vocab.json"
+size = 1042301
+sha256 = "196139668be63f3b5d6574427317ae82f612a97c5d1cdaf36ed2256dbf636783"
+
+[[file]]
+name = "merges.txt"
+size = 456318
+sha256 = "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5"

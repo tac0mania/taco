@@ -1,0 +1,189 @@
+# Quality corpus for the phase 0 and phase 1 baseline (plan §11.2, §12).
+# The files are not committed. `python -m baseline.fetch` downloads them to tools/data/corpus
+# and checks the SHA-256 and the size (measured on 2026-10-18).
+#
+# `offset` is the first byte that the measurement uses. For Gutenberg files it is the byte after
+# the "*** START OF THE PROJECT GUTENBERG EBOOK" line, so the English licence header is not
+# measured. The measurement uses `cap` bytes from `offset` (or fewer, if the file is shorter).
+#
+# NOTE: corpus.canterbury.ac.nz refused the download (HTTP 403 from a Cloudflare bot check) on
+# 2026-10-18. The Canterbury files come from a GitHub mirror. All 11 sizes agree with the
+# published Canterbury sizes. alice29.txt, asyoulik.txt, lcet10.txt and plrabn12.txt also have
+# the same SHA-256 as the copies in google/brotli tests/testdata (measured).
+# NOTE: Project Gutenberg has no Hindi text in Devanagari that a search found (2026-10-18).
+# Chinese is the third language.
+
+cap = 32768
+
+[[file]]
+name = "alice29.txt"
+source = "canterbury"
+class = "English prose"
+url = "https://raw.githubusercontent.com/pfalcon/canterbury-corpus/master/canterbury/alice29.txt"
+size = 152089
+sha256 = "7467306ee0feed4971260f3c87421154a05be571d944e9cb021a5713700c38f0"
+offset = 0
+
+[[file]]
+name = "asyoulik.txt"
+source = "canterbury"
+class = "English play"
+url = "https://raw.githubusercontent.com/pfalcon/canterbury-corpus/master/canterbury/asyoulik.txt"
+size = 125179
+sha256 = "eaa3526fe53859f34ecdf255712f9ecf0b2c903451d4755b2edaa2e2599cb0fc"
+offset = 0
+
+[[file]]
+name = "cp.html"
+source = "canterbury"
+class = "HTML"
+url = "https://raw.githubusercontent.com/pfalcon/canterbury-corpus/master/canterbury/cp.html"
+size = 24603
+sha256 = "e0cd21cef5b6c4069461e949be100080c3ce887de6f1dd8626c480528efaaf61"
+offset = 0
+
+[[file]]
+name = "fields.c"
+source = "canterbury"
+class = "C source"
+url = "https://raw.githubusercontent.com/pfalcon/canterbury-corpus/master/canterbury/fields.c"
+size = 11150
+sha256 = "85d73e354cc50cec76cb5a50537cf8dc035f8cbb8480f9e1cbe2f7d6c23393c7"
+offset = 0
+
+[[file]]
+name = "grammar.lsp"
+source = "canterbury"
+class = "Lisp source"
+url = "https://raw.githubusercontent.com/pfalcon/canterbury-corpus/master/canterbury/grammar.lsp"
+size = 3721
+sha256 = "1b0805dfc0ae706b35aac2bb4e15f02485efd24dda5dbd29de7b2f84d1a88c15"
+offset = 0
+
+[[file]]
+name = "kennedy.xls"
+source = "canterbury"
+class = "Excel binary"
+url = "https://raw.githubusercontent.com/pfalcon/canterbury-corpus/master/canterbury/kennedy.xls"
+size = 1029744
+sha256 = "9af47239ca29dfe20e633f80bbbb9a4cc9783d0803d7b2b5626f42e4c3790420"
+offset = 0
+
+[[file]]
+name = "lcet10.txt"
+source = "canterbury"
+class = "English technical"
+url = "https://raw.githubusercontent.com/pfalcon/canterbury-corpus/master/canterbury/lcet10.txt"
+size = 426754
+sha256 = "5314ba1dbb03f471df88bec6cd120a938ef60d0fd3511c5c1dce61bf7463245f"
+offset = 0
+
+[[file]]
+name = "plrabn12.txt"
+source = "canterbury"
+class = "English poetry"
+url = "https://raw.githubusercontent.com/pfalcon/canterbury-corpus/master/canterbury/plrabn12.txt"
+size = 481861
+sha256 = "07e2e0b461af78c7c647cb53dab39de560198e16f799b4516eccf0fbd69f764c"
+offset = 0
+
+[[file]]
+name = "ptt5"
+source = "canterbury"
+class = "fax image (binary)"
+url = "https://raw.githubusercontent.com/pfalcon/canterbury-corpus/master/canterbury/ptt5"
+size = 513216
+sha256 = "0ec3a75089bb52342813496b17e51377bc9eba3cb519a444d67025354841d650"
+offset = 0
+
+[[file]]
+name = "sum"
+source = "canterbury"
+class = "SPARC executable"
+url = "https://raw.githubusercontent.com/pfalcon/canterbury-corpus/master/canterbury/sum"
+size = 38240
+sha256 = "ee5733cd76ecc2f9d8ff156adc3c02a7a851051dcf43a2d56ff4ee4ff606bdb3"
+offset = 0
+
+[[file]]
+name = "xargs.1"
+source = "canterbury"
+class = "man page"
+url = "https://raw.githubusercontent.com/pfalcon/canterbury-corpus/master/canterbury/xargs.1"
+size = 4227
+sha256 = "c58aeb5d2d1e12751d47e7412b45784405fc30a5671b03d480fa05776e183619"
+offset = 0
+
+[[file]]
+name = "pg22367.txt"
+source = "gutenberg"
+class = "German prose (Kafka, Die Verwandlung)"
+url = "https://www.gutenberg.org/cache/epub/22367/pg22367.txt"
+size = 145983
+sha256 = "359d3f5983c812393f4bd7ee49a350ffffc7d476015e58d6b84b6c848dd2b0e9"
+offset = 950
+
+[[file]]
+name = "pg4650.txt"
+source = "gutenberg"
+class = "French prose (Voltaire, Candide)"
+url = "https://www.gutenberg.org/cache/epub/4650/pg4650.txt"
+size = 234120
+sha256 = "1cc10ab3268a76aa01bd3f9722ae2ae0e5e36b869a18b0bb0832b75bc0327806"
+offset = 869
+
+[[file]]
+name = "pg24264.txt"
+source = "gutenberg"
+class = "Chinese prose (Hong Lou Meng)"
+url = "https://www.gutenberg.org/cache/epub/24264/pg24264.txt"
+size = 2663455
+sha256 = "ff1526996bf4b81807651921a85e5c1c0f1d1d123c9fa4553057ba6a3ec72011"
+offset = 828
+
+[[file]]
+name = "textwrap.py"
+local = "textwrap.py.txt"  # NOTE: a data suffix, so no tool treats the file as code.
+source = "github"
+class = "Python source"
+url = "https://raw.githubusercontent.com/python/cpython/v3.12.0/Lib/textwrap.py"
+size = 19718
+sha256 = "62867e40cdea6669b361f72af4d7daf0359f207c92cbeddfc7c7506397c1f31c"
+offset = 0
+
+[[file]]
+name = "option.rs"
+local = "option.rs.txt"  # NOTE: a data suffix, so no tool treats the file as code.
+source = "github"
+class = "Rust source"
+url = "https://raw.githubusercontent.com/rust-lang/rust/1.80.0/library/core/src/option.rs"
+size = 81530
+sha256 = "0f3bc56817f8f8cfd53ef8fefccf5c401b6fc313e0a84110242ac4395e089c54"
+offset = 0
+
+[[file]]
+name = "twitter.json"
+source = "github"
+class = "JSON (API output)"
+url = "https://raw.githubusercontent.com/miloyip/nativejson-benchmark/master/data/twitter.json"
+size = 631514
+sha256 = "a08b769f32b95f426cbc3abafcec65c1a19d3eb544d4ddf320eae142c99efc5d"
+offset = 0
+
+[[file]]
+name = "HDFS_2k.log"
+source = "loghub"
+class = "log lines (HDFS)"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/HDFS/HDFS_2k.log"
+size = 287848
+sha256 = "7c967000980c086ed55fa6544ba4f05fe66d44622795e890c68caf8bbb635035"
+offset = 0
+
+[[file]]
+name = "Apache_2k.log"
+source = "loghub"
+class = "log lines (Apache)"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/Apache/Apache_2k.log"
+size = 171239
+sha256 = "c7efa3eb686e3a96bd2f8f4457b2a7887e9cf2f3649327f1b4e87af841363ce8"
+offset = 0
