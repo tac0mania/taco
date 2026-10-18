@@ -9,7 +9,7 @@ This note records the phase 2 gate (plan §11.3, §12). `scripts/xcheck` ran it.
 - Each machine made its own `gpt2.hsm` with `python -m convert.gpt2 --recipe clip`. Both files
   have the SHA-256 `aaa03eb96e9ad7957432168c8ac6b4a99ed55d57e637e4786a664b51001ba5c2`
   (measured).
-- Nine inputs: English (4 KiB and 32 KiB), an HTML page, a server log, a German text, an
+- Nine inputs: English (4 KiB and 32 KiB), an HTML page, a server log, a Chinese text (Hong Lou Meng), an
   Excel file, 3,000 random bytes, `dasdasdasdada`, and an empty file.
 
 ## Results (all measured)

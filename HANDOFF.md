@@ -1,6 +1,6 @@
 # Taco: session handoff
 
-Written 2026-10-18 at about 15:00 +04, updated at about 16:30 +04 by the lead session (Claude). A new session or an agent
+Written 2026-10-18 at about 15:00 +04, updated at about 18:10 +04 by the lead session (Claude). A new session or an agent
 starts with no conversation context. This file is the context. Read it once from top to bottom.
 
 - **Lead (a new session):** read sections 1 to 6. Then do section 5 in order.
@@ -62,31 +62,46 @@ them yet.
 
 - **Mac** (Apple Silicon, 8 GB, about 16 GB free disk). All work of 2026-10-18 ran here with
   `scripts/mx`. The GPT-2 weights and the corpus are in `tools/data/` (537 MB, ignored by git).
-- **devbox** (Linux x86, RTX 3060 6 GB). Offline at 15:00. Rohit compacted the disk and frees
-  more disk now. `scripts/dx` refuses to run while Windows C: has less than 15 GB free. Do not
-  start Ubuntu or the keep-alive task without Rohit's approval.
+- **devbox** (Linux x86, RTX 3060 6 GB). Online again at 17:00. On 2026-10-18 the lead deleted
+  the Hippo build caches (about 60 GB) and the local AI images except Ollama (about 17 GB), on
+  Rohit's request. Linux uses 63 GB. Windows C: had 26 GB free, because the disk file shrinks
+  only after a compaction or with sparse mode (Rohit's decision; it stops devbox). The local AI
+  data volumes are kept. CUDA: no nvcc; NVRTC and the CUDA runtime exist as pip wheels in
+  `~/.cache/hippo/cuda` (Hippo's, read only). `scripts/dx` refuses to run while C: has less
+  than 15 GB free.
 
 ## 4. Running agents
 
-None at 16:30. Old status files are in `.agent-status/` (not committed).
+| Agent | Owns | Status file |
+|---|---|---|
+| simd | CPU speed: kernels, prefill (fold), batch (unfold) in `crates/hardshell`, calls in `crates/taco` | `.agent-status/simd.md` |
+| cuda (now the portable GPU agent) | `crates/hardshell-gpu` (wgpu and WGSL first; CUDA later with precompiled PTX), ADR 0008 | `.agent-status/cuda.md` |
+
+Owner requirements for speed work: users install nothing except a normal GPU driver; AMD,
+NVIDIA, Intel and Apple GPUs must work; kernels are one op each (design in
+`docs/design/anymodel.md`). Every fast path gives the same bits as the reference path.
 
 ## 5. Next steps, in order
 
-1. When devbox is back: run the cross-machine check. Run the golden tests on devbox
-   (`scripts/dx main cargo test --workspace`) and compare the hashes in section 2. Make
-   `gpt2.hsm` on devbox (`python -m convert.gpt2 --recipe clip`) and compare its hash. Fold
-   on the Mac, unfold on devbox, and the reverse. Then write `scripts/xcheck` (plan §11.3).
-   That is the phase 2 gate.
-2. Phase 1 part B (float drift, Mac against devbox): the commands are in §10 of
+1. **Phase 2 gate: passed** on 2026-10-18 (`docs/research/2026-10-18-cross-machine.md`). Run
+   `scripts/xcheck` again after every change to HardShell, the coder, the tokenizer or the
+   container. It takes about 40 minutes with the reference engine.
+2. Commit the simd and GPU work after each step when the agents report it ready. Run
+   `scripts/xcheck` before each HardShell commit.
+3. Logs (the first market): an integer match model and a mixer, so that Taco beats xz and zstd
+   by a wide margin on logs. Needs an ADR (it changes the prediction path).
+4. A zstd block kind for binary data (container change, ADR).
+5. Float survey of other models (anymodel M0): SmolLM, Qwen2.5 0.5B/1.5B, Llama 3.2 1B,
+   Nanbeige4.2-3B-Base. Gate: at least 10% better than GPT-2. Owner decisions are open:
+   PyTorch in `tools/`, the models, and the loss that starts a fine-tune.
+6. Phase 1 part B (float drift, Mac against devbox): commands in §10 of
    `docs/research/2026-10-18-phase0-baseline.md`.
-3. Phase 3 (quality): longer context (sliding window), the block size, an integer match model
-   and a mixer for repeated text (logs, JSON), and a block kind that stores a block with zstd
-   when GPT-2 is worse (binary data). The last two change the container format: each needs an
-   ADR.
-4. Phase 4 (speed): SIMD on the CPU, then integer CUDA kernels. Every fast path must give the
-   same bits as the reference path.
-5. A head-to-head benchmark against zstd --long, brotli, PPMd, paq8px and cmix (where memory
-   allows) on the same files, for the README.
+7. A head-to-head benchmark (zstd --long, brotli, PPMd, paq8px, cmix) for the README.
+
+Facts about Nanbeige4.2-3B (read from its GGUF header on devbox, measured): Apache-2.0,
+4,169,800,704 parameters, 22 blocks run 2 times (`num_loops = 2`), width 3,072, 48 heads and 8
+KV heads, context 262,144, SentencePiece-style vocabulary of 166,144 tokens. The file on devbox
+is the chat model in Q4_K_M. The base model is `Nanbeige/Nanbeige4.2-3B-Base`.
 
 ## 6. Notes
 
