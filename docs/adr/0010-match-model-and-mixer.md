@@ -1,6 +1,7 @@
 # ADR 0010: the match model and the mixer of the logs profile
 
-Date: 2026-10-18. Status: proposed (by the logs agent). Plan: §3, §4, §5.1, §7.6, §7.7, §9.
+Date: 2026-10-18. Status: accepted (proposed by the logs agent; the format rules of section 5
+were completed by the profile agent on 2026-10-19). Plan: §3, §4, §5.1, §7.6, §7.7, §9.
 Related: ADR 0006 and ADR 0007 (container and coded block), ADR 0011 (container version 2),
 ADR 0012 (the profiles `text` and `logs`).
 
@@ -116,23 +117,79 @@ The decoder does the same calls in the same order with the decoded token.
 
 ### 5. The format
 
-1. The part uses container version 2 (ADR 0011, ADR 0012). There is no separate version.
-2. The decoder needs these facts from the container, and no other facts:
-   1. The profile is `logs`, and the coding-part flags of the header have the bit "match model
-      and mixer".
-   2. The mixer rule version, one `u8`. Version 1 is sections 2 and 3. The rule version fixes
-      every constant, so the header has no free parameters. A reader refuses an unknown rule
-      version with a typed error.
-   3. For each coded block: whether the block uses the part (proposal below).
-3. Proposal for ADR 0011: a block kind "coded with the match part", next to the block kind
-   "coded" (GPT-2 alone). The encoder can then code a block both ways and keep the smaller
-   form. The cost is a second table and a second range coder in the encoder only, about
-   0.5 ms for each token (est., from the 0.53 ms of `from_weights` in ADR 0003). The decoder
-   does one of the two. With this rule, a block is never larger than with GPT-2 alone.
-4. A version 1 reader refuses a version 2 container (ADR 0006 section 2). A version 2 reader
-   reads version 1 containers with the rules of ADR 0007.
-5. New conformance vectors: the two golden hashes of `crates/taco-match/tests/golden.rs`, and
-   a container vector of the `logs` profile when ADR 0011 is in the code.
+These rules are part of container version 2 (ADR 0011). There is no separate version. A
+change to a rule of this section changes which files are valid, so it needs a new container
+version.
+
+1. **The coding part.** Bit 0 of the coding parts field (header offset 90, `u16`) is the
+   coding part "match model and mixer". The other 15 bits are reserved. A reader refuses a
+   reserved bit (`UnknownCodingParts`).
+2. **The mixer rule version.** Byte 0 of the coding parameters (header offset 92, `u8`) is
+   the mixer rule version when bit 0 is set. Version 1 is sections 2 and 3. The rule version
+   fixes every constant, so the header has no free parameter. A reader refuses an unknown
+   version, also 0 (`UnknownMixerRule`). When bit 0 is clear, byte 0 is 0. Bytes 1 to 11 of the
+   coding parameters (offsets 93 to 103) are 0. A reader refuses another value
+   (`ReservedNotZero`).
+3. **The profile.** The profile `text` (byte 0) has no coding part. A reader refuses bit 0
+   with the profile `text` (`CodingPartsNotInProfile`). The profile `logs` (byte 1) permits
+   bit 0, and also no coding part (for example ADR 0011 vector C, in the raw-only mode). The
+   decoder does not use the profile. It uses the coding parts and the block kinds.
+4. **The per-block choice is a block kind, not a flag.** Block kind 3 is "mixed": a block
+   coded with the match model and the mixer. Kind 1 (coded) stays "GPT-2 alone". Reasons:
+   1. The decoder must know the choice for each block. The block table already has a kind
+      byte for each block, so kind 3 costs no byte. A flag in the payload changes ADR 0007; a
+      flag in the header cannot be different for each block.
+   2. The encoder can code each block both ways and keep the smaller form (item 7). Thus a
+      `logs` container is never larger than the `text` container of the same input and block
+      size.
+   3. A coded block in a `logs` container decodes with no match tables (24 MiB less memory).
+5. **The rules of kind 3.** The stored bytes have the layout of a coded block
+   (`varint(token count) || range coder bytes`, ADR 0007 §1). The decoder refuses a mixed
+   block with the rules of ADR 0007 §4 (`CorruptBlock`). The parser refuses a mixed block:
+   1. in a version 1 container (`UnknownBlockKind`);
+   2. if the coding parts do not have bit 0 (`MixedWithoutCodingPart`);
+   3. in the raw-only mode (`CodedBlockInRawOnly`);
+   4. if it is not smaller than its original bytes (`CodedNotSmaller`). A mixed block of 0
+      bytes is valid, as a coded block of 0 bytes (ADR 0006 §6.4).
+   Thus the growth bound of ADR 0011 §8 does not change.
+6. **Decoding a mixed block.** The decoder makes a new match model and a new mixer of the rule
+   version of the header for each mixed block, and does the calls of section 4. The HardShell
+   weights are the weights of a coded block (ADR 0007 §3). The mixer state belongs to the
+   block, so the block can decode in any lane of a `Batch` (ADR 0013).
+7. **The encoder (rules that change the bytes, not the decoder).**
+   1. With the profile `logs`, the encoder codes each block with two range coders from the
+      same HardShell weights: GPT-2 alone and mixed. Each coder has the stop rule of ADR 0007
+      §5.2 with the stop length `min(original length, zstd length)`. The model stops when both
+      coders have stopped.
+   2. The selected form is the smallest of raw, zstd, coded and mixed. On a tie, the order is
+      raw, zstd, coded, mixed (`Block::choose_smallest(…).or_mixed(…)`). Mixed wins only if it
+      is strictly smaller than every other form. Coded wins a tie with mixed because it
+      decodes without the part.
+   3. A `logs` container has bit 0 and rule version 1 in its header, also if no block is
+      mixed.
+   4. The profile `text` codes GPT-2 alone. Its bytes are the bytes before this ADR (the
+      golden container `0b0ba3f1…7c07` does not change).
+8. **The profile `auto` (encoder only).** The encoder codes as `logs`. If no block is mixed, it
+   writes the `text` container: the same blocks, profile 0, no coding part. Else it writes the
+   `logs` container. Thus `auto` gives the smaller of the two containers, and `text` on a tie.
+   The rule depends only on the input, the model and the block size, so it is the same on
+   every machine and for every number of threads. A test checks both cases. The cost is the
+   cost of `logs` for every input.
+9. **Compatibility.** A version 1 reader refuses a version 2 container (ADR 0006 section 2). A
+   version 2 reader reads version 1 containers with the rules of ADR 0007. A reader of version 2
+   before this ADR refuses bit 0 (`UnknownCodingParts`) and kind 3 (`UnknownBlockKind`) with a
+   typed error. It never decodes a mixed block as a coded block.
+10. **Conformance vectors.**
+    - The two golden hashes of `crates/taco-match/tests/golden.rs` (section 6).
+    - Container vector D (`crates/taco-format/tests/golden.rs`): the data and model hash of
+      vector B, profile `logs`, bit 0, rule version 1, blocks raw, mixed (7 fixed bytes),
+      zstd, coded (0 bytes), mixed (0 bytes). 312 bytes, SHA-256
+      `69578bfc50bee4fa9f8a0eb6f09421ce4a64b1c48ec01e811cad3622eee95af0`. A hand-made copy of
+      the layout gives the same bytes.
+    - The `logs` golden container of the `taco` crate (`crates/taco/tests/logs_profile.rs`,
+      tiny model): 2,148 bytes in blocks of 512, kinds mixed, zstd, raw, zstd, coded.
+      1,328 bytes (the `text` container of the same input: 1,339 bytes), SHA-256
+      `7262257e6d2875ae393dd2474acc8a00dd1b8adf829eeef75b0ca719f73b55ec`.
 
 ### 6. Tests and equality of the Python copy
 
@@ -212,5 +269,8 @@ the JSON lines (0.157 bpb), and xz is smaller on OpenStack (random hex ids).
   vector. The tables are part of the format.
 - The match model and the mixer use 24 MiB for each block that runs at the same time.
 - `scripts/check-no-floats.sh` must add `taco-match` to its kernel list.
+- The memory of the decoder grows by 24 MiB for each mixed block that decodes at the same time
+  (up to 8 lanes for each thread). The tables are zeroed allocations, so only the used entries
+  cost resident memory.
 - The measurement keeps the GPT-2 context restarts at each 16 KiB step for all block sizes. A
   measurement of Taco with large blocks in the real code is still necessary.

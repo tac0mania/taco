@@ -35,6 +35,11 @@
 //!   threads.
 //! - The stored bytes of a coded block are the token count (a LEB128 varint), then the range
 //!   coder bytes (ADR 0007).
+//! - Profiles ([`FoldProfile`], ADR 0012): `text` codes with HardShell alone. `logs` also codes
+//!   each block with the match model and the mixer of `taco-match` between HardShell and the
+//!   frequency table (ADR 0010), and stores that form (block kind 3, "mixed") when it is
+//!   smaller. `auto` selects for the encoder. [`unfold`] reads the profile and the coding parts
+//!   from the header, so the caller never names a profile to decode.
 //!
 //! # Block size
 //!
@@ -60,6 +65,7 @@
 mod codec;
 mod error;
 mod fold;
+mod mix;
 mod parallel;
 mod payload;
 pub mod tokenizer;
@@ -67,11 +73,11 @@ mod unfold;
 
 pub use codec::FREQ_BITS;
 pub use error::{Result, TacoError};
-pub use fold::{FoldOptions, FoldStats, Folded, fold};
+pub use fold::{FoldOptions, FoldProfile, FoldStats, Folded, fold};
 pub use hardshell::TokenId;
 pub use hardshell::gpt2::Model;
 pub use parallel::Threads;
-pub use taco_format::{BlockSize, Checksum, ModelHash};
+pub use taco_format::{BlockSize, Checksum, ModelHash, Profile};
 pub use tokenizer::{MergeFault, Tokenizer};
 pub use unfold::{UnfoldOptions, unfold};
 

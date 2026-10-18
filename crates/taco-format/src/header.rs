@@ -2,12 +2,12 @@
 //! version 2, and the two checks that the caller does (model hash and checksum).
 //!
 //! The first 88 bytes have the same layout in both versions. Version 2 adds 16 bytes (ADR
-//! 0011 §2): the profile (ADR 0012) and the fields that ADR 0010 reserves for the coding parts
-//! of the `logs` profile.
+//! 0011 §2): the profile (ADR 0012) and the coding parts of the `logs` profile (ADR 0010 §5).
 
 use crate::error::{FormatError, Result};
 use crate::layout::{HEADER_LEN_V1_U64, expected_block_count, header_len};
-use crate::types::{BlockSize, Checksum, ModelHash, Profile};
+use crate::types::{BlockSize, Checksum, CodingParts, ModelHash, Profile};
+use crate::writer::ContainerParams;
 use crate::{HEADER_LEN, HEADER_LEN_V1, MAGIC, VERSION, VERSION_1};
 
 /// The length of the coding parameters field of the version 2 header, in bytes.
@@ -19,6 +19,8 @@ pub struct Header {
     /// INVARIANT: [`VERSION_1`] or [`VERSION`].
     version: u16,
     profile: Profile,
+    /// INVARIANT: [`CodingParts::NONE`] for version 1 and for the profile `text`.
+    coding: CodingParts,
     model_hash: ModelHash,
     original_len: u64,
     checksum: Checksum,
@@ -28,23 +30,23 @@ pub struct Header {
 }
 
 impl Header {
-    /// The header of version [`VERSION`] that the writer makes. The caller checked that
-    /// `block_count` is `ceil(original_len / block_size)`.
+    /// The header of version [`VERSION`] that the writer makes from `params`. The caller
+    /// checked that `block_count` is `ceil(original_len / params.block_size)`, and that the
+    /// profile permits the coding parts ([`check_profile`]).
     pub(crate) const fn new_v2(
-        profile: Profile,
-        model_hash: ModelHash,
+        params: &ContainerParams,
         original_len: u64,
         checksum: Checksum,
-        block_size: BlockSize,
         block_count: u32,
     ) -> Self {
         Self {
             version: VERSION,
-            profile,
-            model_hash,
+            profile: params.profile,
+            coding: params.coding,
+            model_hash: params.model_hash,
             original_len,
             checksum,
-            block_size,
+            block_size: params.block_size,
             block_count,
         }
     }
@@ -67,6 +69,13 @@ impl Header {
     #[must_use]
     pub const fn profile(&self) -> Profile {
         self.profile
+    }
+
+    /// The coding parts of the container (ADR 0010 §5): [`CodingParts::NONE`] for version 1
+    /// and for the profile `text`. A mixed block needs [`CodingParts::mixer`].
+    #[must_use]
+    pub const fn coding_parts(&self) -> CodingParts {
+        self.coding
     }
 
     /// The hash of the model that coded the blocks, or [`ModelHash::RAW_ONLY`].
@@ -149,7 +158,7 @@ impl Header {
     }
 
     /// Appends the header bytes to `out`: 88 bytes for version 1, 104 bytes for version 2.
-    /// The flags, the coding parts and the reserved fields are zero.
+    /// The flags and the reserved fields are zero.
     pub(crate) fn write(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&self.version.to_le_bytes());
@@ -162,8 +171,8 @@ impl Header {
         if self.version != VERSION_1 {
             out.push(self.profile.as_u8());
             out.push(0);
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&[0; CODING_PARAMS_LEN]);
+            out.extend_from_slice(&self.coding.bits().to_le_bytes());
+            out.extend_from_slice(&self.coding.params());
         }
     }
 
@@ -184,7 +193,7 @@ impl Header {
                 .split_first_chunk::<HEADER_LEN_V1>()
                 .ok_or(FormatError::LengthOverflow { part: "header field" })?;
             let mut header = read_common(version, common)?;
-            header.profile = read_v2_section(section)?;
+            (header.profile, header.coding) = read_v2_section(section)?;
             Ok((header, rest))
         }
     }
@@ -238,6 +247,7 @@ fn read_common(version: u16, bytes: &[u8; HEADER_LEN_V1]) -> Result<Header> {
     Ok(Header {
         version,
         profile: Profile::Text,
+        coding: CodingParts::NONE,
         model_hash,
         original_len,
         checksum,
@@ -246,9 +256,27 @@ fn read_common(version: u16, bytes: &[u8; HEADER_LEN_V1]) -> Result<Header> {
     })
 }
 
-/// Reads and checks the 16 bytes that version 2 adds (ADR 0011 §2): the profile, a reserved
-/// byte, the coding parts and the coding parameters. Gives the profile.
-fn read_v2_section(bytes: &[u8]) -> Result<Profile> {
+/// Refuses coding parts that the profile does not permit: the profile `text` has no coding
+/// parts (ADR 0012). The profile `logs` permits every defined part, and also none (for
+/// example a container in the raw-only mode).
+///
+/// # Errors
+///
+/// [`FormatError::CodingPartsNotInProfile`].
+pub(crate) fn check_profile(profile: Profile, coding: CodingParts) -> Result<()> {
+    match profile {
+        Profile::Text if !coding.is_none() => Err(FormatError::CodingPartsNotInProfile {
+            profile: profile.as_u8(),
+            parts: coding.bits(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Reads and checks the 16 bytes that version 2 adds (ADR 0011 §2, ADR 0010 §5): the profile,
+/// a reserved byte, the coding parts and the coding parameters. Gives the profile and the
+/// coding parts.
+fn read_v2_section(bytes: &[u8]) -> Result<(Profile, CodingParts)> {
     let mut rest = bytes;
     let [profile] = take::<1>(&mut rest)?;
     let profile = Profile::from_u8(profile).ok_or(FormatError::UnknownProfile { profile })?;
@@ -256,17 +284,13 @@ fn read_v2_section(bytes: &[u8]) -> Result<Profile> {
     if reserved != 0 {
         return Err(FormatError::ReservedNotZero { field: "reserved byte 89" });
     }
-    // NOTE: ADR 0010 (not accepted yet) defines the bits of the coding parts and the coding
-    // parameters. Until then, the reader refuses every bit that is not zero.
+    // ADR 0010 §5: bit 0 is the match model and the mixer, with the rule version in byte 0 of
+    // the coding parameters. Every other bit and byte is reserved and must be 0.
     let parts = u16::from_le_bytes(take(&mut rest)?);
-    if parts != 0 {
-        return Err(FormatError::UnknownCodingParts { parts });
-    }
     let params: [u8; CODING_PARAMS_LEN] = take(&mut rest)?;
-    if params != [0; CODING_PARAMS_LEN] {
-        return Err(FormatError::ReservedNotZero { field: "coding parameters" });
-    }
-    Ok(profile)
+    let coding = CodingParts::read(parts, &params)?;
+    check_profile(profile, coding)?;
+    Ok((profile, coding))
 }
 
 /// Checks the magic and the version, and gives the version. A reader refuses an unknown

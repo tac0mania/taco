@@ -1394,6 +1394,7 @@ dependencies = [
  "sha2",
  "taco-coder",
  "taco-format",
+ "taco-match",
  "thiserror",
 ]
 
@@ -1424,6 +1425,15 @@ dependencies = [
  "thiserror",
  "zstd-safe",
  "zstd-sys",
+]
+
+[[package]]
+name = "taco-match"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]

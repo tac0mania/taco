@@ -162,6 +162,12 @@ pub enum BlockKind {
     /// The stored bytes are one zstd frame (RFC 8878) of the original bytes. Kind byte 2.
     /// Version 2 and later only (ADR 0011).
     Zstd = 2,
+    /// The stored bytes are the output of the range coder for the block, with the weights of
+    /// HardShell changed by the match model and the mixer (ADR 0010). The layout is the
+    /// payload of a coded block (ADR 0007). Kind byte 3. Version 2 and later only, and only in
+    /// a container whose coding parts have the match model and the mixer
+    /// ([`CodingParts::mixer`]).
+    Mixed = 3,
 }
 
 impl BlockKind {
@@ -181,26 +187,144 @@ impl BlockKind {
             0 => Some(Self::Raw),
             1 => Some(Self::Coded),
             2 => Some(Self::Zstd),
+            3 => Some(Self::Mixed),
             _ => None,
         }
     }
 
-    /// The first container version that permits this kind: 1 for raw and coded, 2 for zstd.
+    /// The first container version that permits this kind: 1 for raw and coded, 2 for zstd
+    /// and mixed.
     #[must_use]
     #[inline]
     pub const fn min_version(self) -> u16 {
         match self {
             Self::Raw | Self::Coded => 1,
-            Self::Zstd => 2,
+            Self::Zstd | Self::Mixed => 2,
         }
     }
 
-    /// True if a block of this kind needs the model of the container to decode. Only a coded
-    /// block needs it.
+    /// True if a block of this kind needs the model of the container to decode: a coded block
+    /// and a mixed block.
     #[must_use]
     #[inline]
     pub const fn needs_model(self) -> bool {
-        matches!(self, Self::Coded)
+        matches!(self, Self::Coded | Self::Mixed)
+    }
+}
+
+/// The version of the rules and the constants of the match model and the mixer (ADR 0010
+/// sections 2 and 3). Byte 0 of the coding parameters (offset 92) of a version 2 header holds
+/// it when the coding parts have the match model and the mixer.
+///
+/// The rule version fixes every constant, so the header has no free parameter. A reader
+/// refuses a rule version that it does not know.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MixerRule(u8);
+
+impl MixerRule {
+    /// Mixer rule version 1: ADR 0010 sections 2 and 3.
+    pub const V1: Self = Self(1);
+
+    /// The rule version of a byte, or `None` if this reader does not know the version.
+    #[must_use]
+    #[inline]
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::V1),
+            _ => None,
+        }
+    }
+
+    /// The byte of the rule version.
+    #[must_use]
+    #[inline]
+    pub const fn as_u8(self) -> u8 {
+        self.0
+    }
+}
+
+/// The coding parts of a version 2 container (ADR 0010 §5, ADR 0011 §2): the parts of the
+/// prediction path in addition to HardShell.
+///
+/// Version 2 defines one part: bit 0 of the coding parts field (offset 90), the match model
+/// and the mixer, with its rule version in byte 0 of the coding parameters (offset 92). All
+/// other bits and bytes are 0. A version 1 container has no coding parts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CodingParts {
+    mixer: Option<MixerRule>,
+}
+
+impl CodingParts {
+    /// No coding part: HardShell alone. The profile `text` has this value.
+    pub const NONE: Self = Self { mixer: None };
+
+    /// Bit 0 of the coding parts field: the match model and the mixer.
+    pub const MIXER_BIT: u16 = 1;
+
+    /// The match model and the mixer with the rule version `rule`.
+    #[must_use]
+    #[inline]
+    pub const fn with_mixer(rule: MixerRule) -> Self {
+        Self { mixer: Some(rule) }
+    }
+
+    /// The rule version of the match model and the mixer, or `None` if the container does not
+    /// use them. A mixed block ([`BlockKind::Mixed`]) is valid only if this is `Some`.
+    #[must_use]
+    #[inline]
+    pub const fn mixer(&self) -> Option<MixerRule> {
+        self.mixer
+    }
+
+    /// True if the container has no coding part.
+    #[must_use]
+    #[inline]
+    pub const fn is_none(&self) -> bool {
+        self.mixer.is_none()
+    }
+
+    /// The value of the coding parts field (offset 90).
+    #[must_use]
+    #[inline]
+    pub(crate) const fn bits(&self) -> u16 {
+        if self.mixer.is_some() { Self::MIXER_BIT } else { 0 }
+    }
+
+    /// The 12 bytes of the coding parameters field (offset 92).
+    #[must_use]
+    pub(crate) const fn params(&self) -> [u8; 12] {
+        let mut p = [0; 12];
+        if let Some(rule) = self.mixer {
+            p[0] = rule.as_u8();
+        }
+        p
+    }
+
+    /// Reads and checks the coding parts field and the coding parameters field.
+    ///
+    /// # Errors
+    ///
+    /// - [`FormatError::UnknownCodingParts`] if a bit other than bit 0 is set.
+    /// - [`FormatError::UnknownMixerRule`] if bit 0 is set and byte 0 of the parameters is not
+    ///   a known rule version.
+    /// - [`FormatError::ReservedNotZero`] if bit 0 is clear and byte 0 is not 0, or if bytes 1
+    ///   to 11 of the parameters are not 0.
+    pub(crate) fn read(bits: u16, params: &[u8; 12]) -> Result<Self> {
+        if bits & !Self::MIXER_BIT != 0 {
+            return Err(FormatError::UnknownCodingParts { parts: bits });
+        }
+        let [rule, rest @ ..] = *params;
+        if rest != [0; 11] {
+            return Err(FormatError::ReservedNotZero { field: "coding parameters" });
+        }
+        if bits & Self::MIXER_BIT == 0 {
+            if rule != 0 {
+                return Err(FormatError::ReservedNotZero { field: "coding parameters" });
+            }
+            return Ok(Self::NONE);
+        }
+        let rule = MixerRule::from_u8(rule).ok_or(FormatError::UnknownMixerRule { rule })?;
+        Ok(Self::with_mixer(rule))
     }
 }
 
@@ -209,7 +333,8 @@ impl BlockKind {
 /// [`Profile::Text`].
 ///
 /// The decoder does not select a model or coding parts from the profile. The model hash and the
-/// coding parts of the header do that (ADR 0010, not accepted yet).
+/// coding parts of the header do that (ADR 0010). The profile `text` has no coding parts. The
+/// profile `logs` can have the match model and the mixer ([`CodingParts`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 #[repr(u8)]
@@ -291,24 +416,74 @@ mod tests {
     }
 
     #[test]
-    fn block_kind_bytes_are_zero_one_and_two_only() {
+    fn block_kind_bytes_are_zero_to_three_only() {
         assert_eq!(BlockKind::Raw.as_u8(), 0);
         assert_eq!(BlockKind::Coded.as_u8(), 1);
         assert_eq!(BlockKind::Zstd.as_u8(), 2);
+        assert_eq!(BlockKind::Mixed.as_u8(), 3);
         for b in 0..=255u8 {
             let k = BlockKind::from_u8(b);
             match b {
                 0 => assert_eq!(k, Some(BlockKind::Raw)),
                 1 => assert_eq!(k, Some(BlockKind::Coded)),
                 2 => assert_eq!(k, Some(BlockKind::Zstd)),
+                3 => assert_eq!(k, Some(BlockKind::Mixed)),
                 _ => assert_eq!(k, None),
             }
         }
         assert_eq!(BlockKind::Raw.min_version(), 1);
         assert_eq!(BlockKind::Coded.min_version(), 1);
         assert_eq!(BlockKind::Zstd.min_version(), 2);
-        assert!(BlockKind::Coded.needs_model());
+        assert_eq!(BlockKind::Mixed.min_version(), 2);
+        assert!(BlockKind::Coded.needs_model() && BlockKind::Mixed.needs_model());
         assert!(!BlockKind::Raw.needs_model() && !BlockKind::Zstd.needs_model());
+    }
+
+    #[test]
+    fn mixer_rule_1_is_the_only_rule() {
+        for b in 0..=255u8 {
+            assert_eq!(MixerRule::from_u8(b), (b == 1).then_some(MixerRule::V1));
+        }
+        assert_eq!(MixerRule::V1.as_u8(), 1);
+    }
+
+    #[test]
+    fn coding_parts_read_and_write_the_same_fields() {
+        let mixer = CodingParts::with_mixer(MixerRule::V1);
+        assert_eq!(mixer.bits(), 1);
+        assert_eq!(mixer.params()[0], 1);
+        assert_eq!(&mixer.params()[1..], &[0; 11]);
+        assert_eq!(CodingParts::read(mixer.bits(), &mixer.params()), Ok(mixer));
+        assert_eq!(CodingParts::NONE.bits(), 0);
+        assert_eq!(CodingParts::NONE.params(), [0; 12]);
+        assert_eq!(CodingParts::read(0, &[0; 12]), Ok(CodingParts::NONE));
+        assert!(CodingParts::NONE.is_none() && !mixer.is_none());
+    }
+
+    #[test]
+    fn coding_parts_refuse_unknown_bits_rules_and_bytes() {
+        let mut p = [0; 12];
+        p[0] = 1;
+        for bits in [2, 3, 0x8000, u16::MAX] {
+            assert_eq!(
+                CodingParts::read(bits, &p),
+                Err(FormatError::UnknownCodingParts { parts: bits })
+            );
+        }
+        for rule in [0, 2, 0xFF] {
+            p[0] = rule;
+            assert_eq!(CodingParts::read(1, &p), Err(FormatError::UnknownMixerRule { rule }));
+        }
+        // A rule version without the part, and a byte after the rule version.
+        p[0] = 1;
+        let reserved = Err(FormatError::ReservedNotZero { field: "coding parameters" });
+        assert_eq!(CodingParts::read(0, &p), reserved);
+        for i in 1..12 {
+            let mut q = [0; 12];
+            q[0] = 1;
+            q[i] = 0x10;
+            assert_eq!(CodingParts::read(1, &q), reserved);
+        }
     }
 
     #[test]

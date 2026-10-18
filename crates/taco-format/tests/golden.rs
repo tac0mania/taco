@@ -25,8 +25,8 @@ mod common;
 use common::{Craft, bs, phrases, splitmix64, unfold};
 use sha2::{Digest, Sha256};
 use taco_format::{
-    Block, BlockKind, Checksum, Container, ContainerParams, ModelHash, Profile, VERSION, VERSION_1,
-    ZSTD_LIBRARY_VERSION, compress_zstd, zstd_library_version,
+    Block, BlockKind, Checksum, CodingParts, Container, ContainerParams, MixerRule, ModelHash,
+    Profile, VERSION, VERSION_1, ZSTD_LIBRARY_VERSION, compress_zstd, zstd_library_version,
 };
 
 /// SHA-256 of version 1 vector A (ADR 0006).
@@ -44,6 +44,8 @@ const VECTOR_B_FRAME_SHA256: &str =
     "4a62d79659c63a4dbc2ea9236d5001543baea7f608f045b4563b8262b11fe83d";
 /// SHA-256 of version 2 vector C.
 const VECTOR_C_SHA256: &str = "72dcd44f9b87a9e0fd7f4be6b6e8de252597ec98eac4b5e0bc5215b06ccb7a59";
+/// SHA-256 of version 2 vector D (ADR 0010 §5: the coding part and the mixed block kind).
+const VECTOR_D_SHA256: &str = "69578bfc50bee4fa9f8a0eb6f09421ce4a64b1c48ec01e811cad3622eee95af0";
 /// SHA-256 of the version 2 container of empty data in the raw-only mode, block size 65,536.
 const VECTOR_EMPTY_V2_SHA256: &str =
     "03de05c54a2e192c7dd046526ef8a3c9882b16465b9ab577b42c3477e130c390";
@@ -120,6 +122,25 @@ fn vector_c() -> Vec<u8> {
         .map(|b| Block::choose_smallest(b.len(), None, Some(compress_zstd(b).unwrap())))
         .collect();
     let params = ContainerParams::new(ModelHash::RAW_ONLY, bs(256)).with_profile(Profile::Logs);
+    Container::build(&params, &data, &blocks).unwrap()
+}
+
+/// Version 2 vector D: the data and the model hash of vector B, profile logs, the match model
+/// and the mixer with rule version 1, blocks of 100 bytes: raw, mixed `"mixed-1"`, zstd (the
+/// frame of vector B), coded with 0 bytes, mixed with 0 bytes. The mixed blocks hold fixed
+/// bytes, not the output of a real coder.
+fn vector_d() -> Vec<u8> {
+    let data = vector_b_data();
+    let blocks = [
+        Block::Raw,
+        Block::Mixed(b"mixed-1".to_vec()),
+        Block::Zstd(vector_b_frame()),
+        Block::Coded(Vec::new()),
+        Block::Mixed(Vec::new()),
+    ];
+    let params = ContainerParams::new(model(), bs(100))
+        .with_profile(Profile::Logs)
+        .with_coding(CodingParts::with_mixer(MixerRule::V1));
     Container::build(&params, &data, &blocks).unwrap()
 }
 
@@ -225,4 +246,39 @@ fn empty_vector_has_its_version_2_hash() {
     println!("empty vector, version 2: {} bytes, sha256 {}", bytes.len(), hex(&bytes));
     assert_eq!(bytes.len(), 104);
     assert_eq!(hex(&bytes), VECTOR_EMPTY_V2_SHA256);
+}
+
+#[test]
+fn vector_d_has_its_hash_and_the_hand_made_layout() {
+    let bytes = vector_d();
+    println!("vector D: {} bytes, sha256 {}", bytes.len(), hex(&bytes));
+    let data = vector_b_data();
+    let frame = vector_b_frame();
+    let len = u32::try_from(frame.len()).unwrap();
+    let mut section = vec![0; 16];
+    section[0] = 1; // profile logs
+    section[2] = 1; // coding parts: bit 0, the match model and the mixer
+    section[4] = 1; // mixer rule version 1
+    let hand = Craft {
+        version: 2,
+        model_hash: *model().as_bytes(),
+        original_len: 450,
+        checksum: *Checksum::of(&data).as_bytes(),
+        block_size: 100,
+        block_count: 5,
+        section,
+        entries: vec![(0, 100), (3, 7), (2, len), (1, 0), (3, 0)],
+        payload: [&data[..100], b"mixed-1", frame.as_slice()].concat(),
+        ..Craft::default()
+    }
+    .bytes();
+    assert_eq!(bytes, hand);
+    assert_eq!(hex(&bytes), VECTOR_D_SHA256);
+    let c = Container::parse(&bytes).unwrap();
+    assert_eq!(c.header().coding_parts().mixer(), Some(MixerRule::V1));
+    let kinds: Vec<BlockKind> = c.blocks().iter().map(|b| b.kind()).collect();
+    assert_eq!(
+        kinds,
+        [BlockKind::Raw, BlockKind::Mixed, BlockKind::Zstd, BlockKind::Coded, BlockKind::Mixed]
+    );
 }

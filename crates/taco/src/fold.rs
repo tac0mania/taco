@@ -1,10 +1,14 @@
 //! `fold`: input bytes to a `.taco` container (plan §4).
 
 use hardshell::gpt2::{Model, Session, SessionConfig};
-use taco_format::{Block, BlockSize, Container, ContainerParams, Profile, compress_zstd};
+use taco_format::{
+    Block, BlockSize, CodingParts, Container, ContainerParams, HEADER_LEN, MixerRule, Profile,
+    TABLE_ENTRY_LEN, compress_zstd,
+};
 
 use crate::codec::{encode_block, tokens_restore};
 use crate::error::{Result, TacoError};
+use crate::mix::MixState;
 use crate::parallel::{Threads, map_blocks};
 use crate::tokenizer::Tokenizer;
 use crate::{DEFAULT_BLOCK_SIZE, container_hash};
@@ -15,6 +19,30 @@ use crate::{DEFAULT_BLOCK_SIZE, container_hash};
 // 12 * 32 * 50,257 bytes = 19 MB for each thread (est.).
 const FOLD_CHUNK: usize = 32;
 
+/// The profile that [`fold`] uses (ADR 0012).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum FoldProfile {
+    /// The profile `text`: HardShell alone. Each block is the smallest of raw, zstd and coded.
+    #[default]
+    Text,
+    /// The profile `logs`: HardShell, the match model and the mixer (ADR 0010, mixer rule
+    /// version 1). Each block is the smallest of raw, zstd, coded and mixed, with the tie
+    /// order raw, zstd, coded, mixed. Thus each block is never larger than with the profile
+    /// `text`.
+    Logs,
+    /// The encoder selects. It codes as [`FoldProfile::Logs`]. If no block is stored mixed,
+    /// it writes the container of [`FoldProfile::Text`] (the same blocks, the profile `text`,
+    /// no coding part), else the container of [`FoldProfile::Logs`]. Thus the result is the
+    /// smaller of the two containers, and the text container on a tie (it decodes without the
+    /// match model and the mixer).
+    ///
+    /// The rule is for the encoder only: the decoder reads the profile from the header. It
+    /// depends only on the input, the model and the block size, so it gives the same bytes on
+    /// every machine and for every number of threads.
+    Auto,
+}
+
 /// The options of [`fold`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -23,10 +51,13 @@ pub struct FoldOptions {
     pub block_size: BlockSize,
     /// The number of worker threads. The container does not depend on it.
     pub threads: Threads,
+    /// The profile. The default is [`FoldProfile::Text`].
+    pub profile: FoldProfile,
 }
 
 impl FoldOptions {
-    /// The default options: blocks of [`DEFAULT_BLOCK_SIZE`] bytes, one thread.
+    /// The default options: blocks of [`DEFAULT_BLOCK_SIZE`] bytes, one thread, the profile
+    /// `text`.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -45,11 +76,18 @@ impl FoldOptions {
         self.threads = threads;
         self
     }
+
+    /// The same options with another profile.
+    #[must_use]
+    pub const fn with_profile(mut self, profile: FoldProfile) -> Self {
+        self.profile = profile;
+        self
+    }
 }
 
 impl Default for FoldOptions {
     fn default() -> Self {
-        Self { block_size: DEFAULT_BLOCK_SIZE, threads: Threads::ONE }
+        Self { block_size: DEFAULT_BLOCK_SIZE, threads: Threads::ONE, profile: FoldProfile::Text }
     }
 }
 
@@ -63,13 +101,22 @@ pub struct FoldStats {
     pub container_len: u64,
     /// The number of blocks.
     pub blocks: u64,
-    /// The number of blocks that are stored coded.
+    /// The number of blocks that are stored coded (HardShell alone).
     pub coded_blocks: u64,
+    /// The number of blocks that are stored mixed (the match model and the mixer, ADR 0010).
+    pub mixed_blocks: u64,
     /// The number of blocks that are stored as a zstd frame (ADR 0011). The blocks that are
-    /// not coded and not zstd are raw.
+    /// not coded, not mixed and not zstd are raw.
     pub zstd_blocks: u64,
     /// The number of tokens of all blocks, of every kind.
     pub tokens: u64,
+    /// The profile of the container.
+    pub profile: Profile,
+    /// The length of the container that the profile `text` gives for the same input and block
+    /// size, in bytes: each mixed block is replaced by the smallest of raw, zstd and coded.
+    /// For the profile `text` this is `container_len`. The encoder knows it without a second
+    /// run, because the coded candidate of each block is the same in both profiles.
+    pub text_container_len: u64,
 }
 
 /// The result of [`fold`]: the container and numbers about it.
@@ -89,9 +136,16 @@ pub struct Folded {
 /// into one zstd frame (ADR 0011). The smallest of raw, zstd and coded is stored, with the tie
 /// order of `Block::choose_smallest` (plan §3 rule 6, ADR 0011 §4). The model stops when the
 /// payload reaches the smaller of the block length and the zstd length; this does not change
-/// the selected block. The container is version 2 with the profile `text` (ADR 0012). It
-/// stores the model hash and the SHA-256 of the input. The output is the same for every number
-/// of threads and on every machine.
+/// the selected block. The container is version 2. It stores the model hash, the profile
+/// (ADR 0012) and the SHA-256 of the input. The output is the same for every number of threads
+/// and on every machine.
+///
+/// With the profile `logs` (or `auto`), a second range encoder codes each block with the
+/// match model and the mixer (ADR 0010, a new state at each block start), from the same
+/// HardShell weights. The mixed payload joins the candidates last (`Block::or_mixed`): it is
+/// stored only if it is smaller than raw, zstd and coded. The container then has the coding
+/// part "match model and mixer" with mixer rule version 1. [`FoldProfile::Auto`] gives the
+/// rule for `auto`.
 ///
 /// Before a block is coded, its tokens are checked against the vocabulary of the model: they
 /// must give the block bytes exactly. Thus a tokenizer that does not agree with the model is an
@@ -99,7 +153,9 @@ pub struct Folded {
 ///
 /// Cost: one zstd compression of each block at level 19 (1.5 to 5.4 MB/s on one thread,
 /// measured by the zstdblock agent), then, for each token up to the stop, one HardShell step
-/// and one frequency table of the full vocabulary.
+/// and one frequency table of the full vocabulary. The profile `logs` adds, for each token, the
+/// mixer (one or two passes over the weights) and a second frequency table; and for each
+/// block, the match tables (24 MiB of zeroed memory for each thread, ADR 0010 section 7).
 /// The steps of a block run 32 tokens at a time (`Session::step_many`). Each thread holds one
 /// session (for GPT-2 small, about 19 MB of KV cache and 19 MB of work buffers, est.). Memory:
 /// the input, the container, and the tokens and payload of each block.
@@ -123,6 +179,10 @@ pub fn fold(
         });
     }
     let chunks: Vec<&[u8]> = options.block_size.split(input).collect();
+    let rule = match options.profile {
+        FoldProfile::Text => None,
+        FoldProfile::Logs | FoldProfile::Auto => Some(MixerRule::V1),
+    };
     let coded = map_blocks(
         chunks.len(),
         options.threads,
@@ -137,31 +197,44 @@ pub fn fold(
             }
             // ADR 0011 §4.5: the zstd frame comes first, so the model can stop at its length.
             let zstd = compress_zstd(data)?;
-            let coded = encode_block(session, &tokens, data.len().min(zstd.len()))?;
-            let block = Block::choose_smallest(data.len(), coded.payload, Some(zstd));
-            Ok((block, coded.tokens))
+            let mut mix = rule.map(MixState::new);
+            let coded = encode_block(session, &tokens, data.len().min(zstd.len()), mix.as_mut())?;
+            drop(mix);
+            let text = Block::choose_smallest(data.len(), coded.payload, Some(zstd));
+            let text_len = text.stored_len(data.len());
+            Ok((text.or_mixed(data.len(), coded.mixed), text_len, coded.tokens))
         },
     )?;
+    let to_u64 =
+        |n: usize| u64::try_from(n).map_err(|_| TacoError::InputTooLarge { reason: "length" });
     let mut stats = FoldStats::default();
     let mut blocks = Vec::with_capacity(coded.len());
-    for (block, tokens) in coded {
+    let mut text_len = to_u64(HEADER_LEN)?;
+    for (block, text_stored, tokens) in coded {
         stats.blocks += 1;
         stats.tokens += tokens;
+        text_len += to_u64(TABLE_ENTRY_LEN + text_stored)?;
         match block {
             Block::Coded(_) => stats.coded_blocks += 1,
+            Block::Mixed(_) => stats.mixed_blocks += 1,
             Block::Zstd(_) => stats.zstd_blocks += 1,
             _ => {}
         }
         blocks.push(block);
     }
-    // NOTE: the profile is `text` until the logs profile exists (ADR 0012). The decoder does
-    // not use it.
-    let params =
-        ContainerParams::new(container_hash(model), options.block_size).with_profile(Profile::Text);
+    // FoldProfile::Auto: the text container if no block is mixed. Then the blocks are the
+    // blocks of the profile `text`, because a block is mixed only if the mixed payload wins.
+    let (profile, coding) = match (options.profile, stats.mixed_blocks) {
+        (FoldProfile::Text, _) | (FoldProfile::Auto, 0) => (Profile::Text, CodingParts::NONE),
+        _ => (Profile::Logs, CodingParts::with_mixer(MixerRule::V1)),
+    };
+    let params = ContainerParams::new(container_hash(model), options.block_size)
+        .with_profile(profile)
+        .with_coding(coding);
     let container = Container::build(&params, input, &blocks)?;
-    let to_u64 =
-        |n: usize| u64::try_from(n).map_err(|_| TacoError::InputTooLarge { reason: "length" });
     stats.original_len = to_u64(input.len())?;
     stats.container_len = to_u64(container.len())?;
+    stats.profile = profile;
+    stats.text_container_len = text_len;
     Ok(Folded { container, stats })
 }

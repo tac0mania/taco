@@ -60,6 +60,48 @@ fn fold_then_unfold_restores_the_file() {
 }
 
 #[test]
+fn every_profile_round_trips_and_unfold_needs_no_profile() {
+    let d = dir("cli_profiles");
+    let model = d.join("tiny.hsm");
+    std::fs::write(&model, common::model_file(1)).unwrap();
+    let input = d.join("text.txt");
+    let data = common::ENGLISH.repeat(3);
+    std::fs::write(&input, &data).unwrap();
+    for profile in ["text", "logs", "auto"] {
+        let folded = d.join(format!("{profile}.taco"));
+        let out = taco(&[
+            "fold".as_ref(),
+            &input,
+            "-o".as_ref(),
+            &folded,
+            "--model".as_ref(),
+            &model,
+            "--profile".as_ref(),
+            profile.as_ref(),
+            "--block-size".as_ref(),
+            "512".as_ref(),
+        ]);
+        let summary = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{summary}");
+        if profile != "auto" {
+            assert!(summary.contains(&format!("profile {profile}")), "{summary}");
+        }
+        let back = d.join(format!("{profile}.out"));
+        let out =
+            taco(&["unfold".as_ref(), &folded, "-o".as_ref(), &back, "--model".as_ref(), &model]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(std::fs::read(&back).unwrap(), data.as_bytes());
+    }
+    let read = |name: &str| std::fs::read(d.join(name)).unwrap();
+    let (text, logs, auto) = (read("text.taco"), read("logs.taco"), read("auto.taco"));
+    assert!(logs.len() <= text.len());
+    // Auto: the logs container if it is smaller, else the text container.
+    assert_eq!(auto, if logs.len() < text.len() { logs } else { text });
+    let out = taco(&["fold".as_ref(), &input, "--profile".as_ref(), "json".as_ref()]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
 fn bad_arguments_exit_with_code_2() {
     let out = taco(&["squash".as_ref()]);
     assert_eq!(out.status.code(), Some(2));

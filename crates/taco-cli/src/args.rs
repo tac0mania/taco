@@ -6,7 +6,8 @@ use std::path::PathBuf;
 /// The text of `taco --help`.
 pub(crate) const USAGE: &str = "\
 usage:
-  taco fold <input> [-o <output>] [--model <path.hsm>] [--block-size <bytes>] [--threads <n>] [-f]
+  taco fold <input> [-o <output>] [--model <path.hsm>] [--profile text|logs|auto]
+            [--block-size <bytes>] [--threads <n>] [-f]
   taco unfold <input.taco> [-o <output>] [--model <path.hsm>] [--threads <n>] [-f]
 
   fold      compress <input> into <input>.taco
@@ -15,6 +16,9 @@ usage:
 options:
   -o, --output <path>     the output file
   -m, --model <path.hsm>  the model file (default: the TACO_MODEL environment variable)
+  --profile <name>        fold only: text (GPT-2 alone), logs (GPT-2, the match model and
+                          the mixer) or auto (default: logs if a block gets smaller with
+                          it, else text). unfold reads the profile from the file.
   --block-size <bytes>    the bytes in each block (fold only, default 16384)
   --threads <n>           worker threads (default: all CPUs); the output does not change
   -f, --force             replace an output file that exists
@@ -37,6 +41,16 @@ pub(crate) enum Mode {
     Unfold,
 }
 
+/// The `--profile` of fold.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ProfileArg {
+    Text,
+    Logs,
+    /// The default (ADR 0012).
+    #[default]
+    Auto,
+}
+
 /// One `fold` or `unfold` job, with all defaults applied except the model and the threads.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Job {
@@ -48,6 +62,8 @@ pub(crate) struct Job {
     pub(crate) block_size: Option<u32>,
     pub(crate) threads: Option<usize>,
     pub(crate) force: bool,
+    /// Fold only. The default is [`ProfileArg::Auto`].
+    pub(crate) profile: ProfileArg,
 }
 
 /// The default output name: `<input>.taco` for fold, the input without `.taco` for unfold.
@@ -84,6 +100,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
     };
     let (mut input, mut output, mut model) = (None, None, None);
     let (mut block_size, mut threads, mut force) = (None, None, false);
+    let mut profile = ProfileArg::default();
     while let Some(a) = args.next() {
         match a.to_str() {
             Some("-h" | "--help") => return Ok(Command::Help),
@@ -91,6 +108,14 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
             Some("-m" | "--model") => model = Some(args.next().ok_or("--model needs a path")?),
             Some("--block-size") if mode == Mode::Fold => {
                 block_size = Some(number("--block-size", args.next())?);
+            }
+            Some("--profile") if mode == Mode::Fold => {
+                profile = match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
+                    Some("text") => ProfileArg::Text,
+                    Some("logs") => ProfileArg::Logs,
+                    Some("auto") => ProfileArg::Auto,
+                    _ => return Err("--profile needs text, logs or auto".into()),
+                };
             }
             Some("--threads") => threads = Some(number("--threads", args.next())?),
             Some("-f" | "--force") => force = true,
@@ -120,6 +145,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
         block_size,
         threads,
         force,
+        profile,
     }))
 }
 
@@ -170,6 +196,17 @@ mod tests {
         assert!(run(&["fold", "a", "-o"]).is_err());
         assert_eq!(run(&["--help"]), Ok(Command::Help));
         assert_eq!(run(&["fold", "-h"]), Ok(Command::Help));
+    }
+
+    #[test]
+    fn profile_parses_for_fold_only() {
+        assert_eq!(job(&["fold", "a"]).profile, ProfileArg::Auto);
+        assert_eq!(job(&["fold", "a", "--profile", "text"]).profile, ProfileArg::Text);
+        assert_eq!(job(&["fold", "a", "--profile", "logs"]).profile, ProfileArg::Logs);
+        assert_eq!(job(&["fold", "a", "--profile", "auto"]).profile, ProfileArg::Auto);
+        assert!(run(&["fold", "a", "--profile", "json"]).is_err());
+        assert!(run(&["fold", "a", "--profile"]).is_err());
+        assert!(run(&["unfold", "a.taco", "--profile", "logs"]).is_err());
     }
 
     #[test]

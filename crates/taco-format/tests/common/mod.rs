@@ -114,11 +114,11 @@ pub(crate) fn unfold(bytes: &[u8], loaded: ModelHash) -> Result<Vec<u8>, UnfoldE
         let len = usize::try_from(b.original_len()).unwrap();
         match b.kind() {
             BlockKind::Raw => out.extend_from_slice(b.stored()),
-            BlockKind::Coded => {
+            BlockKind::Coded | BlockKind::Mixed => {
                 out.extend(toy_decode(b.stored(), len).ok_or(UnfoldError::Decode(b.index()))?);
             }
             BlockKind::Zstd => b.decode_zstd_into(&mut out)?,
-            _ => unreachable!("version 2 has three kinds"),
+            _ => unreachable!("version 2 has four kinds"),
         }
     }
     c.header().verify_checksum(&out)?;

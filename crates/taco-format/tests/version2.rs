@@ -12,8 +12,8 @@ mod common;
 
 use common::{Craft, MODEL, bs, fold, unfold};
 use taco_format::{
-    Block, BlockKind, Checksum, Container, ContainerParams, FormatError, HEADER_LEN, ModelHash,
-    Profile, VERSION, compress_zstd,
+    Block, BlockKind, Checksum, CodingParts, Container, ContainerParams, FormatError, HEADER_LEN,
+    MixerRule, ModelHash, Profile, VERSION, compress_zstd,
 };
 
 /// 40 bytes in blocks of 20: block 0 is zstd, block 1 is raw.
@@ -101,7 +101,8 @@ fn reserved_byte_coding_parts_and_coding_parameters_must_be_zero() {
     let mut c = sample(0);
     c.section[1] = 1;
     assert_eq!(parse_err(&c), FormatError::ReservedNotZero { field: "reserved byte 89" });
-    for (lo, hi, parts) in [(1, 0, 1), (0, 0x80, 0x8000), (0xFF, 0xFF, u16::MAX)] {
+    // Bit 0 is the match model and the mixer (ADR 0010); the other bits are unknown.
+    for (lo, hi, parts) in [(2, 0, 2), (0, 0x80, 0x8000), (0xFF, 0xFF, u16::MAX)] {
         let mut c = sample(1);
         c.section[2] = lo;
         c.section[3] = hi;
@@ -129,12 +130,139 @@ fn version_1_refuses_the_zstd_kind() {
 }
 
 #[test]
-fn version_2_refuses_kinds_above_two() {
-    for kind in [3, 4, 0x80, u8::MAX] {
-        let mut c = sample(0);
+fn version_2_refuses_kinds_above_three() {
+    for kind in [4, 5, 0x80, u8::MAX] {
+        let mut c = mixed_sample();
         c.entries[0].0 = kind;
         assert_eq!(parse_err(&c), FormatError::UnknownBlockKind { block: 0, kind });
     }
+}
+
+/// [`sample`] with the profile `logs`, the match model and the mixer (rule version 1), and
+/// block 1 stored mixed (the fixed bytes 7, 8, 9 in place of a real payload).
+fn mixed_sample() -> Craft {
+    let d = data();
+    let f = frame();
+    let len = u32::try_from(f.len()).unwrap();
+    let mut c = Craft {
+        entries: vec![(2, len), (3, 3)],
+        payload: [f.as_slice(), &[7, 8, 9]].concat(),
+        ..sample(1)
+    };
+    c.section[2] = 1;
+    c.section[4] = 1;
+    assert_eq!(c.checksum, *Checksum::of(&d).as_bytes());
+    c
+}
+
+#[test]
+fn mixed_block_parses_with_the_coding_part() {
+    let bytes = mixed_sample().bytes();
+    let c = Container::parse(&bytes).unwrap();
+    assert_eq!(c.header().profile(), Profile::Logs);
+    assert_eq!(c.header().coding_parts(), CodingParts::with_mixer(MixerRule::V1));
+    assert_eq!(c.header().coding_parts().mixer(), Some(MixerRule::V1));
+    let kinds: Vec<BlockKind> = c.blocks().iter().map(|b| b.kind()).collect();
+    assert_eq!(kinds, [BlockKind::Zstd, BlockKind::Mixed]);
+    assert_eq!(c.blocks()[1].stored(), &[7, 8, 9]);
+    assert!(BlockKind::Mixed.needs_model());
+    // The writer gives the same bytes.
+    let params = ContainerParams::new(MODEL, bs(20))
+        .with_profile(Profile::Logs)
+        .with_coding(CodingParts::with_mixer(MixerRule::V1));
+    let built =
+        Container::build(&params, &data(), &[Block::Zstd(frame()), Block::Mixed(vec![7, 8, 9])])
+            .unwrap();
+    assert_eq!(built, bytes);
+    assert_eq!(&built[90..93], &[1, 0, 1]);
+}
+
+#[test]
+fn mixed_block_needs_the_coding_part() {
+    let mut c = mixed_sample();
+    c.section[2] = 0;
+    c.section[4] = 0;
+    assert_eq!(parse_err(&c), FormatError::MixedWithoutCodingPart { block: 1 });
+    let params = ContainerParams::new(MODEL, bs(20)).with_profile(Profile::Logs);
+    assert_eq!(
+        Container::build(&params, &data(), &[Block::Zstd(frame()), Block::Mixed(vec![1])]),
+        Err(FormatError::MixedWithoutCodingPart { block: 1 })
+    );
+}
+
+#[test]
+fn coding_part_needs_a_known_mixer_rule() {
+    for rule in [0, 2, 3, 0x80, u8::MAX] {
+        let mut c = mixed_sample();
+        c.section[4] = rule;
+        assert_eq!(parse_err(&c), FormatError::UnknownMixerRule { rule });
+    }
+    for i in 5..16 {
+        let mut c = mixed_sample();
+        c.section[i] = 1;
+        assert_eq!(parse_err(&c), FormatError::ReservedNotZero { field: "coding parameters" });
+    }
+}
+
+#[test]
+fn text_profile_refuses_the_coding_part() {
+    let mut c = mixed_sample();
+    c.section[0] = 0;
+    assert_eq!(parse_err(&c), FormatError::CodingPartsNotInProfile { profile: 0, parts: 1 });
+    let params =
+        ContainerParams::new(MODEL, bs(20)).with_coding(CodingParts::with_mixer(MixerRule::V1));
+    assert_eq!(
+        Container::build(&params, &data(), &[Block::Zstd(frame()), Block::Raw]),
+        Err(FormatError::CodingPartsNotInProfile { profile: 0, parts: 1 })
+    );
+}
+
+#[test]
+fn logs_profile_without_the_coding_part_is_valid() {
+    // ADR 0011 vector C is such a container (raw-only mode, zstd blocks).
+    let bytes = sample(1).bytes();
+    assert_eq!(Container::parse(&bytes).unwrap().header().coding_parts(), CodingParts::NONE);
+}
+
+#[test]
+fn mixed_block_must_be_smaller_than_its_original() {
+    for stored in [20, 21, u32::MAX] {
+        let mut c = mixed_sample();
+        c.entries[1].1 = stored;
+        assert_eq!(
+            parse_err(&c),
+            FormatError::CodedNotSmaller {
+                block: 1,
+                original_len: 20,
+                stored_len: u64::from(stored)
+            }
+        );
+    }
+    // A mixed block of 0 bytes is valid, as a coded block of 0 bytes (ADR 0006 §6.4).
+    let mut c = mixed_sample();
+    c.entries[1].1 = 0;
+    c.payload.truncate(frame().len());
+    assert!(Container::parse(&c.bytes()).is_ok());
+}
+
+#[test]
+fn raw_only_mode_refuses_a_mixed_block() {
+    let c = Craft { model_hash: [0; 32], ..mixed_sample() };
+    assert_eq!(parse_err(&c), FormatError::CodedBlockInRawOnly { block: 1 });
+    let params = ContainerParams::new(ModelHash::RAW_ONLY, bs(20))
+        .with_profile(Profile::Logs)
+        .with_coding(CodingParts::with_mixer(MixerRule::V1));
+    assert_eq!(
+        Container::build(&params, &data(), &[Block::Zstd(frame()), Block::Mixed(vec![1])]),
+        Err(FormatError::CodedBlockInRawOnly { block: 1 })
+    );
+}
+
+#[test]
+fn version_1_refuses_the_mixed_kind() {
+    let mut v1 = Craft { version: 1, section: Vec::new(), ..sample(0) };
+    v1.entries[0].0 = 3;
+    assert_eq!(parse_err(&v1), FormatError::UnknownBlockKind { block: 0, kind: 3 });
 }
 
 #[test]

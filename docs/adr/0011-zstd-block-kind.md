@@ -1,7 +1,9 @@
 # ADR 0011: container format version 2 and the zstd block kind
 
 Date: 2026-10-18. Status: accepted (proposed by the zstdblock agent). Plan: §3, §9, §11. Shared with
-ADR 0010 (match model and mixer, not accepted yet) and ADR 0012 (two profiles).
+ADR 0010 (match model and mixer, accepted 2026-10-19) and ADR 0012 (two profiles). Updated on
+2026-10-19 by the profile agent: ADR 0010 §5 gives the coding parts, the coding parameters and
+block kind 3 their meaning (§2 and §3 below).
 
 ## Context
 
@@ -34,22 +36,19 @@ The first 88 bytes have the layout of version 1. Version 2 adds 16 bytes, so the
 | 0 to 87 | 88 | as version 1 | The version field is 2. The flags field is 0. |
 | 88 | 1 | profile | 0 = `text`, 1 = `logs` (ADR 0012). A reader refuses another value. |
 | 89 | 1 | reserved | 0. A reader refuses another value. |
-| 90 | 2 | coding parts | `u16` bit set. Reserved for ADR 0010: all bits must be 0. |
-| 92 | 12 | coding parameters | Reserved for ADR 0010: all bytes must be 0. |
+| 90 | 2 | coding parts | `u16` bit set. Bit 0: the match model and the mixer (ADR 0010 §5). Bits 1 to 15 are reserved and must be 0 (`UnknownCodingParts`). |
+| 92 | 12 | coding parameters | Byte 0: the mixer rule version if bit 0 is set (only version 1 is known; `UnknownMixerRule`), else 0. Bytes 1 to 11: 0 (`ReservedNotZero`). |
 
-ADR 0010 defines the coding parts and the coding parameters. Until ADR 0010 is accepted, a
-reader refuses a bit that is not 0 (`UnknownCodingParts`, `ReservedNotZero`). ADR 0010 can give
-a meaning to these fields before version 2 is frozen. If the logs agent needs more or other
-space, change this section before version 2 is frozen.
+The profile `text` has no coding part. A reader refuses bit 0 with the profile `text`
+(`CodingPartsNotInProfile`). ADR 0010 §5 has the full rules.
 
-ADR 0010 (proposed) §5 asks for three things. This layout has space for each. The mapping
-below is a proposal only. The code refuses all three until ADR 0010 is accepted.
+The proposed mapping of the first version of this ADR is now the rule (ADR 0010 §5):
 
-| Need of ADR 0010 §5 | Proposed place |
+| Need of ADR 0010 §5 | Place |
 |---|---|
 | The coding-part flag "match model and mixer" | Bit 0 of the coding parts (offset 90) |
 | The mixer rule version, one `u8` | Byte 0 of the coding parameters (offset 92) |
-| A block kind "coded with the match part" | Kind 3 (§3) |
+| A block kind "coded with the match part" | Kind 3, "mixed" (§3) |
 
 ### 3. Block kinds
 
@@ -58,29 +57,32 @@ below is a proposal only. The code refuses all three until ADR 0010 is accepted.
 | 0 | raw | 1, 2 | The original bytes. The stored length equals the original length. |
 | 1 | coded | 1, 2 | The payload of ADR 0007. The stored length is less than the original length. |
 | 2 | zstd | 2 | One zstd frame (RFC 8878). The stored length is less than the original length. |
+| 3 | mixed | 2 | The payload of ADR 0007, coded with the match model and the mixer (ADR 0010). The stored length is less than the original length. Only with bit 0 of the coding parts. |
 
-1. A reader refuses kind 2 in a version 1 container, and kinds 3 to 255 in both versions
-   (`UnknownBlockKind`). ADR 0010 §5 proposes kind 3 for a block coded with the match part.
-   Kind 3 then joins the candidates of §4, with its tie order set by ADR 0010.
+1. A reader refuses kinds 2 and 3 in a version 1 container, and kinds 4 to 255 in both
+   versions (`UnknownBlockKind`). It refuses kind 3 without bit 0 of the coding parts
+   (`MixedWithoutCodingPart`) and in the raw-only mode (`CodedBlockInRawOnly`).
 2. A zstd block needs no model. The raw-only mode (model hash all zero) permits zstd blocks. It
-   still refuses coded blocks.
+   still refuses coded and mixed blocks.
 3. A container with a model hash needs that model, even if all its blocks are raw or zstd
    (plan §3 rule 3, unchanged).
 
 ### 4. The rule that selects the kind (encoder)
 
 1. The candidates are raw (the original length), coded (if the encoder made a payload) and
-   zstd.
+   zstd. With the profile `logs`, mixed (ADR 0010 §5.7) is a fourth candidate.
 2. The smallest stored length wins.
-3. On a tie, the order is raw, then zstd, then coded. A block is coded or zstd only if it is
-   smaller than raw (plan §3 rule 6). zstd wins a tie with coded because it decodes without
-   the model and thousands of times faster.
+3. On a tie, the order is raw, then zstd, then coded, then mixed. A block is coded, mixed or
+   zstd only if it is smaller than raw (plan §3 rule 6). zstd wins a tie with coded because it
+   decodes without the model and thousands of times faster. Coded wins a tie with mixed
+   because it decodes without the match model and the mixer.
 4. The rule uses only lengths, so every machine selects the same kind.
 5. Consequence: the encoder can stop the model when the coded payload reaches the length of
    the zstd frame. The selected kind and the bytes are the same.
 
-`Block::choose_smallest(original_len, coded, zstd)` in `taco-format` is this rule.
-`Block::with_zstd(original)` adds the zstd candidate to a raw or coded block.
+`Block::choose_smallest(original_len, coded, zstd)` in `taco-format` is this rule for the first
+three candidates, and `Block::or_mixed(original_len, mixed)` adds the fourth.
+`Block::with_zstd(original)` adds the zstd candidate to a raw, coded or mixed block.
 
 ### 5. The rules of a zstd block (decoder)
 
@@ -129,11 +131,13 @@ same bytes on both machines (§Measurements). `scripts/xcheck` does not include 
 
 The checksum covers the original data only (ADR 0006 §10). A change of the profile byte from 0
 to 1 gives a valid container. The decoder does not use the profile, so the output is still the
-original data. A flip test confirms this (measured).
+original data. A flip test confirms this (measured). A change from 1 to 0 in a container with the
+coding part of ADR 0010 is refused (`CodingPartsNotInProfile`).
 
 ### 8. Growth bound
 
-A zstd block is smaller than its original bytes. Thus a version 2 container is at most
+A zstd block and a mixed block are smaller than their original bytes. Thus a version 2
+container is at most
 `104 + 5 × block count + original length` bytes (`worst_case_len`). This is 16 bytes more than
 version 1.
 
@@ -178,5 +182,5 @@ of 20,230 bytes on both machines, and the flip test gave the same counts (measur
 - `docs/ARCHITECTURE.md` must list `zstd-safe` and `zstd-sys` as permitted dependencies of
   `taco-format`.
 - An update of the zstd crates needs new conformance vectors and a new cross-machine check.
-- ADR 0010 fills the coding parts and coding parameters, or changes §2 before version 2 is
-  frozen.
+- ADR 0010 §5 fills the coding parts, the coding parameters and kind 3 (2026-10-19). Vectors
+  A, B, C and both empty vectors do not change. Vector D (ADR 0010 §5.10) is new.

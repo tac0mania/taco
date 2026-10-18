@@ -13,8 +13,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use args::{Command, Job, Mode, USAGE};
-use taco::{BlockSize, FoldOptions, Model, Threads, TokenId, Tokenizer, UnfoldOptions};
+use args::{Command, Job, Mode, ProfileArg, USAGE};
+use taco::{
+    BlockSize, FoldOptions, FoldProfile, Model, Profile, Threads, TokenId, Tokenizer, UnfoldOptions,
+};
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
 
@@ -39,6 +41,21 @@ fn load_model(path: &Path) -> CliResult<Model> {
 /// list: the tokenizer then uses single-byte tokens only.
 fn merges_of(model: &Model) -> Vec<(TokenId, TokenId)> {
     model.vocabulary().merges().unwrap_or(&[]).iter().map(|m| (m.left(), m.right())).collect()
+}
+
+fn fold_profile(arg: ProfileArg) -> FoldProfile {
+    match arg {
+        ProfileArg::Text => FoldProfile::Text,
+        ProfileArg::Logs => FoldProfile::Logs,
+        ProfileArg::Auto => FoldProfile::Auto,
+    }
+}
+
+fn profile_name(profile: Profile) -> &'static str {
+    match profile {
+        Profile::Logs => "logs",
+        _ => "text",
+    }
 }
 
 fn threads(job: &Job) -> Threads {
@@ -74,7 +91,9 @@ fn run(job: &Job) -> CliResult<()> {
             }
             let tokenizer =
                 Tokenizer::for_vocabulary(model.vocabulary(), model.eot_token(), &merges)?;
-            let mut options = FoldOptions::new().with_threads(threads(job));
+            let mut options = FoldOptions::new()
+                .with_threads(threads(job))
+                .with_profile(fold_profile(job.profile));
             if let Some(bs) = job.block_size {
                 options = options.with_block_size(BlockSize::new(bs)?);
             }
@@ -82,16 +101,20 @@ fn run(job: &Job) -> CliResult<()> {
             write_output(job, &folded.container)?;
             let s = folded.stats;
             eprintln!(
-                "taco: fold {} -> {}: {} -> {} bytes, ratio {}, {} bits per byte, {} of {} \
-                 blocks coded, {} tokens, {:.1?} (model load {:.1?})",
+                "taco: fold {} -> {}: {} -> {} bytes, ratio {}, {} bits per byte, profile {}, \
+                 {} of {} blocks coded and {} mixed (profile text: {} bytes), {} tokens, {:.1?} \
+                 (model load {:.1?})",
                 job.input.display(),
                 job.output.display(),
                 s.original_len,
                 s.container_len,
                 ratio(s.original_len, s.container_len),
                 ratio(s.container_len * 8, s.original_len),
+                profile_name(s.profile),
                 s.coded_blocks,
                 s.blocks,
+                s.mixed_blocks,
+                s.text_container_len,
                 s.tokens,
                 start.elapsed(),
                 loaded,

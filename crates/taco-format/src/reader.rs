@@ -50,9 +50,9 @@ impl<'a> BlockRef<'a> {
     }
 
     /// The stored bytes, a slice of the container. For a raw block, these are the original
-    /// bytes. For a coded block, these are the bytes for the range decoder. For a zstd block,
-    /// these are one zstd frame. A coded or zstd block has fewer stored bytes than original
-    /// bytes.
+    /// bytes. For a coded block and a mixed block, these are the payload for the range decoder
+    /// (ADR 0007). For a zstd block, these are one zstd frame. A coded, mixed or zstd block has
+    /// fewer stored bytes than original bytes.
     #[must_use]
     pub const fn stored(&self) -> &'a [u8] {
         self.stored
@@ -125,7 +125,18 @@ fn entry(
             original_len,
             stored_len: u64::from(stored_len),
         }),
-        BlockKind::Raw | BlockKind::Coded | BlockKind::Zstd => Ok((kind, stored_len)),
+        BlockKind::Mixed if header.coding_parts().mixer().is_none() => {
+            Err(FormatError::MixedWithoutCodingPart { block: index })
+        }
+        BlockKind::Mixed if raw_only => Err(FormatError::CodedBlockInRawOnly { block: index }),
+        BlockKind::Mixed if stored_len >= original_len => Err(FormatError::CodedNotSmaller {
+            block: index,
+            original_len,
+            stored_len: u64::from(stored_len),
+        }),
+        BlockKind::Raw | BlockKind::Coded | BlockKind::Zstd | BlockKind::Mixed => {
+            Ok((kind, stored_len))
+        }
     }
 }
 
@@ -144,15 +155,16 @@ impl<'a> Container<'a> {
     /// - [`FormatError::BadMagic`], [`FormatError::UnsupportedVersion`] and
     ///   [`FormatError::UnknownFlags`] for an input that is not a version 1 or version 2
     ///   container.
-    /// - [`FormatError::UnknownProfile`], [`FormatError::UnknownCodingParts`] and
+    /// - [`FormatError::UnknownProfile`], [`FormatError::UnknownCodingParts`],
+    ///   [`FormatError::UnknownMixerRule`], [`FormatError::CodingPartsNotInProfile`] and
     ///   [`FormatError::ReservedNotZero`] for a bad field of a version 2 header.
     /// - [`FormatError::Truncated`] if the header or the block table is not complete.
     /// - [`FormatError::ZeroBlockSize`] and [`FormatError::WrongBlockCount`] for a header that
     ///   does not agree with itself.
-    /// - [`FormatError::UnknownBlockKind`] (also kind 2 in version 1),
+    /// - [`FormatError::UnknownBlockKind`] (also kinds 2 and 3 in version 1),
     ///   [`FormatError::RawLengthMismatch`], [`FormatError::CodedNotSmaller`],
-    ///   [`FormatError::ZstdNotSmaller`] and [`FormatError::CodedBlockInRawOnly`] for a bad
-    ///   entry of the block table.
+    ///   [`FormatError::ZstdNotSmaller`], [`FormatError::CodedBlockInRawOnly`] and
+    ///   [`FormatError::MixedWithoutCodingPart`] for a bad entry of the block table.
     /// - [`FormatError::WrongTotalLength`] if the input does not end at the end of the last
     ///   block.
     /// - [`FormatError::LengthOverflow`] if a length does not fit in `u64` or `usize`.

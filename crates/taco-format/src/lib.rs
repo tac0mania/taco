@@ -6,7 +6,8 @@
 //! [`Container::build`]. [`Container::parse`] checks untrusted bytes and gives the stored bytes
 //! of each block as slices of the input, with no copy. ADR 0006 records the rules of version 1
 //! that plan §9 does not state. ADR 0011 records version 2: the zstd block kind and the header
-//! fields of ADR 0010 and ADR 0012.
+//! fields of ADR 0010 and ADR 0012. ADR 0010 gives the coding parts their meaning: the match
+//! model and the mixer, and the mixed block kind.
 //!
 //! The writer writes version 2 only. The reader reads version 1 and version 2.
 //!
@@ -28,12 +29,13 @@
 //! | 84 | 4 | block count | `u32`, exactly `ceil(original length / block size)`. |
 //! | 88 | 1 | profile | Version 2 only. `u8`: 0 text, 1 logs (ADR 0012). |
 //! | 89 | 1 | reserved | Version 2 only. 0. |
-//! | 90 | 2 | coding parts | Version 2 only. `u16`, 0. Reserved for ADR 0010. |
-//! | 92 | 12 | coding parameters | Version 2 only. All 0. Reserved for ADR 0010. |
+//! | 90 | 2 | coding parts | Version 2 only. `u16` bit set. Bit 0: the match model and the mixer (ADR 0010). Other bits 0. |
+//! | 92 | 12 | coding parameters | Version 2 only. Byte 0: the mixer rule version (1) if bit 0 is set, else 0. Bytes 1 to 11: 0. |
 //! | H | 5 × count | block table | H = 88 (version 1) or 104 (version 2). For each block: kind (`u8`), stored length (`u32`). |
 //! | H + 5 × count | sum of stored lengths | blocks | The stored bytes of each block, in table order, with no gap. |
 //!
-//! The block kinds are 0 (raw) and 1 (coded) in version 1, and also 2 (zstd) in version 2.
+//! The block kinds are 0 (raw) and 1 (coded) in version 1, and also 2 (zstd) and 3 (mixed:
+//! coded with the match model and the mixer) in version 2.
 //! Block `i` holds the original bytes `[i × block size, min((i + 1) × block size, original
 //! length))`. Thus each block has `block size` bytes, and the last block can have fewer.
 //!
@@ -41,20 +43,23 @@
 //!
 //! 1. The magic, then the version, then the flags. A reader refuses an unknown version with
 //!    [`FormatError::UnsupportedVersion`] before it reads other fields.
-//! 2. Version 2: the profile is 0 or 1. The reserved byte, the coding parts and the coding
-//!    parameters are 0.
+//! 2. Version 2: the profile is 0 or 1. The reserved byte is 0. The coding parts have only
+//!    bit 0, and the profile `text` has no coding part. With bit 0, byte 0 of the coding
+//!    parameters is a known mixer rule version (1); without it, byte 0 is 0. Bytes 1 to 11 of
+//!    the coding parameters are 0.
 //! 3. The block size is at least 1. The block count is `ceil(original length / block size)`.
 //!    Thus empty data has 0 blocks and a container of exactly the header.
 //! 4. A raw block stores exactly its original bytes: its stored length equals its original
 //!    length.
-//! 5. A coded block and a zstd block are smaller than their original bytes (plan §3 rule 6).
-//!    A coded block of 0 bytes is permitted.
-//! 6. A container in the raw-only mode (model hash all zero) has no coded block. It can have
-//!    zstd blocks: they need no model.
-//! 7. A version 1 container has no zstd block.
-//! 8. The input ends exactly at the end of the last block: no missing byte and no extra byte.
-//! 9. All sums use checked arithmetic. The parser allocates one entry for each block only
-//!    after it checks that the block table is inside the input.
+//! 5. A coded block, a mixed block and a zstd block are smaller than their original bytes
+//!    (plan §3 rule 6). A coded or mixed block of 0 bytes is permitted.
+//! 6. A container in the raw-only mode (model hash all zero) has no coded or mixed block. It
+//!    can have zstd blocks: they need no model.
+//! 7. A version 1 container has no zstd block and no mixed block.
+//! 8. A mixed block is permitted only if the coding parts have bit 0.
+//! 9. The input ends exactly at the end of the last block: no missing byte and no extra byte.
+//! 10. All sums use checked arithmetic. The parser allocates one entry for each block only
+//!     after it checks that the block table is inside the input.
 //!
 //! Thus a version 2 container is at most `104 + 5 × block count + original length` bytes long
 //! (plan §3 rule 6, [`worst_case_len`]).
@@ -90,7 +95,7 @@ pub use error::{FormatError, Result};
 pub use header::Header;
 pub use layout::worst_case_len;
 pub use reader::{BlockRef, Container};
-pub use types::{BlockKind, BlockSize, Checksum, ModelHash, Profile};
+pub use types::{BlockKind, BlockSize, Checksum, CodingParts, MixerRule, ModelHash, Profile};
 pub use writer::{Block, ContainerParams};
 pub use zstd_block::{
     ZSTD_LEVEL, ZSTD_LIBRARY_VERSION, ZSTD_WINDOW_LOG_MAX, compress_zstd, zstd_library_version,

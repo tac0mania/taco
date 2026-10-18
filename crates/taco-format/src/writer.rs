@@ -6,10 +6,10 @@
 //! writes version 2 only (ADR 0011 §3).
 
 use crate::error::{FormatError, Result};
-use crate::header::Header;
+use crate::header::{Header, check_profile};
 use crate::layout::{HEADER_LEN_U64, OriginalLens, block_count, header_and_table_len};
 use crate::reader::Container;
-use crate::types::{BlockKind, BlockSize, Checksum, ModelHash, Profile};
+use crate::types::{BlockKind, BlockSize, Checksum, CodingParts, ModelHash, Profile};
 use crate::zstd_block::{check_frame, compress_zstd};
 
 /// The parts of the header that the caller selects. The writer calculates the other fields.
@@ -22,19 +22,29 @@ pub struct ContainerParams {
     pub block_size: BlockSize,
     /// The profile of the container (ADR 0012). The default is [`Profile::Text`].
     pub profile: Profile,
+    /// The coding parts of the container (ADR 0010 §5). The default is [`CodingParts::NONE`].
+    /// A mixed block needs [`CodingParts::mixer`]. The profile `text` permits no coding part.
+    pub coding: CodingParts,
 }
 
 impl ContainerParams {
-    /// Makes the parameters of a container with the profile [`Profile::Text`].
+    /// Makes the parameters of a container with the profile [`Profile::Text`] and no coding
+    /// part.
     #[must_use]
     pub const fn new(model_hash: ModelHash, block_size: BlockSize) -> Self {
-        Self { model_hash, block_size, profile: Profile::Text }
+        Self { model_hash, block_size, profile: Profile::Text, coding: CodingParts::NONE }
     }
 
     /// The same parameters with another profile.
     #[must_use]
     pub const fn with_profile(self, profile: Profile) -> Self {
         Self { profile, ..self }
+    }
+
+    /// The same parameters with other coding parts.
+    #[must_use]
+    pub const fn with_coding(self, coding: CodingParts) -> Self {
+        Self { coding, ..self }
     }
 }
 
@@ -51,6 +61,9 @@ pub enum Block {
     Coded(Vec<u8>),
     /// Store these bytes, one zstd frame of the original bytes ([`compress_zstd`]).
     Zstd(Vec<u8>),
+    /// Store these bytes, the output of the range coder for the block with the match model
+    /// and the mixer (ADR 0010). The container needs [`CodingParts::mixer`].
+    Mixed(Vec<u8>),
 }
 
 impl Block {
@@ -88,9 +101,25 @@ impl Block {
         best
     }
 
-    /// Adds the zstd candidate to a block that is already raw or coded, and selects the
-    /// smallest form with [`Block::choose_smallest`]. `original` is the original bytes of the
-    /// block. A zstd block stays as it is.
+    /// Adds the mixed candidate to the selected block: [`Block::Mixed`] if `mixed` is smaller
+    /// than the stored length of `self`, else `self`. `self` is the result of
+    /// [`Block::choose_smallest`] for a block of `original_len` bytes.
+    ///
+    /// Thus the full tie order is raw, then zstd, then coded, then mixed (ADR 0010 §5): a
+    /// mixed block wins only if it is strictly smaller than every other form. Coded wins a tie
+    /// with mixed because it decodes without the match model and the mixer. The rule depends
+    /// only on the lengths. Cost: one compare.
+    #[must_use]
+    pub fn or_mixed(self, original_len: usize, mixed: Option<Vec<u8>>) -> Self {
+        match mixed {
+            Some(m) if m.len() < self.stored_len(original_len) => Self::Mixed(m),
+            _ => self,
+        }
+    }
+
+    /// Adds the zstd candidate to a block that is already raw, coded or mixed, and selects the
+    /// smallest form with [`Block::choose_smallest`] and [`Block::or_mixed`]. `original` is the
+    /// original bytes of the block. A zstd block stays as it is.
     ///
     /// Cost: one [`compress_zstd`] of `original`.
     ///
@@ -98,12 +127,14 @@ impl Block {
     ///
     /// [`FormatError::Zstd`] if the zstd library fails.
     pub fn with_zstd(self, original: &[u8]) -> Result<Self> {
-        let coded = match self {
-            Self::Raw => None,
-            Self::Coded(c) => Some(c),
+        let (coded, mixed) = match self {
+            Self::Raw => (None, None),
+            Self::Coded(c) => (Some(c), None),
+            Self::Mixed(m) => (None, Some(m)),
             Self::Zstd(z) => return Ok(Self::Zstd(z)),
         };
-        Ok(Self::choose_smallest(original.len(), coded, Some(compress_zstd(original)?)))
+        let zstd = Some(compress_zstd(original)?);
+        Ok(Self::choose_smallest(original.len(), coded, zstd).or_mixed(original.len(), mixed))
     }
 
     /// The kind byte that the block table stores for this block.
@@ -113,6 +144,7 @@ impl Block {
             Self::Raw => BlockKind::Raw,
             Self::Coded(_) => BlockKind::Coded,
             Self::Zstd(_) => BlockKind::Zstd,
+            Self::Mixed(_) => BlockKind::Mixed,
         }
     }
 
@@ -122,7 +154,7 @@ impl Block {
     pub fn stored_len(&self, original_len: usize) -> usize {
         match self {
             Self::Raw => original_len,
-            Self::Coded(b) | Self::Zstd(b) => b.len(),
+            Self::Coded(b) | Self::Zstd(b) | Self::Mixed(b) => b.len(),
         }
     }
 }
@@ -146,21 +178,27 @@ fn stored<'a>(
     block: &'a Block,
     original: &'a [u8],
     original_len: u32,
-    raw_only: bool,
+    params: &ContainerParams,
 ) -> Result<Stored<'a>> {
+    let raw_only = params.model_hash.is_raw_only();
+    let coded_form = |kind, coded: &'a [u8]| {
+        if raw_only {
+            return Err(FormatError::CodedBlockInRawOnly { block: index });
+        }
+        let stored_len = to_u64(coded.len(), "coded block")?;
+        match u32::try_from(coded.len()) {
+            Ok(len) if len < original_len => Ok(Stored { kind, bytes: coded, len }),
+            _ => Err(FormatError::CodedNotSmaller { block: index, original_len, stored_len }),
+        }
+    };
     match block {
         Block::Raw => Ok(Stored { kind: BlockKind::Raw, bytes: original, len: original_len }),
-        Block::Coded(coded) => {
-            if raw_only {
-                return Err(FormatError::CodedBlockInRawOnly { block: index });
+        Block::Coded(coded) => coded_form(BlockKind::Coded, coded),
+        Block::Mixed(mixed) => {
+            if params.coding.mixer().is_none() {
+                return Err(FormatError::MixedWithoutCodingPart { block: index });
             }
-            let stored_len = to_u64(coded.len(), "coded block")?;
-            match u32::try_from(coded.len()) {
-                Ok(len) if len < original_len => {
-                    Ok(Stored { kind: BlockKind::Coded, bytes: coded, len })
-                }
-                _ => Err(FormatError::CodedNotSmaller { block: index, original_len, stored_len }),
-            }
+            coded_form(BlockKind::Mixed, mixed)
         }
         Block::Zstd(frame) => {
             let stored_len = to_u64(frame.len(), "zstd block")?;
@@ -190,10 +228,14 @@ impl Container<'_> {
     ///
     /// - [`FormatError::TooManyBlocks`] if `original` needs more than `u32::MAX` blocks.
     /// - [`FormatError::WrongBlockCount`] if `blocks` does not have one entry for each block.
-    /// - [`FormatError::CodedBlockInRawOnly`] if a block is coded and the model hash is
-    ///   [`ModelHash::RAW_ONLY`].
-    /// - [`FormatError::CodedNotSmaller`] and [`FormatError::ZstdNotSmaller`] if a coded or
-    ///   zstd block is not smaller than its original bytes. Use [`Block::choose_smallest`] to
+    /// - [`FormatError::CodingPartsNotInProfile`] if the profile does not permit the coding
+    ///   parts (the profile `text` permits none).
+    /// - [`FormatError::CodedBlockInRawOnly`] if a block is coded or mixed and the model hash
+    ///   is [`ModelHash::RAW_ONLY`].
+    /// - [`FormatError::MixedWithoutCodingPart`] if a block is mixed and the coding parts do
+    ///   not have the match model and the mixer.
+    /// - [`FormatError::CodedNotSmaller`] and [`FormatError::ZstdNotSmaller`] if a coded,
+    ///   mixed or zstd block is not smaller than its original bytes. Use [`Block::choose_smallest`] to
     ///   store such a block raw.
     /// - [`FormatError::CorruptZstdBlock`] if a zstd block is not one zstd frame with the
     ///   original length as its content size. The writer does not decode the frame.
@@ -211,13 +253,13 @@ impl Container<'_> {
             });
         }
 
-        let raw_only = params.model_hash.is_raw_only();
+        check_profile(params.profile, params.coding)?;
         let mut parts = Vec::with_capacity(blocks.len());
         let mut total = header_and_table_len(HEADER_LEN_U64, u64::from(count))?;
         let lens = OriginalLens::new(original_len, params.block_size);
         let pieces = params.block_size.split(original);
         for (index, ((block, piece), len)) in (0..count).zip(blocks.iter().zip(pieces).zip(lens)) {
-            let part = stored(index, block, piece, len, raw_only)?;
+            let part = stored(index, block, piece, len, params)?;
             total = total
                 .checked_add(u64::from(part.len))
                 .ok_or(FormatError::LengthOverflow { part: "container" })?;
@@ -226,14 +268,7 @@ impl Container<'_> {
         let total = usize::try_from(total)
             .map_err(|_| FormatError::LengthOverflow { part: "container" })?;
 
-        let header = Header::new_v2(
-            params.profile,
-            params.model_hash,
-            original_len,
-            Checksum::of(original),
-            params.block_size,
-            count,
-        );
+        let header = Header::new_v2(params, original_len, Checksum::of(original), count);
         let mut out = Vec::with_capacity(total);
         header.write(&mut out);
         for part in &parts {
@@ -283,6 +318,28 @@ mod tests {
         // Zstd wins a tie with coded.
         assert_eq!(Block::choose_smallest(9, Some(v(5)), Some(v(5))), Block::Zstd(v(5)));
         assert_eq!(Block::choose_smallest(1, Some(v(0)), Some(v(0))), Block::Zstd(v(0)));
+    }
+
+    #[test]
+    fn or_mixed_wins_only_when_strictly_smaller() {
+        let v = |n: usize| vec![0xAA; n];
+        // Ties go to raw, zstd and coded.
+        assert_eq!(Block::Raw.or_mixed(3, Some(v(3))), Block::Raw);
+        assert_eq!(Block::Zstd(v(5)).or_mixed(9, Some(v(5))), Block::Zstd(v(5)));
+        assert_eq!(Block::Coded(v(5)).or_mixed(9, Some(v(5))), Block::Coded(v(5)));
+        assert_eq!(Block::Coded(v(0)).or_mixed(9, Some(v(0))), Block::Coded(v(0)));
+        // Strictly smaller wins.
+        assert_eq!(Block::Raw.or_mixed(3, Some(v(2))), Block::Mixed(v(2)));
+        assert_eq!(Block::Zstd(v(5)).or_mixed(9, Some(v(4))), Block::Mixed(v(4)));
+        assert_eq!(Block::Coded(v(5)).or_mixed(9, Some(v(4))), Block::Mixed(v(4)));
+        assert_eq!(Block::Coded(v(5)).or_mixed(9, None), Block::Coded(v(5)));
+        assert_eq!(Block::Mixed(v(4)).kind(), BlockKind::Mixed);
+        assert_eq!(Block::Mixed(v(4)).stored_len(9), 4);
+        // with_zstd keeps a smaller mixed block, and gives zstd a tie.
+        let text = b"abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc".repeat(4);
+        let z = compress_zstd(&text).unwrap();
+        assert_eq!(Block::Mixed(v(2)).with_zstd(&text).unwrap(), Block::Mixed(v(2)));
+        assert_eq!(Block::Mixed(v(z.len())).with_zstd(&text).unwrap(), Block::Zstd(z));
     }
 
     #[test]

@@ -17,6 +17,9 @@ pub enum TacoError {
     /// The range coder refused a table or a symbol. This is an internal fault.
     #[error("coder: {0}")]
     Coder(#[from] taco_coder::CoderError),
+    /// The match model or the mixer refused its input (ADR 0010). This is an internal fault.
+    #[error("mixer: {0}")]
+    Match(#[from] taco_match::MatchError),
     /// The container is not valid, or the writer refused the blocks.
     #[error("container: {0}")]
     Format(#[from] taco_format::FormatError),
@@ -42,7 +45,7 @@ pub enum TacoError {
         /// The checksum of the restored data.
         found: Checksum,
     },
-    /// A coded block does not decode to its original length. The block is damaged.
+    /// A coded or mixed block does not decode to its original length. The block is damaged.
     #[error("coded block {block} is damaged: {reason}")]
     CorruptBlock {
         /// The index of the block.

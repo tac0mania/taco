@@ -1,11 +1,12 @@
 //! `unfold`: a `.taco` container back to the original bytes (plan §4).
 
 use hardshell::gpt2::{Batch, BatchInput, Model};
-use taco_format::{BlockKind, BlockRef, Container, FormatError};
+use taco_format::{BlockKind, BlockRef, Container, FormatError, MixerRule};
 
 use crate::codec::BlockDecoder;
 use crate::container_hash;
 use crate::error::{Result, TacoError};
+use crate::mix::MixState;
 use crate::parallel::{Threads, map_blocks};
 
 /// The options of [`unfold`].
@@ -50,17 +51,26 @@ impl UnfoldOptions {
 ///    not the hash of `model` (plan §3 rule 3). A container in the raw-only mode needs no
 ///    model.
 /// 3. Decode each coded block with a new HardShell context: the range decoder gives token
-///    ids, and the vocabulary gives their bytes. The decoder never tokenizes. Copy each raw
-///    block. Decode each zstd block (ADR 0011 §5) without the model. Each thread decodes groups of up to 8 blocks in lockstep in one
-///    `hardshell::gpt2::Batch`, so each weight of the model is read once for the group. The
-///    weights of each block are the same as with its own session (a HardShell test proves it).
+///    ids, and the vocabulary gives their bytes. The decoder never tokenizes. Decode each mixed
+///    block in the same way, with a new match model and mixer of the rule version of the
+///    header between HardShell and the table (ADR 0010 section 4). Copy each raw block.
+///    Decode each zstd block (ADR 0011 §5) without the model. Each thread decodes groups of up
+///    to 8 blocks in lockstep in one `hardshell::gpt2::Batch`, so each weight of the model is
+///    read once for the group. The weights of each block are the same as with its own session
+///    (a HardShell test proves it). The mixer state belongs to the block, so a mixed block
+///    works in any lane.
+///
+/// The decoder selects the coding parts from the header (the coding parts and the block
+/// kinds), not from the profile. The caller does not name a profile.
 /// 4. Verify the length and the SHA-256 of the result (plan §3 rule 4).
 ///
 /// No buffer is allocated from a length in the container before the blocks decode (ADR 0006
 /// section 9.3). Thus a damaged length can cost time, but not a large allocation.
 ///
 /// Cost: for each token, one HardShell step and one frequency table, and a binary search in
-/// the decoder. Memory: the decoded blocks, then one copy into the output.
+/// the decoder; for a mixed block also the mixer (one or two passes over the weights).
+/// Memory: the decoded blocks, then one copy into the output; for each mixed block that
+/// decodes at the same time, 24 MiB of zeroed match tables (ADR 0010 section 7).
 ///
 /// # Errors
 ///
@@ -94,6 +104,7 @@ pub fn unfold(model: Option<&Model>, container: &[u8], options: &UnfoldOptions) 
         return Err(TacoError::OutputTooLarge { original_len: header.original_len(), limit });
     }
     let blocks = parsed.blocks();
+    let rule = header.coding_parts().mixer();
     // Groups of up to MAX_LANES blocks decode in lockstep on one thread (the batch path of
     // HardShell). The group size gives each thread at least one group when there are enough
     // blocks. The output does not depend on it (each block is independent).
@@ -108,7 +119,7 @@ pub fn unfold(model: Option<&Model>, container: &[u8], options: &UnfoldOptions) 
         |batch: &mut Option<Batch<'_>>, g| {
             let end = ((g + 1) * group_size).min(blocks.len());
             let group = blocks.get(g * group_size..end).unwrap_or(&[]);
-            decode_group(model, batch, group_size, group)
+            decode_group(model, rule, batch, group_size, group)
         },
     )?;
     let parts: Vec<Vec<u8>> = group_parts.into_iter().flatten().collect();
@@ -137,12 +148,15 @@ const MIN_LANES: usize = 4;
 const MAX_LANES: usize = 8;
 
 /// Decodes one group of blocks: raw blocks are copied, zstd blocks are decoded, and the coded
-/// blocks run in lockstep in the lanes of `batch` (made on the first use, with `lanes` lanes).
+/// and mixed blocks run in lockstep in the lanes of `batch` (made on the first use, with
+/// `lanes` lanes). `rule` is the mixer rule version of the header, if the container has the
+/// match model and the mixer.
 ///
 /// If several blocks of the group fail, the result is the error of the block with the lowest
 /// index, so the error does not depend on the grouping.
 fn decode_group<'m>(
     model: Option<&'m Model>,
+    rule: Option<MixerRule>,
     batch: &mut Option<Batch<'m>>,
     lanes: usize,
     group: &[BlockRef<'_>],
@@ -154,7 +168,15 @@ fn decode_group<'m>(
         match (b.kind(), model) {
             (BlockKind::Raw, _) => parts[slot] = Some(b.stored().to_vec()),
             (BlockKind::Coded, Some(m)) => {
-                match BlockDecoder::new(m, b.stored(), b.index(), b.original_len()) {
+                match BlockDecoder::new(m, b.stored(), b.index(), b.original_len(), None) {
+                    Ok(d) => lane_of.push(Some((slot, d))),
+                    Err(e) => errors.push((b.index(), e)),
+                }
+            }
+            // NOTE: the parser refuses a mixed block without a rule version in the header.
+            (BlockKind::Mixed, Some(m)) if rule.is_some() => {
+                let mix = rule.map(MixState::new);
+                match BlockDecoder::new(m, b.stored(), b.index(), b.original_len(), mix) {
                     Ok(d) => lane_of.push(Some((slot, d))),
                     Err(e) => errors.push((b.index(), e)),
                 }

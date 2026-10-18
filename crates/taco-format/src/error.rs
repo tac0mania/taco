@@ -73,7 +73,7 @@ pub enum FormatError {
         blocks: u64,
     },
     /// A kind byte in the block table is not a kind of the version of the container: 0 (raw)
-    /// or 1 (coded) in version 1, and also 2 (zstd) in version 2.
+    /// or 1 (coded) in version 1, and also 2 (zstd) and 3 (mixed) in version 2.
     #[error("block {block} has the unknown kind {kind}")]
     UnknownBlockKind {
         /// The index of the block.
@@ -91,8 +91,8 @@ pub enum FormatError {
         /// The stored length of the block.
         stored_len: u64,
     },
-    /// A coded block is not smaller than its original bytes. Plan §3 rule 6 says that such a
-    /// block is stored raw.
+    /// A coded block or a mixed block is not smaller than its original bytes. Plan §3 rule 6
+    /// says that such a block is stored raw.
     #[error(
         "coded block {block} stores {stored_len} bytes, not less than its original {original_len}"
     )]
@@ -144,11 +144,35 @@ pub enum FormatError {
         profile: u8,
     },
     /// The coding parts field of a version 2 header has a bit that this reader does not
-    /// define. ADR 0010 defines the bits. Until it is accepted, all bits are reserved.
+    /// define. ADR 0010 defines bit 0 (the match model and the mixer). The other bits are
+    /// reserved.
     #[error("unknown .taco coding parts {parts:#06x}")]
     UnknownCodingParts {
         /// The coding parts field.
         parts: u16,
+    },
+    /// The coding parts have the match model and the mixer, and byte 0 of the coding
+    /// parameters is not a mixer rule version that this reader knows (ADR 0010: version 1).
+    #[error("unknown mixer rule version {rule}")]
+    UnknownMixerRule {
+        /// The rule version byte.
+        rule: u8,
+    },
+    /// The coding parts of the header are not permitted with its profile. The profile `text`
+    /// has no coding parts (ADR 0012).
+    #[error("the profile {profile} does not permit the coding parts {parts:#06x}")]
+    CodingPartsNotInProfile {
+        /// The profile byte.
+        profile: u8,
+        /// The coding parts field.
+        parts: u16,
+    },
+    /// A mixed block (kind 3) is in a container whose coding parts do not have the match model
+    /// and the mixer, or the writer received a mixed block for such a container.
+    #[error("block {block} is mixed, but the container has no match model and mixer")]
+    MixedWithoutCodingPart {
+        /// The index of the block.
+        block: u32,
     },
     /// A reserved field of a version 2 header is not zero.
     #[error("the reserved field {field} of the header is not zero")]
@@ -156,7 +180,8 @@ pub enum FormatError {
         /// The name of the field.
         field: &'static str,
     },
-    /// A container in the raw-only mode (model hash all zero) has a coded block.
+    /// A container in the raw-only mode (model hash all zero) has a coded block or a mixed
+    /// block.
     #[error("block {block} is coded, but the container is in the raw-only mode")]
     CodedBlockInRawOnly {
         /// The index of the block.

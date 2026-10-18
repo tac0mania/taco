@@ -114,3 +114,8 @@ vector; add vectors B, C and the version 2 empty vector of ADR 0011).
 - `VERSION` is 2, `VERSION_1` is 1, `HEADER_LEN` is 104, `HEADER_LEN_V1` is 88.
 - New errors: `ZstdNotSmaller`, `CorruptZstdBlock`, `Zstd`, `NotZstd`, `UnknownProfile`,
   `UnknownCodingParts`, `ReservedNotZero`.
+- ADR 0010 §5 (2026-10-19, the profile agent): `BlockKind::Mixed` (kind byte 3),
+  `Block::Mixed(Vec<u8>)`, `Block::or_mixed(original_len, mixed)`, `CodingParts`
+  (`NONE`, `with_mixer`, `mixer()`, `MIXER_BIT`), `MixerRule` (`V1`, `from_u8`, `as_u8`),
+  `ContainerParams::with_coding`, `ContainerParams.coding`, `Header::coding_parts()`. New
+  errors: `UnknownMixerRule`, `CodingPartsNotInProfile`, `MixedWithoutCodingPart`.

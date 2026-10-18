@@ -5,9 +5,11 @@
 #
 #   scripts/xcheck
 #
-# Inputs are made from the corpus in tools/data/corpus (tools/baseline fetches it) and from a
-# fixed random seed. Each machine uses its own tools/data/out/gpt2.hsm; the check refuses to
-# run if the two model hashes differ. Results: tools/data/xcheck/ (ignored by git).
+# Inputs are made from the corpus in tools/data/corpus (tools/baseline fetches it), the logs in
+# tools/data/logs (python -m logs.corpus fetch) and a fixed random seed. An input with ".logs."
+# in its name is folded with --profile logs (ADR 0010), every other input with --profile text.
+# Each machine uses its own tools/data/out/gpt2.hsm; the check refuses to run if the two model
+# hashes differ. Results: tools/data/xcheck/ (ignored by git).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 X=tools/data/xcheck
@@ -32,19 +34,23 @@ head -c 4096 "$C/kennedy.xls" > "$X/in/binary_4k.xls"
 python3 -c "import random,sys; r=random.Random(20261018); sys.stdout.buffer.write(bytes(r.randrange(256) for _ in range(3000)))" > "$X/in/random_3000.bin"
 printf 'dasdasdasdada' > "$X/in/dasdas.txt"
 : > "$X/in/empty.bin"
+L=tools/data/logs
+head -c 65536 "$L/Linux_2k.log" > "$X/in/loghub_linux_64k.logs.log"
+head -c 32768 "$L/nginx_json.log" > "$X/in/nginx_32k.logs.jsonl"
 
 echo "== build and fold on the Mac"
 scripts/mx cargo build --release -q -p taco-cli
 TACO=$HOME/.cache/taco-mac/target/release/taco
 for f in "$X"/in/*; do
   n=$(basename "$f")
-  "$TACO" fold "$f" -o "$X/mac/$n.taco" --model "$MODEL" --threads 6 -f 2>/dev/null
+  case $n in *.logs.*) p=logs ;; *) p=text ;; esac
+  "$TACO" fold "$f" -o "$X/mac/$n.taco" --model "$MODEL" --profile $p --threads 6 -f 2>/dev/null
 done
 
 echo "== on devbox: unfold the Mac files, fold the same inputs"
 scripts/dx main "set -e; cargo build --release -q -p taco-cli; T=\$CARGO_TARGET_DIR/release/taco; rm -rf $X/linux $X/back_on_linux; mkdir -p $X/linux $X/back_on_linux; \
   for f in $X/mac/*.taco; do n=\$(basename \$f .taco); \$T unfold \$f -o $X/back_on_linux/\$n --model $MODEL --threads 6 -f 2>/dev/null; cmp -s $X/in/\$n $X/back_on_linux/\$n && echo \"restored-on-linux ok   \$n\" || echo \"restored-on-linux FAIL \$n\"; done; \
-  for f in $X/in/*; do n=\$(basename \$f); \$T fold \$f -o $X/linux/\$n.taco --model $MODEL --threads 6 -f 2>/dev/null; done; \
+  for f in $X/in/*; do n=\$(basename \$f); case \$n in *.logs.*) p=logs ;; *) p=text ;; esac; \$T fold \$f -o $X/linux/\$n.taco --model $MODEL --profile \$p --threads 6 -f 2>/dev/null; done; \
   (cd $X/linux && sha256sum *.taco) > $X/linux/SHA256SUMS" | grep -E "restored-on-linux" | tee "$X/linux_restore.txt"
 
 echo "== copy the devbox files back"
@@ -61,6 +67,12 @@ for f in "$X"/linux/*.taco; do
 done
 grep -q FAIL "$X/linux_restore.txt" && fail=1
 
+echo "== the logs inputs have the profile logs (header byte 88) and mixed blocks"
+for f in "$X"/mac/*.logs.*.taco; do
+  mixed=$(python3 -c 'import sys; b=open(sys.argv[1],"rb").read(); n=int.from_bytes(b[84:88],"little"); print(sum(b[104+5*i]==3 for i in range(n)) if b[88]==1 else -1)' "$f")
+  if [ "$mixed" -gt 0 ]; then echo "profile logs ok        $(basename "$f") ($mixed mixed blocks)"; else echo "profile logs FAIL      $(basename "$f")"; fail=1; fi
+done
+
 echo "== compare the .taco files of both machines"
 (cd "$X/mac" && shasum -a 256 *.taco) > "$X/mac/SHA256SUMS"
 if diff "$X/mac/SHA256SUMS" "$X/linux/SHA256SUMS" >/dev/null; then
@@ -68,6 +80,6 @@ if diff "$X/mac/SHA256SUMS" "$X/linux/SHA256SUMS" >/dev/null; then
 else
   echo "the .taco files differ:"; diff "$X/mac/SHA256SUMS" "$X/linux/SHA256SUMS" || true; fail=1
 fi
-printf "%-24s %9s %9s\n" input bytes taco
-for f in "$X"/in/*; do n=$(basename "$f"); printf "%-24s %9d %9d\n" "$n" "$(wc -c < "$f")" "$(wc -c < "$X/mac/$n.taco")"; done
+printf "%-28s %9s %9s\n" input bytes taco
+for f in "$X"/in/*; do n=$(basename "$f"); printf "%-28s %9d %9d\n" "$n" "$(wc -c < "$f")" "$(wc -c < "$X/mac/$n.taco")"; done
 [ $fail -eq 0 ] && echo "xcheck: PASS" || { echo "xcheck: FAIL" >&2; exit 1; }
