@@ -13,6 +13,8 @@
 
 pub mod error;
 pub mod gelu;
+pub mod gpt2;
+pub mod hsm;
 pub mod int;
 pub mod kernels;
 pub mod layernorm;

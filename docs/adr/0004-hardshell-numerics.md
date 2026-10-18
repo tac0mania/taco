@@ -104,12 +104,56 @@ the weights is at most `2^60`. HardShell refuses a table that breaks this bound.
 - A linear layer has one `m` for each output row and one `s` for the layer, because the weight
   scale is different for each row (plan §7.1).
 
+### 7. Activations
+
+- An `i8` activation is symmetric: HardShell clamps it to `[-127, 127]`.
+- The converter selects each activation scale from calibration: the largest value maps to 127
+  (`i8`) or to 32,767 (the `i16` GELU input).
+
+### 8. The model file (plan §8)
+
+Plan §8 does not give the exact header schema. HardShell defines it. The full text is in the
+module documentation of `crates/hardshell/src/hsm/mod.rs` (layout and JSON schema) and
+`crates/hardshell/src/gpt2/mod.rs` (the forward pass and the tensor names). The Python
+converter must obey these two documents. The writer `hardshell::hsm::HsmWriter` is the
+reference implementation.
+
+The main rules:
+
+1. The fixed part is 16 bytes: the magic, the version (1) and `header_len`. The JSON header
+   follows at offset 16.
+2. The vocabulary and every tensor start at a multiple of 64 bytes. Plan §8 says "all
+   sections"; the fixed part and the header start at 0 and 16.
+3. The layout is canonical: the vocabulary is at `align64(16 + header_len)`, each tensor is at
+   `align64` of the end of the section before, in header order, and the file ends at the end of
+   the last tensor. All gap bytes are zero. The header can end with spaces. Thus one model has
+   exactly one file and one model hash.
+4. The header has three fields: `model` (architecture, `n_layer`, `n_head`, `d_model`, `d_ff`,
+   `vocab_size`, `n_ctx`, `eot_token`, and `constants` with `ln_k`, `ln_j`, `ln_eps`,
+   `softmax_p`), `vocabulary` (`offset`, `length`) and `tensors` (`name`, `dtype`, `shape`,
+   `offset`, `length`, and `shift` on a rescale tensor).
+5. Every number is an integer. A fraction, an exponent, an unknown field, a missing field or a
+   duplicate field is an error.
+6. A rescale `(m, s)` is an `i32` tensor of multipliers with a `shift`. Plan §8 puts `(m, s)`
+   in the JSON; HardShell puts `s` in the JSON and `m` in the data, because a linear layer has
+   one `m` for each output row.
+7. Plan §8 names the constants K, J and P. The file also needs `ln_eps`, `d_ff` and
+   `eot_token`, so the header has them.
+
+### 9. Context restart (plan §7.7)
+
+When the context has `n_ctx` tokens and the caller gives one more token, the session empties
+the context, runs `<|endoftext|>` at position 0, and runs the token at position 1.
+
 ## Consequences
 
 - The converter must obey the bounds in sections 1 and 2. If the residual is too small, the
   LayerNorm error increases (measured above).
 - These numbers measure each operation alone. The error of the full model is a phase 3
-  measurement on GPT-2. The error on a random tiny model is in the report of the hardshell
-  agent.
+  measurement on GPT-2. On a random tiny model (2 layers, width 64, vocabulary 300), the mean
+  KL divergence against the float model with the same `i8` weights is 0.006 to 0.009 bits for
+  each token, and the most likely token agrees for 93.8% to 96.1% of the positions (measured,
+  3 seeds, `crates/hardshell/tests/gpt2.rs`). A random model is not GPT-2, so these numbers do
+  not predict the GPT-2 loss.
 - A change to a constant changes the model file and the compressed bytes. It needs new
   conformance vectors.
