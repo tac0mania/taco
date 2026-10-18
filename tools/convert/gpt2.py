@@ -3,6 +3,11 @@
 Run from tools/ (after `python -m baseline.fetch`):
     nice uv run python -m convert.gpt2 [--recipe NAME] [--out PATH]
 
+Another model of the GPT-2 architecture with the GPT-2 vocabulary (for example distilgpt2,
+6 blocks) needs its own weights and its own calibration statistics:
+    nice uv run python -m convert.gpt2 --model M.safetensors --stats S.toml --out M.hsm
+The defaults give `gpt2.hsm`, and the file does not change (SHA-256 aaa03eb9...a5c2).
+
 Inputs: the published float weights (tools/data/model), the GPT-2 vocabulary and merges, and
 the calibration statistics in tools/convert/calib_stats.toml. The tool does not run the model.
 Thus the same inputs give the same file on every machine (`convert.numerics`, DETERMINISM).
@@ -19,7 +24,7 @@ import sys
 import time
 from pathlib import Path
 
-from baseline._paths import MODEL_DIR, OUT_DIR, check_file
+from baseline._paths import MODEL_DIR, OUT_DIR, check_file, sha256_file
 from baseline.bpe import EOT_ID, EOT_TEXT, Tokenizer
 from convert import recipe as rc
 from convert.build import build
@@ -50,14 +55,24 @@ def main() -> int:
     ap.add_argument("--recipe", default="clip", choices=sorted(rc.RECIPES))
     ap.add_argument("--stats", type=Path, default=STATS_PATH)
     ap.add_argument("--out", type=Path, default=OUT_DIR / "gpt2.hsm")
+    ap.add_argument("--model", type=Path, default=None,
+                    help="a GPT-2-architecture safetensors file (default: GPT-2 small)")
+    ap.add_argument("--model-sha256", default=None, help="the expected SHA-256 of --model")
     args = ap.parse_args()
     t0 = time.time()
-    check_file(MODEL_DIR / "model.safetensors", MODEL_SIZE, MODEL_SHA256)
+    if args.model is None:
+        args.model = MODEL_DIR / "model.safetensors"
+        check_file(args.model, MODEL_SIZE, MODEL_SHA256)
+    else:
+        model_sha = sha256_file(args.model)
+        if args.model_sha256 is not None and model_sha != args.model_sha256:
+            raise ValueError(f"{args.model}: sha256 {model_sha}, expected {args.model_sha256}")
+        print(f"model {args.model}: sha256 {model_sha}")
     stats = rc.load_stats(args.stats)
     sc = rc.scales(stats, rc.RECIPES[args.recipe])
     tok = Tokenizer()
     vocab, merges = vocabulary_and_merges(tok)
-    fm = load_gpt2(MODEL_DIR / "model.safetensors")
+    fm = load_gpt2(args.model)
     hsm = build(fm, sc, vocab, merges)
     size, sha = write(hsm, args.out)
     shifts = {t.name: t.shift for t in hsm.tensors if t.shift is not None}

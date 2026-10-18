@@ -10,6 +10,15 @@ dependencies = [
     "zstandard>=0.22",
 ]
 
+[project.optional-dependencies]
+# Route A (tools/finetune/train.py): the fine-tune on a GPU machine. Not in the default
+# environment. Install with `uv sync --extra train`. The data tools and the converter do not
+# need it.
+train = [
+    "torch>=2.4",
+    "transformers>=4.44",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

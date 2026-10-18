@@ -11,6 +11,10 @@ section 1 needs 2^12 units or more.
 
 Output: tools/convert/calib_stats.toml (committed; the converter reads it) and
 tools/data/out/calib_channels.npz (the channel maxima; not committed).
+
+For another GPT-2-architecture model (Route A):
+    nice uv run python -m convert.calibrate --model M.safetensors --windows W.txt \
+        --stats-out S.toml --channels-out C.npz
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ from baseline._paths import MODEL_DIR, OUT_DIR, check_file
 from baseline.bpe import Tokenizer
 from baseline.fetch import fetch
 from convert.model import FModel, forward, load_gpt2
-from convert.windows import CALIB_DIR, PACKAGE_DIR, calibration_windows
+from convert.windows import CALIB_DIR, PACKAGE_DIR, Window, calibration_windows
 
 STATS_PATH = PACKAGE_DIR / "calib_stats.toml"
 CHANNELS_PATH = OUT_DIR / "calib_channels.npz"
@@ -97,10 +101,10 @@ def _f(x: float) -> str:
     return repr(float(x))
 
 
-def write_stats(obs: Observer, windows, path: Path) -> None:
+def write_stats(obs: Observer, windows, path: Path, name: str = "GPT-2 small") -> None:
     sd = np.concatenate(obs.row_std)
     lines = [
-        "# Calibration statistics of GPT-2 small (measured; `python -m convert.calibrate`).",
+        f"# Calibration statistics of {name} (measured; `python -m convert.calibrate`).",
         "# The converter (`python -m convert.gpt2`) reads this file and selects the scales.",
         "# All values are absolute values of activations, in float units.",
         "",
@@ -138,9 +142,27 @@ def write_stats(obs: Observer, windows, path: Path) -> None:
     path.write_text("\n".join(lines))
 
 
+def read_windows(path: Path, tok: Tokenizer) -> list[Window]:
+    """Windows from a file of lines `label<TAB>ids` (the format of eval_bits)."""
+    out = []
+    for line in path.read_text().splitlines():
+        if not line or line.startswith("#"):
+            continue
+        label, ids = line.split("\t", 1)
+        toks = [int(x) for x in ids.split()]
+        out.append(Window(label, toks, tok.decode(toks)))
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--fetch", action="store_true", help="download the calibration files")
+    ap.add_argument("--model", type=Path, default=None,
+                    help="a GPT-2-architecture safetensors file (default: GPT-2 small)")
+    ap.add_argument("--windows", type=Path, default=None,
+                    help="a window file (label, tab, ids) instead of calibration.toml")
+    ap.add_argument("--stats-out", type=Path, default=STATS_PATH)
+    ap.add_argument("--channels-out", type=Path, default=CHANNELS_PATH)
     args = ap.parse_args()
     if args.fetch:
         import tomllib
@@ -150,16 +172,21 @@ def main() -> int:
         for s in spec["source"]:
             fetch(s["url"], CALIB_DIR / s["name"], s["size"], s["sha256"])
     tok = Tokenizer()
-    windows = calibration_windows(tok)
+    windows = calibration_windows(tok) if args.windows is None else read_windows(args.windows, tok)
     print(f"calibration: {len(windows)} windows, {sum(len(w.tokens) for w in windows)} tokens")
-    check_file(MODEL_DIR / "model.safetensors", 548105171,
-               "248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707")
-    model = load_gpt2(MODEL_DIR / "model.safetensors")
+    if args.model is None:
+        args.model = MODEL_DIR / "model.safetensors"
+        check_file(args.model, 548105171,
+                   "248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707")
+        name = "GPT-2 small"
+    else:
+        name = f"{args.model.parent.name}/{args.model.name}"
+    model = load_gpt2(args.model)
     obs = run(model, windows)
-    write_stats(obs, windows, STATS_PATH)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    np.savez(CHANNELS_PATH, **{k: v for k, v in obs.chan.items()})
-    print(f"wrote {STATS_PATH} and {CHANNELS_PATH}")
+    write_stats(obs, windows, args.stats_out, name)
+    args.channels_out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(args.channels_out, **{k: v for k, v in obs.chan.items()})
+    print(f"wrote {args.stats_out} and {args.channels_out}")
     return 0
 
 

@@ -1,0 +1,142 @@
+# Data for Route A: distilgpt2 fine-tuned on logs (research note 2026-10-19-route-a).
+#
+# The files are not committed. `python -m finetune.prepare` reads the archives from a local
+# directory, checks the size and the SHA-256 (measured on 2026-10-18), and writes the splits.
+#
+# Licence (read on 2026-10-18):
+# - The Zenodo record 10.5281/zenodo.8196385 ("Loghub: A Large Collection of System Log
+#   Datasets for AI-driven Log Analytics") states the licence CC-BY-4.0.
+# - The GitHub repository logpai/loghub states: "The datasets are freely available for research
+#   or academic work." For use or distribution, refer to the repository URL and cite the Loghub
+#   paper (Zhu et al., ISSRE 2023). GitHub reports the licence as "Other" (NOASSERTION).
+# - The two statements are not the same. CC-BY-4.0 permits commercial use with attribution. The
+#   README text names research use only. The owner must decide before a model that was
+#   trained on Loghub ships in a product. Taco does not distribute the logs.
+# - The logs are not anonymised (Loghub README). They can contain host names, user names and
+#   IP addresses. Do not publish them or text that a model generates from them.
+
+[licence]
+zenodo = "CC-BY-4.0"
+github = "freely available for research or academic work; cite the Loghub paper"
+citation = "Zhu, He, He, Liu, Lyu. Loghub: A Large Collection of System Log Datasets for AI-driven Log Analytics. ISSRE 2023"
+
+[split]
+# Systems that the model never sees in training (all their data is evaluation data).
+held_out = ["Apache", "HealthApp", "Proxifier", "Zookeeper"]
+# For each training system: the first `cap` bytes of the large file (cut at a line end), then
+# train = the first 90 %, val = the next 5 % (checkpoint selection), tail = the last 5 %
+# (evaluation only). The 2k samples of the training systems can contain lines of the train part.
+cap = 25165824
+train_fraction = 0.90
+val_fraction = 0.05
+
+# The larger raw files (Zenodo). `range` = the first bytes of the archive only (an HTTP range
+# request); the partial tar.gz gives a prefix of the log, which is sufficient for `cap`.
+# `members`: the archive members, joined in this order. A pattern ("*.log") selects all the
+# files that agree with it, in archive order.
+
+[[archive]]
+system = "Android"
+url = "https://zenodo.org/api/records/8196385/files/Android_v1.zip/content"
+name = "Android_v1.zip"
+size = 24858007
+sha256 = "0d04afa769e9eb59f9551151698127127e08c0c831b423c974024c78ce8c4d71"
+members = ["Android.log"]
+
+[[archive]]
+system = "BGL"
+url = "https://zenodo.org/api/records/8196385/files/BGL.zip/content"
+name = "BGL.zip"
+size = 57489019
+sha256 = "d67fd82a711aea0157a9b83175892c6ee60e384a2ddf5bc51f39118453816da8"
+members = ["BGL.log"]
+
+[[archive]]
+system = "HDFS"
+url = "https://zenodo.org/api/records/8196385/files/HDFS_v1.zip/content"
+name = "HDFS_v1.zip"
+size = 186645559
+sha256 = "04f919f2185821f23f045dca611a7586429bdabc601bd7b43f30005f8e289b01"
+members = ["HDFS.log"]
+
+[[archive]]
+system = "HPC"
+url = "https://zenodo.org/api/records/8196385/files/HPC.zip/content"
+name = "HPC.zip"
+size = 2975898
+sha256 = "3df2d31235c441083d8bee41f15bebd9ca5997f1a2ba9e6a967118865dfb1811"
+members = ["HPC.log"]
+
+[[archive]]
+system = "Hadoop"
+url = "https://zenodo.org/api/records/8196385/files/Hadoop.zip/content"
+name = "Hadoop.zip"
+size = 3416419
+sha256 = "79e63c6521e90ae164754a29d13e04e0c6c5e782490a7fe1e2b124f4f5737ced"
+members = ["*.log"]
+
+[[archive]]
+system = "Linux"
+url = "https://zenodo.org/api/records/8196385/files/Linux.tar.gz/content"
+name = "Linux.tar.gz"
+size = 232039
+sha256 = "7e1f820d8d45ae086032e515d9ce8d079a102a9b37dcff5b41a8e60b1f857820"
+members = ["Linux.log"]
+
+[[archive]]
+system = "Mac"
+url = "https://zenodo.org/api/records/8196385/files/Mac.tar.gz/content"
+name = "Mac.tar.gz"
+size = 1489372
+sha256 = "a3ebaae341af38f397924cc4f00f2e0e95ff9db4e97abd0dd23986eda239a5a3"
+members = ["Mac.log"]
+
+[[archive]]
+system = "OpenStack"
+url = "https://zenodo.org/api/records/8196385/files/OpenStack.tar.gz/content"
+name = "OpenStack.tar.gz"
+size = 5394691
+sha256 = "87c98c5ed03262e05cdb7a6f3717033df76d88fda0f7d2db23bd9fa4200f1879"
+members = ["openstack_normal1.log", "openstack_normal2.log", "openstack_abnormal.log"]
+
+[[archive]]
+system = "OpenSSH"
+url = "https://zenodo.org/api/records/8196385/files/SSH.tar.gz/content"
+name = "SSH.tar.gz"
+size = 4596666
+sha256 = "296610a35773f58b7c295e5407fc5ccdf48beb3c544fc14a6309addf904a2712"
+members = ["SSH.log"]
+
+[[archive]]
+system = "Spark"
+url = "https://zenodo.org/api/records/8196385/files/Spark.tar.gz/content"
+name = "part16M_Spark.tar.gz"
+range = "0-16777215"
+size = 16777216
+sha256 = "8bff865698102e47373ab8b2b963ad4a1641876601ea41a1c40fe861566b9d00"
+members = ["*.log"]
+
+[[archive]]
+system = "Thunderbird"
+url = "https://zenodo.org/api/records/8196385/files/Thunderbird.tar.gz/content"
+name = "part16M_Thunderbird.tar.gz"
+range = "0-16777215"
+size = 16777216
+sha256 = "579e4f0672b1a8d35920aea6c7b5d56366e953c9a5afffb663ab9eae80253ea3"
+members = ["Thunderbird.log"]
+
+[[archive]]
+system = "Windows"
+url = "https://zenodo.org/api/records/8196385/files/Windows.tar.gz/content"
+name = "part16M_Windows.tar.gz"
+range = "0-16777215"
+size = 16777216
+sha256 = "bfe9238152993b9bfcba7507b819597c982b41029d44378b19a8b320f0362abd"
+members = ["Windows.log"]
+
+# The 2k samples (2,000 lines of each of the 16 systems): the "logs" agent downloads them to
+# tools/data/logs with tools/logs/logs.toml (URL, size and SHA-256 are there). This tool reads
+# them and checks them against that file.
+[samples]
+manifest = "../logs/logs.toml"
+group = "loghub"

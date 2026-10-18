@@ -77,20 +77,35 @@ class FModel:
         return self.wpe.shape[0]
 
 
-def load_gpt2(path: Path, dtype: type = np.float32) -> FModel:
-    """Load GPT-2 small from the published safetensors file. Conv1D weights become [out, in]."""
+def load_gpt2(path: Path, dtype: type = np.float32, n_head: int = 12) -> FModel:
+    """Load a GPT-2-architecture model from a safetensors file. Conv1D weights become [out, in].
+
+    The file can be the published GPT-2 small file (names `h.0.ln_1.weight`, ...) or a file
+    that `transformers` writes (the same names after `transformer.`). The number of blocks is
+    the number of `h.{i}.ln_1.weight` tensors. If the file has `lm_head.weight`, it must be
+    equal to `wte.weight`, because the model file stores one tied matrix.
+    """
     from safetensors.numpy import safe_open
 
     with safe_open(str(path), "np") as f:
+        keys = set(f.keys())
+        pre = "transformer." if "transformer.wte.weight" in keys else ""
 
         def get(name: str) -> np.ndarray:
-            return np.ascontiguousarray(f.get_tensor(name), dtype=dtype)
+            return np.ascontiguousarray(f.get_tensor(pre + name), dtype=dtype)
 
         def get_t(name: str) -> np.ndarray:
-            return np.ascontiguousarray(f.get_tensor(name).T, dtype=dtype)
+            return np.ascontiguousarray(f.get_tensor(pre + name).T, dtype=dtype)
 
+        n_layer = 0
+        while f"{pre}h.{n_layer}.ln_1.weight" in keys:
+            n_layer += 1
+        if "lm_head.weight" in keys and not np.array_equal(
+            f.get_tensor("lm_head.weight"), f.get_tensor(pre + "wte.weight")
+        ):
+            raise ValueError("lm_head.weight is not wte.weight: the model is not tied")
         blocks = []
-        for i in range(12):
+        for i in range(n_layer):
             p = f"h.{i}."
             blocks.append(
                 FBlock(
@@ -104,7 +119,7 @@ def load_gpt2(path: Path, dtype: type = np.float32) -> FModel:
             )
         return FModel(
             wte=get("wte.weight"), wpe=get("wpe.weight"), blocks=blocks,
-            lnf_g=get("ln_f.weight"), lnf_b=get("ln_f.bias"), n_head=12, eot=50256,
+            lnf_g=get("ln_f.weight"), lnf_b=get("ln_f.bias"), n_head=n_head, eot=50256,
         )
 
 
