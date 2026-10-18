@@ -91,8 +91,8 @@ exponent table (§7.6). The output is a table with total `T = 2^FREQ_BITS`.
 
 Algorithm:
 
-1. Let `V` be the number of tokens and `W` the sum of the weights. If `W` is 0, all weights are
-   1.
+1. Let `V` be the number of tokens and `W` the sum of the weights, calculated in `u128` (a
+   `u64` sum can overflow). If `W` is 0, all weights are 1.
 2. `f[i] = 1 + floor(w[i] * (T - V) / W)`. Calculate the product in `u128`.
 3. The sum of `f` is at most `T`. Add the remainder `T - sum(f)` to the token with the largest
    weight. If two tokens have the same weight, use the lower token id.
@@ -109,8 +109,12 @@ Phase 2 uses GPT-2 small (124M parameters, 12 layers, width 768, context 1,024).
 - Published integer-only methods (I-BERT) cover all its operations.
 
 Later models (phase 6): a small model that we train for one data type (logs, code, JSON), and
-a 3B model. devbox has Nanbeige4.2-3B as a Q4_K_M GGUF file (2.5 GiB). Its weights are already
-4-bit integers with block scales. Its licence and its architecture are UNVERIFIED.
+a model of 3B to 4B parameters. devbox has Nanbeige4.2-3B as a Q4_K_M GGUF file of
+2,684,023,968 bytes (published, `~/Documents/dev-server/local-ai/README.md`). It is in the
+Ollama Docker volume of the local AI stack. Q4_K_M has about 4.8 bits for each weight (est.),
+so the file holds about 4.4B parameters (est.). Read the parameter count from the GGUF header
+before you use it. Its weights are already 4-bit integers with block scales. Its licence and its
+architecture are UNVERIFIED.
 
 ## §7 HardShell numerics
 
