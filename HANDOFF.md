@@ -1,6 +1,6 @@
 # Taco: session handoff
 
-Written 2026-10-18 at about 15:00 +04 by the lead session (Claude). A new session or an agent
+Written 2026-10-18 at about 15:00 +04, updated at about 16:30 +04 by the lead session (Claude). A new session or an agent
 starts with no conversation context. This file is the context. Read it once from top to bottom.
 
 - **Lead (a new session):** read sections 1 to 6. Then do section 5 in order.
@@ -25,8 +25,9 @@ the only model of version 1. Nanbeige is not in the plan. Documents use ASD-STE1
 | `crates/hardshell` | Done. Integer kernels, LayerNorm, GELU, softmax, `.hsm` reader and writer, integer GPT-2 with KV cache (ADR 0004). | 61 pass |
 | `crates/taco-format` | Done. `.taco` container version 1 (ADR 0006). | 54 pass |
 | `tools/baseline` | Done. NumPy GPT-2, Python BPE, Python coder, phase 0 and 1A scripts. | BPE 6,284 and coder 600 round trips |
-| `tools/convert` | In progress (agent "convert"). GPT-2 to `gpt2.hsm`, calibration, merges section, tiny conformance model, integer quality. | — |
-| `crates/taco`, `crates/taco-cli` | In progress (agent "taco"). Tokenizer, fold and unfold, the `taco` command. | — |
+| `tools/convert` | Done. GPT-2 to `gpt2.hsm` (recipe `clip`, beta correction), merges section, `conformance/tiny.hsm`. | converter hash repeats |
+| `crates/taco` | Done. Tokenizer (equal to Python on 4,926,962 tokens), fold and unfold, ADR 0007. | 51 pass |
+| `crates/taco-cli` | Done. `taco fold` and `taco unfold`. | 7 pass |
 
 Key measurements (all measured on the Mac):
 
@@ -36,7 +37,14 @@ Key measurements (all measured on the Mac):
 - Coder overhead against the table ideal: 0.021%.
 - Float drift on one machine: full-sequence encode with KV-cache decode decoded 1 of 270
   windows. Batch 4 against batch 1, and float32 against float64, decoded 0 of 38.
-- HardShell on a GPT-2-sized random model: 41.2 tokens/s on one thread.
+- HardShell on a GPT-2-sized random model: 41.2 tokens/s on one thread. Real `gpt2.hsm`: about
+  55 tokens/s on one thread (measured by `eval_bits`).
+- Integer GPT-2 (`gpt2.hsm`, SHA-256 `aaa03eb9…a5c2`) against float on 16 held-out text files:
+  1.871 against 1.867 bits per byte (+0.2%).
+- `taco fold` with `gpt2.hsm`, all restored byte for byte: alice29 (32 KiB) 8,432 bytes (xz
+  12,400); cp.html 4,759 (xz 7,652); lcet10 (4 KiB) 1,237 (xz 1,684); HDFS log (16 KiB) 3,129
+  (xz 3,164); kennedy.xls (8 KiB) stored raw, 8,285 (xz 1,672). Speed: about 0.5 KB/s with 6
+  threads.
 
 Golden hashes (conformance vectors, plan §11). The Mac computed them. devbox has not checked
 them yet.
@@ -46,6 +54,9 @@ them yet.
 | Coder stream | `91676cdc669fca0eb22ed18f5f629882212523261f41d0d5c568b647e78d798f` |
 | HardShell tiny model output | `d4063522517854fdcab605c3d3159bd3ac9a15eb92fa6721ff4a276658f90078` |
 | Container vector A | `c1c07402a5dae2993c596345a696d35b7c1c0502fe304d31fa33d4f5ecefeeec` |
+| taco golden container (tiny model) | `c3ff718b1c9682589836078b36d936836077744b03b1cc8af3a6ced0d5821b8a` |
+| `gpt2.hsm` | `aaa03eb96e9ad7957432168c8ac6b4a99ed55d57e637e4786a664b51001ba5c2` |
+| `conformance/tiny.hsm` | `eb78b89a4f0f17c7245865aed22f86512a49e0272b7583a831c47e1a401418f8` |
 
 ## 3. Machines
 
@@ -55,30 +66,27 @@ them yet.
   more disk now. `scripts/dx` refuses to run while Windows C: has less than 15 GB free. Do not
   start Ubuntu or the keep-alive task without Rohit's approval.
 
-## 4. Running agents at 15:00
+## 4. Running agents
 
-| Agent | Owns | Status file |
-|---|---|---|
-| convert | `tools/convert`, `crates/hardshell/src/hsm` (merges only), `crates/hardshell/examples`, `conformance/` | `.agent-status/convert.md` |
-| taco | `crates/taco`, `crates/taco-cli`, ADR 0007 | `.agent-status/taco.md` |
-
-Read the status files for their progress. Do not guess from file times.
+None at 16:30. Old status files are in `.agent-status/` (not committed).
 
 ## 5. Next steps, in order
 
-1. When "convert" finishes: verify, then commit in small steps (hsm merges, converter, tiny
-   model, eval example, research note).
-2. When "taco" finishes: connect its tokenizer to `HsmFile` merges. Verify. Commit.
-3. Run `taco fold` on the Mac with `gpt2.hsm`, and `taco unfold` on the result.
-4. When devbox is back: run the cross-machine check. Run all golden tests on devbox
-   (`scripts/dx main cargo test --workspace`) and compare the hashes in section 2. Then write
-   `scripts/xcheck` (plan §11.3). Then fold on the Mac and unfold on devbox. That is the
-   phase 2 gate.
-5. Phase 1 part B (float drift, Mac against devbox): the commands are in §10 of
+1. When devbox is back: run the cross-machine check. Run the golden tests on devbox
+   (`scripts/dx main cargo test --workspace`) and compare the hashes in section 2. Make
+   `gpt2.hsm` on devbox (`python -m convert.gpt2 --recipe clip`) and compare its hash. Fold
+   on the Mac, unfold on devbox, and the reverse. Then write `scripts/xcheck` (plan §11.3).
+   That is the phase 2 gate.
+2. Phase 1 part B (float drift, Mac against devbox): the commands are in §10 of
    `docs/research/2026-10-18-phase0-baseline.md`.
-6. Phase 3 (quality): the integer loss against float, context length, the block size, and a
-   block kind that stores a block with zstd when GPT-2 is worse (binary data). The last item
-   changes the container format: it needs an ADR.
+3. Phase 3 (quality): longer context (sliding window), the block size, an integer match model
+   and a mixer for repeated text (logs, JSON), and a block kind that stores a block with zstd
+   when GPT-2 is worse (binary data). The last two change the container format: each needs an
+   ADR.
+4. Phase 4 (speed): SIMD on the CPU, then integer CUDA kernels. Every fast path must give the
+   same bits as the reference path.
+5. A head-to-head benchmark against zstd --long, brotli, PPMd, paq8px and cmix (where memory
+   allows) on the same files, for the README.
 
 ## 6. Notes
 
@@ -87,4 +95,5 @@ Read the status files for their progress. Do not guess from file times.
 - The Canterbury site refuses scripted downloads (HTTP 403). `tools/baseline` uses a GitHub
   mirror with the published sizes.
 - Time estimates for the owner (est.): prototype with fold and unfold bit-exact on both machines
-  in 3 to 5 days. Version 1 with a GPU path in 5 to 7 weeks.
+  in 3 to 5 days (fold and unfold already work on the Mac on 2026-10-18). Version 1 with a GPU
+  path in 5 to 7 weeks.
