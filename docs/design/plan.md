@@ -117,7 +117,8 @@ a larger model) are phase 6 work, after version 1 is released.
 ### §7.1 Number formats
 
 - Weights: `i8`, symmetric, with one scale for each output row.
-- Activations: `i8` with one static scale for each tensor. A tool calibrates the scales on a
+- Residual stream: `i32`, clamped to ±(2^30 − 1) (ADR 0004).
+- Activations: `i8` (symmetric, −127 to 127) with one static scale for each tensor. A tool calibrates the scales on a
   calibration corpus before publication. If phase 3 shows too much loss, activations change to
   `i16` with `i64` accumulation. The model file states the type of each tensor.
 - Accumulators: `i32` for `i8 x i8` dot products. Bound: 127 x 128 x 3,072 < 2^26, so an
@@ -170,11 +171,13 @@ table as §7.5, then gives the weights to `taco-coder::freq`.
 ### §7.7 Context
 
 A block starts with an empty context and the `<|endoftext|>` token. When the context is full
-(1,024 tokens for GPT-2), the context starts again. A sliding window is a phase 3 measurement.
+(1,024 tokens for GPT-2), the context starts again: `<|endoftext|>` at position 0, then the
+next token at position 1. A sliding window is a phase 3 measurement.
 
 ## §8 Model file (`.hsm`, version 1)
 
-All integers are little-endian. All sections start at a multiple of 64 bytes.
+All integers are little-endian. The header starts at byte 16. The vocabulary and each tensor
+start at a multiple of 64 bytes. ADR 0004 gives the exact layout and the JSON schema.
 
 ```
 magic        8 bytes   "HSHLMDL\0"

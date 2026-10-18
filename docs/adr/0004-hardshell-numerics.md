@@ -1,6 +1,6 @@
 # ADR 0004: HardShell numerics constants
 
-Date: 2026-10-18. Status: proposed (hardshell agent). The lead accepts it.
+Date: 2026-10-18. Status: accepted (proposed by the hardshell agent).
 
 ## Context
 
