@@ -20,8 +20,11 @@ All numbers below are measured on the Mac (ARM), 2026-10-18, unless a label says
   model. This is not an `i8` activation: it is not the input of a matrix product.
 - HardShell clamps the residual to `[-(2^30 - 1), 2^30 - 1]` after each addition. This bound
   keeps all LayerNorm products exact (see `src/layernorm.rs`).
-- The converter selects the residual scale so that the largest calibration value is near
-  `2^24` and a typical row has a standard deviation of `2^12` units or more.
+- The converter selects the residual scale so that a typical row has a standard deviation of
+  `2^12` units or more. For GPT-2 this puts the largest calibration value at about `2^27.45`
+  (measured), still inside the clamp. The first rule of this ADR also asked for a largest value
+  near `2^24`. GPT-2 cannot meet both rules, so the standard-deviation rule has priority
+  (changed 2026-10-18 after the convert measurements).
 
 ### 2. LayerNorm (plan §7.3)
 
@@ -107,8 +110,17 @@ the weights is at most `2^60`. HardShell refuses a table that breaks this bound.
 ### 7. Activations
 
 - An `i8` activation is symmetric: HardShell clamps it to `[-127, 127]`.
-- The converter selects each activation scale from calibration: the largest value maps to 127
-  (`i8`) or to 32,767 (the `i16` GELU input).
+- The converter selects each activation scale from calibration with a recipe for each site. The
+  published recipe is `clip` (`tools/convert/recipe.py`). For most sites the largest calibration
+  value maps to 127 (`i8`) or to 32,767 (the `i16` GELU input). For `ln_f` and the GELU outputs,
+  the range comes from the typical channel, and the few outlier channels saturate at the clamp.
+- The first rule ("the largest value maps to 127" at every site) failed for GPT-2: +67% bits on
+  the held-out windows (measured). Outlier channels reach 295 while a typical channel used one
+  or two levels. The `clip` recipe gives +0.2% against float on the held-out text files
+  (measured, `docs/research/2026-10-18-integer-gpt2.md`).
+- **Beta correction.** HardShell adds the LayerNorm `beta` after the rounding step, so each
+  channel has a constant error. The converter removes that error through the bias of the next
+  linear layer. This is a converter rule: every converter for a HardShell model must apply it.
 
 ### 8. The model file (plan §8)
 

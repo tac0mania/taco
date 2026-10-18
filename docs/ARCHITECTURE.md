@@ -31,8 +31,8 @@ may use floats. Nothing in `crates/` calls a tool at run time.
 | Tool | Job | Plan |
 |---|---|---|
 | `tools/baseline` | Float GPT-2 in NumPy. Compression sizes. Float drift between machines. | §12 phases 0, 1 |
-| `tools/convert` | Float weights to a `.hsm` model file. Calibration. Tables. | §8 |
-| `tools/tinymodel` | The tiny conformance model from a fixed seed. | §11.1 |
+| `tools/convert` | Float weights to a `.hsm` model file. Calibration (recipe `clip`). Tables. Merges. | §8 |
+| `tools/convert/tiny.py` | The tiny conformance model from a fixed seed. | §11.1 |
 
 ## Other directories
 
