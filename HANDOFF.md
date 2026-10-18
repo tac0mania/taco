@@ -70,6 +70,12 @@ them yet.
   `~/.cache/hippo/cuda` (Hippo's, read only). `scripts/dx` refuses to run while C: has less
   than 15 GB free.
 
+- **Colab** (Google, owner's account). The Colab CLI (`~/.local/bin/colab`) is signed in on
+  the Mac. Rule from Rohit (2026-10-18): use the RTX 3060 on devbox first. Use a Colab GPU only
+  for a heavy job that takes too long on the 3060, for example the conversion of a 3B to 4B
+  model. Colab time is limited (the balance was 0 compute units on 2026-10-18). Rohit permits Colab
+  for such jobs. Tell him when you start a session, and stop it when the job ends. A TPU runtime cannot run HardShell (no CUDA, no Vulkan).
+
 ## 4. Running agents
 
 | Agent | Owns | Status file |
