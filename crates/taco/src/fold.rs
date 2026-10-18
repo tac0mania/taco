@@ -1,6 +1,6 @@
 //! `fold`: input bytes to a `.taco` container (plan §4).
 
-use hardshell::gpt2::{Model, Session};
+use hardshell::gpt2::{Model, Session, SessionConfig};
 use taco_format::{Block, BlockSize, Container, ContainerParams};
 
 use crate::codec::{encode_block, tokens_restore};
@@ -8,6 +8,12 @@ use crate::error::{Result, TacoError};
 use crate::parallel::{Threads, map_blocks};
 use crate::tokenizer::Tokenizer;
 use crate::{DEFAULT_BLOCK_SIZE, container_hash};
+
+/// The number of tokens that the encoder gives to HardShell in one call (the prefill path).
+// NOTE: measured on the M2 with gpt2.hsm (1,024 tokens, one thread): 8 tokens 329, 32 tokens
+// 345 and 64 tokens 343 steps per second (simd agent). The work buffers grow with it: about
+// 12 * 32 * 50,257 bytes = 19 MB for each thread (est.).
+const FOLD_CHUNK: usize = 32;
 
 /// The options of [`fold`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,7 +92,8 @@ pub struct Folded {
 /// error here, not a damaged container.
 ///
 /// Cost: for each token, one HardShell step and one frequency table of the full vocabulary.
-/// Each thread holds one session (for GPT-2 small, about 19 MB of KV cache, est.). Memory:
+/// The steps of a block run 32 tokens at a time (`Session::step_many`). Each thread holds one
+/// session (for GPT-2 small, about 19 MB of KV cache and 19 MB of work buffers, est.). Memory:
 /// the input, the container, and the tokens and payload of each block.
 ///
 /// # Errors
@@ -111,7 +118,7 @@ pub fn fold(
     let coded = map_blocks(
         chunks.len(),
         options.threads,
-        || Session::new(model),
+        || Session::with_config(model, SessionConfig::new().with_chunk(FOLD_CHUNK)),
         |session, i| {
             let index = u32::try_from(i)
                 .map_err(|_| TacoError::InputTooLarge { reason: "more than u32::MAX blocks" })?;

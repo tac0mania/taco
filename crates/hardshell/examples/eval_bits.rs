@@ -3,8 +3,12 @@
 //!
 //! ```text
 //! cargo run --release -p hardshell --example eval_bits -- MODEL.hsm WINDOWS.txt \
-//!     [--threads N] [--digest] [--limit STEPS]
+//!     [--threads N] [--digest] [--limit STEPS] [--chunk N] [--reference]
 //! ```
+//!
+//! `--chunk N` runs the window with `Session::step_many`, `N` tokens at a time (the prefill
+//! path). `--reference` runs it with `ReferenceSession` (the scalar reference). The weights,
+//! and thus the digests, are the same for every choice.
 //!
 //! `WINDOWS.txt` has one window on each line: a label, a tab, then the token ids, separated by
 //! spaces. A line that starts with `#` is a comment. For each window the example calls
@@ -34,7 +38,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use hardshell::TokenId;
-use hardshell::gpt2::{Model, Session};
+use hardshell::gpt2::{Model, ReferenceSession, Session, SessionConfig};
 use sha2::{Digest, Sha256};
 
 type AnyResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -63,6 +67,8 @@ struct Args {
     threads: usize,
     digest: bool,
     limit: Option<usize>,
+    chunk: usize,
+    reference: bool,
 }
 
 fn parse_args() -> AnyResult<Args> {
@@ -71,17 +77,29 @@ fn parse_args() -> AnyResult<Args> {
     let mut threads = std::thread::available_parallelism().map_or(1, usize::from);
     let mut digest = false;
     let mut limit = None;
+    let mut chunk = 1;
+    let mut reference = false;
     while let Some(a) = it.next() {
         match a.as_str() {
             "--threads" => threads = it.next().ok_or("--threads needs a value")?.parse()?,
             "--digest" => digest = true,
             "--limit" => limit = Some(it.next().ok_or("--limit needs a value")?.parse()?),
+            "--chunk" => chunk = it.next().ok_or("--chunk needs a value")?.parse()?,
+            "--reference" => reference = true,
             _ => pos.push(a),
         }
     }
     let [model, windows] = <[String; 2]>::try_from(pos)
         .map_err(|_| "usage: eval_bits MODEL.hsm WINDOWS.txt [--threads N] [--digest]")?;
-    Ok(Args { model, windows, threads: threads.max(1), digest, limit })
+    Ok(Args {
+        model,
+        windows,
+        threads: threads.max(1),
+        digest,
+        limit,
+        chunk: chunk.max(1),
+        reference,
+    })
 }
 
 fn read_windows(path: &str, limit: Option<usize>) -> AnyResult<Vec<Window>> {
@@ -133,14 +151,42 @@ fn table_freq(weights: &[u64], token: usize) -> u128 {
     }
 }
 
-fn measure(model: &Model, w: &Window, digest: bool) -> AnyResult<Outcome> {
+/// Calls `f(i, weights)` with the weights that predict token `i` of the window, in order.
+fn run_window(
+    model: &Model,
+    w: &Window,
+    args: &Args,
+    mut f: impl FnMut(usize, &[u64]) -> AnyResult<()>,
+) -> AnyResult<()> {
+    let toks = &w.tokens;
+    let inputs = toks.get(..toks.len() - 1).unwrap_or(&[]);
+    if args.reference {
+        let mut s = ReferenceSession::new(model);
+        f(0, s.start_block()?)?;
+        for (i, &t) in inputs.iter().enumerate() {
+            f(i + 1, s.step(t)?)?;
+        }
+        return Ok(());
+    }
+    let mut s = Session::with_config(model, SessionConfig::new().with_chunk(args.chunk));
+    f(0, s.start_block()?)?;
+    let mut i = 1;
+    for part in inputs.chunks(args.chunk) {
+        for weights in s.step_many(part)?.iter() {
+            f(i, weights)?;
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+fn measure(model: &Model, w: &Window, args: &Args) -> AnyResult<Outcome> {
     let t0 = Instant::now();
-    let mut s = Session::new(model);
     let mut out = Outcome::default();
-    let mut hasher = digest.then(Sha256::new);
+    let mut hasher = args.digest.then(Sha256::new);
     let mut bytes = Vec::new();
-    for (i, &tok) in w.tokens.iter().enumerate() {
-        let weights = if i == 0 { s.start_block()? } else { s.step(w.tokens[i - 1])? };
+    run_window(model, w, args, |i, weights| {
+        let tok = w.tokens[i];
         let t = tok.get() as usize;
         let wt = *weights.get(t).ok_or("token id out of range")?;
         let sum: u128 = weights.iter().map(|&x| u128::from(x)).sum();
@@ -156,7 +202,8 @@ fn measure(model: &Model, w: &Window, digest: bool) -> AnyResult<Outcome> {
             }
         }
         bytes.extend_from_slice(model.vocabulary().token(tok).ok_or("token without bytes")?);
-    }
+        Ok(())
+    })?;
     out.bytes = bytes.len();
     out.seconds = t0.elapsed().as_secs_f64();
     out.digest = hasher.map(|h| h.finalize().iter().map(|b| format!("{b:02x}")).collect());
@@ -172,11 +219,13 @@ fn main() -> AnyResult<()> {
     let windows = read_windows(&args.windows, args.limit)?;
     let steps: usize = windows.iter().map(|w| w.tokens.len()).sum();
     eprintln!(
-        "model {} ({}), {} windows, {steps} steps, {} threads, loaded in {:.1} s",
+        "model {} ({}), {} windows, {steps} steps, {} threads, chunk {}{}, loaded in {:.1} s",
         args.model,
         model.hash(),
         windows.len(),
         args.threads,
+        args.chunk,
+        if args.reference { ", reference session" } else { "" },
         t0.elapsed().as_secs_f64()
     );
     let slots: Vec<Mutex<Option<AnyResult<Outcome>>>> =
@@ -190,7 +239,7 @@ fn main() -> AnyResult<()> {
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(w) = windows.get(i) else { break };
-                    let r = measure(&model, w, args.digest);
+                    let r = measure(&model, w, &args);
                     let k = done.fetch_add(1, Ordering::Relaxed) + 1;
                     eprintln!(
                         "  [{k}/{}] {} {:.1} s",

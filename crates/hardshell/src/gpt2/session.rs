@@ -1,78 +1,98 @@
-//! A GPT-2 session: the context (KV cache) and one forward pass for each token.
+//! A GPT-2 session: the context (KV cache) of one block. It runs one token at a time
+//! ([`Session::step`]) or many known tokens at a time ([`Session::step_many`], the prefill
+//! path of the encoder).
+//!
+//! Both paths use the op kernels of `ops` through `engine::forward`, and both give the same
+//! weights as [`super::ReferenceSession`], bit for bit (`tests/fast_paths.rs`).
 
-use super::model::{Block, Linear, Model, RowRescale};
-use super::{RESIDUAL_LIMIT as RES, SCORE_LIMIT};
+use super::Model;
+use super::attention::KvCache;
+use super::engine::{self, Row, Work};
 use crate::error::{Error, Result};
-use crate::int::{clamp_act_i8, clamp_i32, clamp_wide, rescale};
-use crate::kernels::{dot_i8, matvec_i8};
-use crate::logits::logits_to_weights;
-use crate::softmax::softmax;
+use crate::kernels::Kernels;
 use crate::types::TokenId;
+
+/// The options of a [`Session`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionConfig {
+    /// The largest number of tokens of one [`Session::step_many`] call: the number of rows
+    /// that share one read of the weights. At least 1.
+    pub chunk: usize,
+    /// The kernels. Every selection gives the same weights; only the speed differs.
+    pub kernels: Kernels,
+}
+
+impl SessionConfig {
+    /// The default options: a chunk of 1 token (the step path) and the fastest kernels of
+    /// this CPU.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The same options with another chunk size (at least 1).
+    #[must_use]
+    pub const fn with_chunk(mut self, chunk: usize) -> Self {
+        self.chunk = if chunk == 0 { 1 } else { chunk };
+        self
+    }
+
+    /// The same options with other kernels.
+    #[must_use]
+    pub const fn with_kernels(mut self, kernels: Kernels) -> Self {
+        self.kernels = kernels;
+        self
+    }
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self { chunk: 1, kernels: Kernels::detect() }
+    }
+}
 
 /// The state of one block of input: the KV cache, the position and the work buffers.
 ///
 /// A session borrows its model. Two sessions of one model give the same weights for the same
-/// tokens (DETERMINISM: every step uses only the integer rules of `int`).
+/// tokens, for every chunk size and every kernel selection (DETERMINISM: every step uses only
+/// the integer rules of `int`, and every kernel is exact).
 #[derive(Debug)]
 pub struct Session<'m> {
     model: &'m Model,
+    kernels: Kernels,
     /// The number of tokens in the context.
     pos: usize,
-    /// `[n_layer, n_ctx, d_model]` keys and values.
-    k_cache: Vec<i8>,
-    v_cache: Vec<i8>,
-    x: Vec<i32>,
-    a: Vec<i8>,
-    acc: Vec<i32>,
-    qkv: Vec<i8>,
-    att: Vec<i8>,
-    g: Vec<i8>,
-    scores: Vec<i64>,
-    probs: Vec<i64>,
-    head_acc: Vec<i64>,
-    logits: Vec<i64>,
-    weights: Vec<u64>,
-}
-
-/// An internal length error. It cannot occur for a model that `Model::load` accepted.
-fn internal(expected: usize, found: usize) -> Error {
-    Error::LengthMismatch { expected, found }
-}
-
-/// `rescale(acc + b, m[r], s)` for row `r`, as an `i128`.
-fn row_rescale(acc: i32, b: i32, r: &RowRescale, row: usize) -> i128 {
-    let m = r.m.get(row).copied().unwrap_or(0);
-    rescale(i64::from(acc) + i64::from(b), m, r.s)
+    /// One KV cache: the engine indexes caches by lane, and a session has lane 0 only.
+    cache: [KvCache; 1],
+    work: Work,
+    rows: Vec<Row>,
 }
 
 impl<'m> Session<'m> {
-    /// Makes a session with an empty context. Cost: allocates the KV cache,
-    /// `2 * n_layer * n_ctx * d_model` bytes.
+    /// Makes a session with an empty context and the default options (the step path). Cost:
+    /// allocates the KV cache, `2 * n_layer * n_ctx * d_model` bytes.
     ///
     /// PERF: GPT-2 small needs 18.9 MB of cache (est.: 2 * 12 * 1,024 * 768 bytes). A model
     /// file with many layers and a long context can ask for much more memory than its own size;
     /// the decoder loads only model files with a known hash.
     #[must_use]
     pub fn new(model: &'m Model) -> Self {
-        let d = model.dims;
-        let cache = d.n_layer * d.n_ctx * d.d_model;
-        let acc_len = (3 * d.d_model).max(d.d_ff).max(d.vocab);
+        Self::with_config(model, SessionConfig::new())
+    }
+
+    /// Makes a session with the options `config`. Cost: the KV cache, and work buffers of
+    /// about `12 * chunk * vocab` bytes (for GPT-2 small and a chunk of 32: 19 MB, est.).
+    #[must_use]
+    pub fn with_config(model: &'m Model, config: SessionConfig) -> Self {
+        let chunk = config.chunk.max(1);
         Self {
             model,
+            kernels: config.kernels,
             pos: 0,
-            k_cache: vec![0; cache],
-            v_cache: vec![0; cache],
-            x: vec![0; d.d_model],
-            a: vec![0; d.d_model],
-            acc: vec![0; acc_len],
-            qkv: vec![0; 3 * d.d_model],
-            att: vec![0; d.d_model],
-            g: vec![0; d.d_ff],
-            scores: vec![0; d.n_ctx],
-            probs: vec![0; d.n_ctx],
-            head_acc: vec![0; d.head_dim],
-            logits: vec![0; d.vocab],
-            weights: vec![0; d.vocab],
+            cache: [KvCache::new(model)],
+            work: Work::new(model, chunk, chunk),
+            rows: Vec::with_capacity(2 * chunk),
         }
     }
 
@@ -87,6 +107,18 @@ impl<'m> Session<'m> {
         self.pos
     }
 
+    /// The largest number of tokens of one [`Session::step_many`] call.
+    #[must_use]
+    pub fn chunk(&self) -> usize {
+        self.work.cap()
+    }
+
+    /// The kernels of this session.
+    #[must_use]
+    pub fn kernels(&self) -> Kernels {
+        self.kernels
+    }
+
     /// Starts a block (plan §7.7): empties the context and runs `<|endoftext|>`. The result is
     /// the weights for the first token of the block.
     ///
@@ -94,7 +126,12 @@ impl<'m> Session<'m> {
     /// The errors of [`Session::step`].
     pub fn start_block(&mut self) -> Result<&[u64]> {
         self.reset();
-        self.step(self.model.eot_token())
+        let eot = self.model.check_token(self.model.eot_token())?;
+        self.rows.clear();
+        self.rows.push(Row { lane: 0, pos: 0, tok: eot, out: Some(0) });
+        engine::forward(self.kernels, self.model, &mut self.cache, &self.rows, &mut self.work)?;
+        self.pos = 1;
+        self.weights(0)
     }
 
     /// Adds `token` to the context and runs the model. The result has one weight for each
@@ -108,138 +145,93 @@ impl<'m> Session<'m> {
     /// # Errors
     /// [`Error::TokenOutOfRange`] if `token` is not in the vocabulary.
     pub fn step(&mut self, token: TokenId) -> Result<&[u64]> {
-        let tok = self.model.check_token(token)?;
-        if self.pos >= self.model.dims.n_ctx {
-            // PLAN(§7.7): the context starts again with <|endoftext|>.
-            self.reset();
-            let eot = self.model.check_token(self.model.eot_token())?;
-            self.forward(eot)?;
-        }
-        self.forward(tok)?;
-        Ok(&self.weights)
+        self.run(core::slice::from_ref(&token))?;
+        self.weights(0)
     }
 
-    /// One forward pass at position `self.pos`; then `pos` increases by one.
+    /// Adds all `tokens` to the context, in order, and runs the model for all of them at once
+    /// (the prefill path). The result is the same as one [`Session::step`] for each token:
+    /// item `i` of the result is the weights after `tokens[i]`, bit for bit. Context restarts
+    /// (plan §7.7) happen at the same tokens as with `step`.
     ///
-    /// DETERMINISM: every value is an integer, every rounding is `int::rescale`, and every
-    /// saturation is `int::clamp*`. The kernels may sum in any order (integer addition is
-    /// associative and nothing overflows), so the weights are the same bits on every machine.
-    fn forward(&mut self, tok: usize) -> Result<()> {
+    /// Cost: the multiply-adds of one `step` for each token, but each weight of the model is
+    /// read from memory once for all the tokens of the call.
+    ///
+    /// # Errors
+    /// [`Error::LengthMismatch`] if `tokens` has more than [`Session::chunk`] tokens;
+    /// [`Error::TokenOutOfRange`] if a token is not in the vocabulary. On an error the context
+    /// does not change.
+    pub fn step_many(&mut self, tokens: &[TokenId]) -> Result<StepWeights<'_>> {
+        self.run(tokens)?;
+        let vocab = self.model.vocab_size();
+        let data = self.work.weights_prefix(vocab, tokens.len()).unwrap_or(&[]);
+        Ok(StepWeights { data, vocab })
+    }
+
+    /// The rows for `tokens`, then the forward pass in groups of at most `chunk` rows.
+    fn run(&mut self, tokens: &[TokenId]) -> Result<()> {
+        let cap = self.work.cap();
+        if tokens.len() > cap {
+            return Err(Error::LengthMismatch { expected: cap, found: tokens.len() });
+        }
         let model = self.model;
-        let t = self.pos;
-        self.embed(tok, t)?;
-        for (l, block) in model.blocks.iter().enumerate() {
-            self.attention(block, l, t)?;
-            self.mlp(block)?;
+        let n_ctx = model.n_ctx();
+        let eot = model.check_token(model.eot_token())?;
+        self.rows.clear();
+        let mut pos = self.pos;
+        for (i, &t) in tokens.iter().enumerate() {
+            let tok = model.check_token(t)?;
+            if pos >= n_ctx {
+                // PLAN(§7.7): the context starts again with <|endoftext|>. Its weights are not
+                // used, so the row has no output slot.
+                self.rows.push(Row { lane: 0, pos: 0, tok: eot, out: None });
+                pos = 1;
+            }
+            self.rows.push(Row { lane: 0, pos, tok, out: Some(i) });
+            pos += 1;
         }
-        model.ln_f.apply(model.ln_consts, &self.x, &mut self.a)?;
-        let vocab = model.dims.vocab;
-        let acc = self.acc.get_mut(..vocab).ok_or(internal(vocab, 0))?;
-        matvec_i8(&model.wte, &self.a, acc)?;
-        for (v, (l, &s)) in self.logits.iter_mut().zip(acc.iter()).enumerate() {
-            let m = model.logit.m.get(v).copied().unwrap_or(0);
-            *l = clamp_wide(rescale(i64::from(s), m, model.logit.s), -SCORE_LIMIT, SCORE_LIMIT);
+        for group in self.rows.chunks(cap) {
+            engine::forward(self.kernels, model, &mut self.cache, group, &mut self.work)?;
         }
-        logits_to_weights(&self.logits, &model.logits_exp, &mut self.weights)?;
-        self.pos = t + 1;
+        self.pos = pos;
         Ok(())
     }
 
-    /// Step 1 of the forward pass: token and position embeddings into the residual stream.
-    fn embed(&mut self, tok: usize, t: usize) -> Result<()> {
-        let model = self.model;
-        let d = model.dims.d_model;
-        let te = model.wte.row(tok).ok_or(internal(d, 0))?;
-        let pe = model.wpe.row(t).ok_or(internal(d, 0))?;
-        let tm = model.embed.m.get(tok).copied().unwrap_or(0);
-        let pm = model.pos.m.get(t).copied().unwrap_or(0);
-        for ((x, &a), &b) in self.x.iter_mut().zip(te).zip(pe) {
-            let v =
-                rescale(i64::from(a), tm, model.embed.s) + rescale(i64::from(b), pm, model.pos.s);
-            *x = clamp_i32(v, -RES, RES);
-        }
-        Ok(())
+    fn weights(&self, slot: usize) -> Result<&[u64]> {
+        let vocab = self.model.vocab_size();
+        self.work.weights(vocab, slot).ok_or(Error::LengthMismatch { expected: vocab, found: 0 })
+    }
+}
+
+/// The weights of a [`Session::step_many`] call: one row of `vocab_size` weights for each
+/// token.
+#[derive(Clone, Copy, Debug)]
+pub struct StepWeights<'a> {
+    data: &'a [u64],
+    vocab: usize,
+}
+
+impl<'a> StepWeights<'a> {
+    /// The number of rows: the number of tokens of the call.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.data.len() / self.vocab.max(1)
     }
 
-    /// `acc = lin.w * input`, then `x[r] = clamp(x[r] + rescale(acc[r] + b[r]), -R, R)`.
-    fn add_to_residual(x: &mut [i32], acc: &mut [i32], lin: &Linear, input: &[i8]) -> Result<()> {
-        matvec_i8(&lin.w, input, acc)?;
-        for (r, (xv, (&s, &b))) in x.iter_mut().zip(acc.iter().zip(lin.b.iter())).enumerate() {
-            let delta = row_rescale(s, b, &lin.rescale, r);
-            *xv = clamp_i32(i128::from(*xv) + delta, -RES, RES);
-        }
-        Ok(())
+    /// `true` if the call had no tokens.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
 
-    /// Steps 2.1 to 2.4: LayerNorm, q, k, v, causal attention, output projection, residual.
-    fn attention(&mut self, block: &Block, layer: usize, t: usize) -> Result<()> {
-        let model = self.model;
-        let dims = model.dims;
-        let (d, hd) = (dims.d_model, dims.head_dim);
-        block.ln_1.apply(model.ln_consts, &self.x, &mut self.a)?;
-        let acc = self.acc.get_mut(..3 * d).ok_or(internal(3 * d, 0))?;
-        matvec_i8(&block.c_attn.w, &self.a, acc)?;
-        for (r, (o, (&s, &b))) in
-            self.qkv.iter_mut().zip(acc.iter().zip(block.c_attn.b.iter())).enumerate()
-        {
-            *o = clamp_act_i8(row_rescale(s, b, &block.c_attn.rescale, r));
-        }
-        // Put k and v of this position into the cache.
-        let layer_base = layer * dims.n_ctx * d;
-        let at = layer_base + t * d;
-        let (q, kv) = self.qkv.split_at(d);
-        let (k, v) = kv.split_at(d);
-        self.k_cache.get_mut(at..at + d).ok_or(internal(d, 0))?.copy_from_slice(k);
-        self.v_cache.get_mut(at..at + d).ok_or(internal(d, 0))?.copy_from_slice(v);
-
-        let n = t + 1;
-        let keys = self.k_cache.get(layer_base..layer_base + n * d).ok_or(internal(n * d, 0))?;
-        let values = self.v_cache.get(layer_base..layer_base + n * d).ok_or(internal(n * d, 0))?;
-        let scores = self.scores.get_mut(..n).ok_or(internal(n, 0))?;
-        let probs = self.probs.get_mut(..n).ok_or(internal(n, 0))?;
-        for (h, (q_h, out_h)) in q.chunks_exact(hd).zip(self.att.chunks_exact_mut(hd)).enumerate() {
-            let off = h * hd;
-            for (sc, key) in scores.iter_mut().zip(keys.chunks_exact(d)) {
-                let k_h = key.get(off..off + hd).ok_or(internal(hd, 0))?;
-                let dot = dot_i8(q_h, k_h);
-                *sc = clamp_wide(
-                    rescale(i64::from(dot), block.score.m, block.score.s),
-                    -SCORE_LIMIT,
-                    SCORE_LIMIT,
-                );
-            }
-            softmax(scores, &model.attn_exp, model.softmax_p, probs)?;
-            self.head_acc.fill(0);
-            for (&p, val) in probs.iter().zip(values.chunks_exact(d)) {
-                let v_h = val.get(off..off + hd).ok_or(internal(hd, 0))?;
-                for (acc, &vv) in self.head_acc.iter_mut().zip(v_h) {
-                    // INVARIANT: 0 <= p <= 2^30, |v| <= 128 and sum(p) <= 2^30, so
-                    // |acc| <= 2^37.
-                    *acc += p * i64::from(vv);
-                }
-            }
-            for (o, &a) in out_h.iter_mut().zip(self.head_acc.iter()) {
-                *o = clamp_act_i8(rescale(a, block.attn_out.m, block.attn_out.s));
-            }
-        }
-        let acc = self.acc.get_mut(..d).ok_or(internal(d, 0))?;
-        Self::add_to_residual(&mut self.x, acc, &block.c_proj, &self.att)
+    /// The weights after token `i` of the call, or `None` if `i >= len()`.
+    #[must_use]
+    pub fn get(&self, i: usize) -> Option<&'a [u64]> {
+        self.data.get(i * self.vocab..(i + 1) * self.vocab)
     }
 
-    /// Steps 2.5 to 2.7: LayerNorm, MLP with GELU, residual.
-    fn mlp(&mut self, block: &Block) -> Result<()> {
-        let model = self.model;
-        let (d, f) = (model.dims.d_model, model.dims.d_ff);
-        block.ln_2.apply(model.ln_consts, &self.x, &mut self.a)?;
-        let acc = self.acc.get_mut(..f).ok_or(internal(f, 0))?;
-        matvec_i8(&block.c_fc.w, &self.a, acc)?;
-        let (lo, hi) = (block.gelu.min_input(), block.gelu.max_input());
-        for (r, (o, (&s, &b))) in
-            self.g.iter_mut().zip(acc.iter().zip(block.c_fc.b.iter())).enumerate()
-        {
-            *o = block.gelu.apply(clamp_wide(row_rescale(s, b, &block.c_fc.rescale, r), lo, hi));
-        }
-        let acc = self.acc.get_mut(..d).ok_or(internal(d, 0))?;
-        Self::add_to_residual(&mut self.x, acc, &block.mlp_proj, &self.g)
+    /// The rows in token order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &'a [u64]> + use<'a> {
+        self.data.chunks_exact(self.vocab.max(1))
     }
 }

@@ -22,3 +22,11 @@ workspace = true
 [[bench]]
 name = "step"
 harness = false
+
+[[bench]]
+name = "kernels"
+harness = false
+
+[[bench]]
+name = "paths"
+harness = false

@@ -12,6 +12,10 @@
 //! 2. For `i` in `0..n`: code `t[i]` with the table of the current weights. Then, if
 //!    `i + 1 < n`, `Session::step(t[i])` gives the weights for `t[i + 1]`.
 //!
+//! The encoder knows all tokens, so it uses `Session::step_many` (many steps at once); the
+//! decoder runs one step for each token, in a lane of a `Batch`. Both give the weights of
+//! these calls, bit for bit.
+//!
 //! The session starts the context again when it is full (§7.7, inside HardShell).
 
 use hardshell::TokenId;
@@ -62,6 +66,10 @@ pub(crate) fn tokens_restore(model: &Model, tokens: &[TokenId], data: &[u8]) -> 
 /// range coder has written are already at least `original_len` bytes. This rule depends only
 /// on the input, so every machine selects the same form.
 ///
+/// All tokens are known, so the session runs them `session.chunk()` at a time
+/// (`Session::step_many`, the prefill path). The weights are the same as with one step for
+/// each token (a HardShell test proves it), so the coded bytes are the same too.
+///
 /// Cost: one HardShell step and one frequency table for each token except the last.
 pub(crate) fn encode_block(
     session: &mut Session<'_>,
@@ -77,14 +85,24 @@ pub(crate) fn encode_block(
     }
     let bits = freq_bits()?;
     let mut encoder = Encoder::with_capacity(original_len);
-    let mut table = FreqTable::from_weights(session.start_block()?, bits)?;
-    for (i, &t) in tokens.iter().enumerate() {
-        encoder.encode(&table, Symbol::new(t.get()))?;
+    let first = FreqTable::from_weights(session.start_block()?, bits)?;
+    if let Some((&t0, rest)) = tokens.split_first() {
+        encoder.encode(&first, Symbol::new(t0.get()))?;
         if prefix + encoder.bytes_written() >= original_len {
             return raw;
         }
-        if i + 1 < tokens.len() {
-            table = FreqTable::from_weights(session.step(t)?, bits)?;
+        // The weights after token `i` code token `i + 1`. The last token needs no step.
+        let inputs = tokens.get(..tokens.len() - 1).unwrap_or(&[]);
+        let mut next = rest.iter();
+        for part in inputs.chunks(session.chunk().max(1)) {
+            for weights in session.step_many(part)?.iter() {
+                let Some(&t) = next.next() else { break };
+                let table = FreqTable::from_weights(weights, bits)?;
+                encoder.encode(&table, Symbol::new(t.get()))?;
+                if prefix + encoder.bytes_written() >= original_len {
+                    return raw;
+                }
+            }
         }
     }
     let coded = encoder.finish();
@@ -94,56 +112,79 @@ pub(crate) fn encode_block(
     Ok(CodedBlock { block: Block::choose(payload, original_len), tokens: count })
 }
 
-/// Decodes the payload of coded block `index` into its `original_len` bytes.
+/// The decoder state of one coded block: the range decoder, the bytes so far and the count.
 ///
-/// Damaged input gives [`TacoError::CorruptBlock`] when the decoder finds the fault: a bad
-/// varint, a token count larger than the block, `<|endoftext|>`, or a wrong length. Other
-/// damage gives wrong bytes, and the checksum of the container finds them.
-///
-/// Cost: one HardShell step and one frequency table for each token except the last. The
-/// output grows with the decoded bytes; it is never allocated from the stored count.
-pub(crate) fn decode_block(
-    session: &mut Session<'_>,
-    model: &Model,
-    payload: &[u8],
+/// The caller gives the weights of each step: first the weights of `start_block`, then the
+/// weights after each token that [`BlockDecoder::next`] returned. Thus one state machine
+/// serves a single session and a lane of a `hardshell::gpt2::Batch`.
+pub(crate) struct BlockDecoder<'a> {
+    decoder: Decoder<'a>,
+    model: &'a Model,
     index: u32,
-    original_len: u32,
-) -> Result<Vec<u8>> {
-    let corrupt = |reason| TacoError::CorruptBlock { block: index, reason };
-    let (count, coded) = read_varint(payload).ok_or(corrupt("the token count is not valid"))?;
-    // INVARIANT: every token has at least one byte, so a valid block has at most
-    // `original_len` tokens.
-    if count > u64::from(original_len) || count == 0 {
-        return Err(corrupt("the token count does not agree with the block length"));
+    count: u64,
+    done: u64,
+    limit: usize,
+    out: Vec<u8>,
+}
+
+impl<'a> BlockDecoder<'a> {
+    /// Reads the token count of the payload of coded block `index` of `original_len` bytes.
+    ///
+    /// # Errors
+    /// [`TacoError::CorruptBlock`] if the count is not valid or does not agree with the length.
+    pub(crate) fn new(
+        model: &'a Model,
+        payload: &'a [u8],
+        index: u32,
+        original_len: u32,
+    ) -> Result<Self> {
+        let corrupt = |reason| TacoError::CorruptBlock { block: index, reason };
+        let (count, coded) = read_varint(payload).ok_or(corrupt("the token count is not valid"))?;
+        // INVARIANT: every token has at least one byte, so a valid block has at most
+        // `original_len` tokens.
+        if count > u64::from(original_len) || count == 0 {
+            return Err(corrupt("the token count does not agree with the block length"));
+        }
+        let limit = usize::try_from(original_len)
+            .map_err(|_| TacoError::InputTooLarge { reason: "block length" })?;
+        let decoder = Decoder::new(coded);
+        Ok(Self { decoder, model, index, count, done: 0, limit, out: Vec::new() })
     }
-    let limit = usize::try_from(original_len)
-        .map_err(|_| TacoError::InputTooLarge { reason: "block length" })?;
-    let vocab = model.vocabulary();
-    let eot = model.eot_token();
-    let bits = freq_bits()?;
-    let mut decoder = Decoder::new(coded);
-    let mut out = Vec::new();
-    let mut table = FreqTable::from_weights(session.start_block()?, bits)?;
-    let mut i = 0u64;
-    loop {
-        let token = TokenId::new(decoder.decode(&table).get());
+
+    /// Decodes one token with the table of `weights`. Returns the token if the block has more
+    /// tokens (the caller steps the model with it), or `None` if the block is complete.
+    ///
+    /// # Errors
+    /// [`TacoError::CorruptBlock`] if the token has no bytes or the bytes are too long.
+    pub(crate) fn next(&mut self, weights: &[u64]) -> Result<Option<TokenId>> {
+        let corrupt = |reason| TacoError::CorruptBlock { block: self.index, reason };
+        let table = FreqTable::from_weights(weights, freq_bits()?)?;
+        let token = TokenId::new(self.decoder.decode(&table).get());
+        let vocab = self.model.vocabulary();
         let bytes = vocab.token(token).ok_or(corrupt("a token is not in the vocabulary"))?;
-        if token == eot || bytes.is_empty() {
+        if token == self.model.eot_token() || bytes.is_empty() {
             return Err(corrupt("the block has a token with no bytes"));
         }
         // INVARIANT: out.len() <= limit, by this check in the steps before.
-        if bytes.len() > limit - out.len() {
+        if bytes.len() > self.limit - self.out.len() {
             return Err(corrupt("the tokens are longer than the block"));
         }
-        out.extend_from_slice(bytes);
-        i += 1;
-        if i == count {
-            break;
+        self.out.extend_from_slice(bytes);
+        self.done += 1;
+        Ok((self.done < self.count).then_some(token))
+    }
+
+    /// The bytes of the complete block.
+    ///
+    /// # Errors
+    /// [`TacoError::CorruptBlock`] if the tokens are shorter than the block.
+    pub(crate) fn finish(self) -> Result<Vec<u8>> {
+        if self.out.len() != self.limit {
+            return Err(TacoError::CorruptBlock {
+                block: self.index,
+                reason: "the tokens are shorter than the block",
+            });
         }
-        table = FreqTable::from_weights(session.step(token)?, bits)?;
+        Ok(self.out)
     }
-    if out.len() != limit {
-        return Err(corrupt("the tokens are shorter than the block"));
-    }
-    Ok(out)
 }

@@ -68,6 +68,16 @@
 //! The model file has no other tensors. [`Model::load`] refuses a missing tensor, an extra
 //! tensor, a wrong type, a wrong shape and a rescale tensor without a shift.
 //!
+//! # Paths
+//!
+//! - [`ReferenceSession`]: the reference, one token at a time with the scalar kernels.
+//! - [`Session`]: the same API, with the fast kernels, and [`Session::step_many`] for many
+//!   known tokens at a time (the prefill path of the encoder).
+//! - [`Batch`]: many sessions in lockstep (the batch path of the decoder).
+//!
+//! All paths give the same weights, bit for bit. They are built from the op kernels of the
+//! private module `ops` (`embed`, `norm`, `linear`, `attention`, `logits`).
+//!
 //! # Context (plan §7.7)
 //!
 //! A block starts with an empty context and the `<|endoftext|>` token: call
@@ -76,11 +86,18 @@
 //! position 0, then runs the token at position 1. The encoder and the decoder do the same, so
 //! they stay in step.
 
+mod attention;
+mod batch;
+mod engine;
 mod model;
+mod ops;
+mod reference;
 mod session;
 
+pub use batch::{Batch, BatchInput};
 pub use model::Model;
-pub use session::Session;
+pub use reference::ReferenceSession;
+pub use session::{Session, SessionConfig, StepWeights};
 
 /// The residual limit `R = 2^30 - 1` (ADR 0004 section 1).
 pub const RESIDUAL_LIMIT: i32 = (1 << 30) - 1;

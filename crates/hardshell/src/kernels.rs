@@ -1,7 +1,9 @@
-//! Integer matrix-vector products: the reference kernels.
+//! Integer matrix-vector products: the reference kernels, and the fast kernels ([`Kernels`]).
 //!
-//! These are single-threaded scalar loops. A faster path (SIMD, GPU) must give the same bits
-//! as these functions, and a test must prove it (CLAUDE.md §1 rule 10).
+//! The free functions of this module are the reference: single-threaded scalar loops. A faster
+//! path (SIMD, GPU) must give the same bits as these functions, and a test must prove it
+//! (CLAUDE.md §1 rule 10). [`Kernels`] holds the fast paths: portable Rust, NEON `sdot` on
+//! aarch64 and AVX2 on x86_64. `tests/fast_kernels.rs` compares each one with the reference.
 //!
 //! DETERMINISM: integer addition is associative and commutative, and no sum here overflows
 //! (see the bounds). Thus a compiler can vectorise or reorder the sums, and the result stays
@@ -9,6 +11,15 @@
 
 use crate::error::{Error, Result};
 use crate::tensor::Matrix;
+
+#[cfg(target_arch = "x86_64")]
+mod avx2;
+mod fast;
+#[cfg(target_arch = "aarch64")]
+mod neon;
+mod portable;
+
+pub use fast::{Kernels, MatRef, rescale_clamp};
 
 /// The longest `i8 x i8` dot product with an `i32` accumulator.
 ///

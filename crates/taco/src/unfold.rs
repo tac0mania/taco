@@ -1,9 +1,9 @@
 //! `unfold`: a `.taco` container back to the original bytes (plan §4).
 
-use hardshell::gpt2::{Model, Session};
-use taco_format::{BlockKind, Container, FormatError};
+use hardshell::gpt2::{Batch, BatchInput, Model};
+use taco_format::{BlockKind, BlockRef, Container, FormatError};
 
-use crate::codec::decode_block;
+use crate::codec::BlockDecoder;
 use crate::container_hash;
 use crate::error::{Result, TacoError};
 use crate::parallel::{Threads, map_blocks};
@@ -49,9 +49,11 @@ impl UnfoldOptions {
 /// 2. Refuse the container if it needs a model and `model` is `None`, or if its model hash is
 ///    not the hash of `model` (plan §3 rule 3). A container in the raw-only mode needs no
 ///    model.
-/// 3. Decode each coded block with a new HardShell session: the range decoder gives token
+/// 3. Decode each coded block with a new HardShell context: the range decoder gives token
 ///    ids, and the vocabulary gives their bytes. The decoder never tokenizes. Copy each raw
-///    block.
+///    block. Each thread decodes groups of up to 8 blocks in lockstep in one
+///    `hardshell::gpt2::Batch`, so each weight of the model is read once for the group. The
+///    weights of each block are the same as with its own session (a HardShell test proves it).
 /// 4. Verify the length and the SHA-256 of the result (plan §3 rule 4).
 ///
 /// No buffer is allocated from a length in the container before the blocks decode (ADR 0006
@@ -91,26 +93,24 @@ pub fn unfold(model: Option<&Model>, container: &[u8], options: &UnfoldOptions) 
         return Err(TacoError::OutputTooLarge { original_len: header.original_len(), limit });
     }
     let blocks = parsed.blocks();
-    let parts = map_blocks(
-        blocks.len(),
+    // Groups of up to MAX_LANES blocks decode in lockstep on one thread (the batch path of
+    // HardShell). The group size gives each thread at least one group when there are enough
+    // blocks. The output does not depend on it (each block is independent).
+    // NOTE: lanes come before threads. On the M2, 2 blocks of alice29 (32 KiB) unfold in 48.9 s
+    // on 1 thread with 2 lanes, and in 86.5 s on 2 threads with 1 lane each (measured).
+    let fill = blocks.len().min(MIN_LANES);
+    let group_size = blocks.len().div_ceil(options.threads.get()).max(fill).clamp(1, MAX_LANES);
+    let group_parts = map_blocks(
+        blocks.len().div_ceil(group_size),
         options.threads,
-        || model.map(Session::new),
-        |session, i| {
-            let Some(b) = blocks.get(i) else { return Err(TacoError::WorkerFailed) };
-            match (b.kind(), session.as_mut(), model) {
-                (BlockKind::Raw, _, _) => Ok(b.stored().to_vec()),
-                (BlockKind::Coded, Some(s), Some(m)) => {
-                    decode_block(s, m, b.stored(), b.index(), b.original_len())
-                }
-                // NOTE: the parser refuses a coded block in the raw-only mode, and step 2
-                // refuses a missing model. Thus this arm is for block kinds of later versions.
-                _ => Err(TacoError::CorruptBlock {
-                    block: b.index(),
-                    reason: "the block kind needs a model or a newer reader",
-                }),
-            }
+        || None,
+        |batch: &mut Option<Batch<'_>>, g| {
+            let end = ((g + 1) * group_size).min(blocks.len());
+            let group = blocks.get(g * group_size..end).unwrap_or(&[]);
+            decode_group(model, batch, group_size, group)
         },
     )?;
+    let parts: Vec<Vec<u8>> = group_parts.into_iter().flatten().collect();
     let total: usize = parts.iter().map(Vec::len).sum();
     let mut out = Vec::with_capacity(total);
     for p in &parts {
@@ -124,4 +124,89 @@ pub fn unfold(model: Option<&Model>, container: &[u8], options: &UnfoldOptions) 
         other => TacoError::Format(other),
     })?;
     Ok(out)
+}
+
+/// The smallest number of lanes of a group when the container has that many blocks.
+const MIN_LANES: usize = 4;
+
+/// The largest number of blocks that one thread decodes in lockstep. Each lane holds one KV
+/// cache (for GPT-2 small, 18.9 MB, est.).
+// UNVERIFIED: 8 lanes is an estimate of the point where the batch stops to be limited by the
+// memory bandwidth on the M2; the step and batch measurements are in the simd agent report.
+const MAX_LANES: usize = 8;
+
+/// Decodes one group of blocks: raw blocks are copied, and the coded blocks run in lockstep
+/// in the lanes of `batch` (made on the first use, with `lanes` lanes).
+///
+/// If several blocks of the group fail, the result is the error of the block with the lowest
+/// index, so the error does not depend on the grouping.
+fn decode_group<'m>(
+    model: Option<&'m Model>,
+    batch: &mut Option<Batch<'m>>,
+    lanes: usize,
+    group: &[BlockRef<'_>],
+) -> Result<Vec<Vec<u8>>> {
+    let mut parts: Vec<Option<Vec<u8>>> = vec![None; group.len()];
+    let mut errors: Vec<(u32, TacoError)> = Vec::new();
+    let mut lane_of: Vec<Option<(usize, BlockDecoder<'_>)>> = Vec::new();
+    for (slot, b) in group.iter().enumerate() {
+        match (b.kind(), model) {
+            (BlockKind::Raw, _) => parts[slot] = Some(b.stored().to_vec()),
+            (BlockKind::Coded, Some(m)) => {
+                match BlockDecoder::new(m, b.stored(), b.index(), b.original_len()) {
+                    Ok(d) => lane_of.push(Some((slot, d))),
+                    Err(e) => errors.push((b.index(), e)),
+                }
+            }
+            // NOTE: the parser refuses a coded block in the raw-only mode, and `unfold`
+            // refuses a missing model. Thus this arm is for block kinds of later versions.
+            _ => errors.push((
+                b.index(),
+                TacoError::CorruptBlock {
+                    block: b.index(),
+                    reason: "the block kind needs a model or a newer reader",
+                },
+            )),
+        }
+    }
+    if let (Some(m), false) = (model, lane_of.is_empty()) {
+        let batch = batch.get_or_insert_with(|| Batch::new(m, lanes));
+        let mut inputs: Vec<Option<BatchInput>> = vec![None; batch.lanes()];
+        for (input, lane) in inputs.iter_mut().zip(&lane_of) {
+            *input = lane.as_ref().map(|_| BatchInput::Start);
+        }
+        while inputs.iter().any(Option::is_some) {
+            batch.run(&inputs)?;
+            for (lane, (input, state)) in inputs.iter_mut().zip(lane_of.iter_mut()).enumerate() {
+                if input.is_none() {
+                    continue;
+                }
+                let Some((slot, dec)) = state.as_mut() else { continue };
+                let weights = batch.weights(lane).ok_or(TacoError::WorkerFailed)?;
+                match dec.next(weights) {
+                    Ok(Some(t)) => *input = Some(BatchInput::Token(t)),
+                    Ok(None) => {
+                        *input = None;
+                        let slot = *slot;
+                        if let Some((_, dec)) = state.take() {
+                            let index = group.get(slot).map_or(0, BlockRef::index);
+                            match dec.finish() {
+                                Ok(bytes) => parts[slot] = Some(bytes),
+                                Err(e) => errors.push((index, e)),
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        *input = None;
+                        errors.push((group.get(*slot).map_or(0, BlockRef::index), e));
+                        *state = None;
+                    }
+                }
+            }
+        }
+    }
+    if let Some((_, e)) = errors.into_iter().min_by_key(|(i, _)| *i) {
+        return Err(e);
+    }
+    parts.into_iter().map(|p| p.ok_or(TacoError::WorkerFailed)).collect()
 }
