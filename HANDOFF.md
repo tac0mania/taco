@@ -58,7 +58,11 @@ them yet.
 | `gpt2.hsm` | `aaa03eb96e9ad7957432168c8ac6b4a99ed55d57e637e4786a664b51001ba5c2` |
 | `conformance/tiny.hsm` | `eb78b89a4f0f17c7245865aed22f86512a49e0272b7583a831c47e1a401418f8` |
 
-## 3. Machines
+## 3. Repository and machines
+
+- **Remote:** `origin` = https://github.com/tac0mania/taco (private, Rohit's tac0mania account,
+  Apache-2.0). Push after each verified wave of commits. Never push weights, corpora or data.
+
 
 - **Mac** (Apple Silicon, 8 GB, about 16 GB free disk). All work of 2026-10-18 ran here with
   `scripts/mx`. The GPT-2 weights and the corpus are in `tools/data/` (537 MB, ignored by git).
