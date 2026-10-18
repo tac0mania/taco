@@ -1,0 +1,163 @@
+#!/bin/bash
+# Windows check: build and test Taco natively on Windows x86 (the Windows side of devbox, `ssh
+# umes-win`), and compare its .taco files with the files of the Mac (plan §11.3, rule 7).
+#
+#   scripts/wcheck          the tests, then the cross-machine half
+#   scripts/wcheck tests    the tests only
+#   scripts/wcheck fold     the cross-machine half only
+#
+# Windows builds the committed HEAD (git archive), never the working tree. The toolchain is in
+# C:\Users\rohit\taco-win (Rust x86_64-pc-windows-gnu and w64devkit GCC, per user, no PATH change;
+# docs/research/2026-10-19-windows.md tells how to install it). The cross-machine half needs a
+# finished scripts/xcheck run on the Mac: it folds the inputs of tools/data/xcheck/in on Windows,
+# compares the SHA-256 of each .taco file with tools/data/xcheck/mac, and unfolds the Mac files
+# on Windows. Identical .taco files need no unfold on the Mac. Results: tools/data/xcheck/win/.
+#
+# The GPU of devbox is shared, so the tests of hardshell-cuda and hardshell-gpu are built but not
+# run. The Linux disk of devbox is a file on C:, so the script refuses to run while C: has less
+# than TACO_MIN_WINDOWS_GB (default 20) GB free. Builds use TACO_JOBS (default 3) jobs at low
+# priority.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+mode=${1:-all}
+case $mode in all | tests | fold) ;; *) echo "usage: scripts/wcheck [tests|fold]" >&2; exit 64 ;; esac
+WIN=${TACO_WIN_HOST:-umes-win}
+W='C:\Users\rohit\taco-win'
+X=tools/data/xcheck
+MODEL=tools/data/out/gpt2.hsm
+LOCAL_TMP=$(mktemp -d)
+trap 'rm -rf "$LOCAL_TMP"' EXIT
+win() { ssh "$WIN" "$@" | tr -d '\r'; }
+free_gb() { win 'powershell -NoProfile -Command "[int][math]::Floor((Get-PSDrive C).Free/1GB)"' | tr -dc 0-9; }
+
+echo "== Windows disk"
+gb=$(free_gb)
+echo "C: has $gb GB free"
+if [ "$gb" -lt "${TACO_MIN_WINDOWS_GB:-20}" ]; then
+  echo "wcheck: C: has less than ${TACO_MIN_WINDOWS_GB:-20} GB free; the Linux disk of devbox is there. Stop and tell the lead." >&2
+  exit 75
+fi
+win "if exist $W\\cargo\\bin\\cargo.exe (if exist $W\\w64devkit\\bin\\gcc.exe echo toolchain ok)" | grep -q "toolchain ok" ||
+  { echo "wcheck: no toolchain in $W; see docs/research/2026-10-19-windows.md" >&2; exit 69; }
+
+echo "== copy the committed tree ($(git rev-parse --short HEAD)) to Windows"
+# The environment of every Windows command. w64devkit GCC is static only: its unwinder is in
+# libgcc.a, and rustc asks for libgcc_eh, so an empty libgcc_eh.a in lib-extra satisfies it.
+cat > "$LOCAL_TMP/env.cmd" <<'EOF'
+@echo off
+set W=C:\Users\rohit\taco-win
+set RUSTUP_HOME=%W%\rustup
+set CARGO_HOME=%W%\cargo
+set CARGO_TARGET_DIR=%W%\target
+set CARGO_TERM_COLOR=never
+set CARGO_INCREMENTAL=0
+if "%TACO_JOBS%"=="" set TACO_JOBS=3
+set CARGO_BUILD_JOBS=%TACO_JOBS%
+set LIBRARY_PATH=%W%\lib-extra
+set PATH=%W%\cargo\bin;%W%\w64devkit\bin;%PATH%
+cd /d %W%\src
+EOF
+sed -i.bak 's/$/\r/' "$LOCAL_TMP/env.cmd"
+git archive --format=tar --prefix=src/ -o "$LOCAL_TMP/src.tar" HEAD
+win "if exist $W\\src rmdir /s /q $W\\src"
+scp -q "$LOCAL_TMP/src.tar" "$LOCAL_TMP/env.cmd" "$WIN:C:/Users/rohit/taco-win/"
+win "cd /d $W && tar -xf src.tar && del src.tar && (if not exist lib-extra\\libgcc_eh.a (mkdir lib-extra 2>nul & w64devkit\\bin\\ar.exe rcs lib-extra\\libgcc_eh.a)) && echo copied"
+# cmd keeps the space before "&&" in a plain `set X=3 && ...`, and cargo refuses the job count
+# "3 ". The quoted form sets exactly "3". TACO_JOBS must be set before env.cmd reads it.
+RUN="set \"TACO_JOBS=${TACO_JOBS:-3}\" && $W\\env.cmd && start /b /wait /belownormal"
+
+fail=0
+mkdir -p "$X/win"
+if [ "$mode" != fold ]; then
+  echo "== tests on Windows (release; GPU crates built, not run)"
+  if win "cmd /c \"$RUN cargo test --workspace --release --exclude hardshell-cuda --exclude hardshell-gpu 2>&1 && $RUN cargo test --release -p hardshell-cuda -p hardshell-gpu --no-run 2>&1\"" > "$X/win/tests.log"; then
+    passed=$(grep -E '^test result:' "$X/win/tests.log" | awk '{s+=$4} END {print s+0}')
+    failed=$(grep -E '^test result:' "$X/win/tests.log" | awk '{s+=$6} END {print s+0}')
+    ignored=$(grep -E '^test result:' "$X/win/tests.log" | awk '{s+=$8} END {print s+0}')
+    echo "tests: $passed passed, $failed failed, $ignored ignored ($X/win/tests.log)"
+    [ "$failed" -eq 0 ] || fail=1
+  else
+    echo "tests: FAIL ($X/win/tests.log)"; tail -30 "$X/win/tests.log"; fail=1
+  fi
+fi
+
+if [ "$mode" != tests ]; then
+  echo "== model"
+  mac_model=$(shasum -a 256 "$MODEL" | cut -d' ' -f1)
+  win_model=$(win "powershell -NoProfile -Command \"if (Test-Path $W\\data\\gpt2.hsm) { (Get-FileHash -Algorithm SHA256 $W\\data\\gpt2.hsm).Hash.ToLower() }\"")
+  if [ "$win_model" != "$mac_model" ]; then
+    echo "copy gpt2.hsm from devbox (WSL writes C: directly)"
+    ssh devbox "mkdir -p /mnt/c/Users/rohit/taco-win/data && cp ~/mirror/taco/$MODEL /mnt/c/Users/rohit/taco-win/data/gpt2.hsm"
+    win_model=$(win "powershell -NoProfile -Command \"(Get-FileHash -Algorithm SHA256 $W\\data\\gpt2.hsm).Hash.ToLower()\"")
+  fi
+  echo "mac     $mac_model"; echo "windows $win_model"
+  [ "$mac_model" = "$win_model" ] || { echo "wcheck: the model files differ; stop" >&2; exit 1; }
+
+  echo "== build taco.exe"
+  win "cmd /c \"$RUN cargo build --release -q -p taco-cli 2>&1\""
+
+  echo "== inputs and Mac files to Windows"
+  ls "$X"/in/* > /dev/null && ls "$X"/mac/*.taco > /dev/null || { echo "wcheck: run scripts/xcheck first" >&2; exit 66; }
+  # A taco without --profile cannot fold an input of the profile logs (ADR 0010, 0012), so the
+  # check leaves out the ".logs." inputs for such a taco and says so.
+  inputs=()
+  help=$(win "$W\\target\\release\\taco.exe --help 2>&1" || true)
+  profile=0
+  if [[ $help == *--profile* ]]; then
+    profile=1
+    inputs=("$X"/in/*)
+  else
+    for f in "$X"/in/*; do
+      case $(basename "$f") in *.logs.*) echo "left out (this taco has no --profile): $(basename "$f")" ;; *) inputs+=("$f") ;; esac
+    done
+  fi
+  macs=(); for f in "${inputs[@]}"; do macs+=("$X/mac/$(basename "$f").taco"); done
+  win "if exist $W\\xcheck rmdir /s /q $W\\xcheck"
+  win "mkdir $W\\xcheck\\in $W\\xcheck\\mac"
+  scp -q "${inputs[@]}" "$WIN:C:/Users/rohit/taco-win/xcheck/in/"
+  scp -q "${macs[@]}" "$WIN:C:/Users/rohit/taco-win/xcheck/mac/"
+
+  echo "== on Windows: fold the inputs, unfold the Mac files"
+  # The profile rule is the rule of scripts/xcheck. A taco without --profile folds with its
+  # default.
+  cat > "$LOCAL_TMP/wcheck.ps1" <<'EOF'
+param([string]$W, [int]$Profile)
+$ErrorActionPreference = 'Continue'
+(Get-Process -Id $PID).PriorityClass = 'BelowNormal'
+$T = "$W\target\release\taco.exe"; $M = "$W\data\gpt2.hsm"; $X = "$W\xcheck"
+New-Item -ItemType Directory -Force "$X\win", "$X\back" | Out-Null
+function Get-Sha256($p) { (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash.ToLower() }
+foreach ($f in Get-ChildItem -File "$X\in") {
+  $n = $f.Name
+  $a = @('fold', $f.FullName, '-o', "$X\win\$n.taco", '--model', $M, '--threads', '6', '-f')
+  if ($Profile -eq 1) { $p = if ($n -like '*.logs.*') { 'logs' } else { 'text' }; $a += @('--profile', $p) }
+  & $T @a 2>$null
+  if ($LASTEXITCODE -ne 0) { "fold-on-windows FAIL $n (exit $LASTEXITCODE)"; continue }
+  "win $(Get-Sha256 "$X\win\$n.taco") $n.taco"
+}
+foreach ($f in Get-ChildItem -File "$X\mac" -Filter *.taco) {
+  $n = $f.BaseName
+  & $T unfold $f.FullName -o "$X\back\$n" --model $M --threads 6 -f 2>$null
+  if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath "$X\back\$n") -and ((Get-Sha256 "$X\back\$n") -eq (Get-Sha256 "$X\in\$n"))) {
+    "restored-on-windows ok   $n"
+  } else { "restored-on-windows FAIL $n" }
+}
+EOF
+  scp -q "$LOCAL_TMP/wcheck.ps1" "$WIN:C:/Users/rohit/taco-win/wcheck.ps1"
+  win "powershell -NoProfile -ExecutionPolicy Bypass -File $W\\wcheck.ps1 -W $W -Profile $profile" > "$X/win/run.txt"
+  grep -E "restored-on-windows|FAIL" "$X/win/run.txt" || true
+  grep -q FAIL "$X/win/run.txt" && fail=1
+  awk '$1 == "win" {print $2 "  " $3}' "$X/win/run.txt" | sort -k2 > "$X/win/SHA256SUMS"
+
+  echo "== compare the .taco files of Windows and the Mac"
+  (cd "$X/mac" && for f in "${inputs[@]}"; do shasum -a 256 "$(basename "$f").taco"; done) | sort -k2 > "$X/win/MAC_SHA256SUMS"
+  if diff "$X/win/MAC_SHA256SUMS" "$X/win/SHA256SUMS" > /dev/null; then
+    echo "identical .taco files on Windows and the Mac: $(wc -l < "$X/win/SHA256SUMS" | tr -d ' ') of ${#inputs[@]}"
+  else
+    echo "the .taco files differ (< Mac, > Windows):"; diff "$X/win/MAC_SHA256SUMS" "$X/win/SHA256SUMS" || true; fail=1
+  fi
+fi
+
+echo "== Windows disk"
+echo "C: has $(free_gb) GB free"
+[ $fail -eq 0 ] && echo "wcheck: PASS" || { echo "wcheck: FAIL" >&2; exit 1; }
