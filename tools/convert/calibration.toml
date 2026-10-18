@@ -1,0 +1,81 @@
+# Calibration set for the GPT-2 conversion (plan §7.1, ADR 0004 section 7).
+#
+# None of these files is in the phase 0 quality corpus (tools/baseline/corpus.toml). The files
+# are not committed. `python -m convert.calibrate --fetch` downloads them to tools/data/calib and
+# checks the size and the SHA-256 (measured on 2026-10-18).
+#
+# For each source, the tool reads `cap` bytes from `offset`, tokenizes them with the GPT-2 BPE of
+# tools/baseline, and takes the first `windows` windows of 1,024 tokens. The model input of a
+# window is <|endoftext|> and then the first 1,023 tokens (plan §7.7), as in the evaluation.
+# For Gutenberg files, `offset` is a byte after the "*** START OF" line.
+#
+# Licences: Project Gutenberg texts are in the public domain in the USA. listobject.c is under
+# the PSF licence, strings.go under the BSD 3-clause licence. Taco uses them only as measurement
+# data and does not distribute them.
+
+[[source]]
+name = "pg1342.txt"
+class = "English prose (Austen, Pride and Prejudice), CRLF line ends"
+url = "https://www.gutenberg.org/cache/epub/1342/pg1342.txt"
+size = 772386
+sha256 = "3f6bb9d6f78e0293b56acd4714dd68cb7d6d1d293402031ce9d5a216bcaf9d75"
+offset = 993
+cap = 16384
+windows = 2
+
+[[source]]
+name = "pg1342.txt"
+class = "English prose, from the middle of the book"
+url = "https://www.gutenberg.org/cache/epub/1342/pg1342.txt"
+size = 772386
+sha256 = "3f6bb9d6f78e0293b56acd4714dd68cb7d6d1d293402031ce9d5a216bcaf9d75"
+offset = 300000
+cap = 16384
+windows = 2
+
+[[source]]
+name = "pg2000.txt"
+class = "Spanish prose (Cervantes, Don Quijote), CRLF line ends"
+url = "https://www.gutenberg.org/cache/epub/2000/pg2000.txt"
+size = 2225803
+sha256 = "534f41d59f7142163fa0964076ac6351845c006ea6433778be637fac6d5b04d7"
+offset = 904
+cap = 16384
+windows = 1
+
+[[source]]
+name = "pg2000.txt"
+class = "Spanish prose, from the middle of the book"
+url = "https://www.gutenberg.org/cache/epub/2000/pg2000.txt"
+size = 2225803
+sha256 = "534f41d59f7142163fa0964076ac6351845c006ea6433778be637fac6d5b04d7"
+offset = 1000000
+cap = 16384
+windows = 2
+
+[[source]]
+name = "listobject.c"
+class = "C source (CPython v3.12.0, Objects/listobject.c)"
+url = "https://raw.githubusercontent.com/python/cpython/v3.12.0/Objects/listobject.c"
+size = 104504
+sha256 = "dab9b7e182cb20e5c4cf1670d09455593d3b57297793d4e91a8a40912705f6c5"
+offset = 0
+cap = 32768
+windows = 2
+
+[[source]]
+name = "strings.go"
+class = "Go source (Go 1.22.0, src/strings/strings.go)"
+url = "https://raw.githubusercontent.com/golang/go/go1.22.0/src/strings/strings.go"
+size = 32017
+sha256 = "d61c2e6eb243a800402a8bd0f6b8ccfe345566dd156a5eb50c1dd03d7a61a836"
+offset = 0
+cap = 16384
+windows = 1
+
+# A window of random bytes from splitmix64 (seed below). No download. Binary input is an input
+# class of plan §11.2; GPT-2 sees it as single-byte tokens.
+[random]
+seed = 20261018
+bytes = 1200
+windows = 1
