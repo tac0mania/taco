@@ -1,0 +1,22 @@
+[package]
+name = "hardshell-gpu"
+version = "0.1.0"
+description = "HardShell on a GPU: the integer GPT-2 of hardshell in portable WGSL compute shaders (wgpu), bit for bit equal to the CPU reference"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+hardshell = { path = "../hardshell" }
+thiserror.workspace = true
+# NOTE: crate-local version spec. The lead moves it to [workspace.dependencies] at commit time.
+wgpu.workspace = true
+
+[dev-dependencies]
+# The bench example measures the CPU cost of the frequency table of the coder.
+taco-coder = { path = "../taco-coder" }
+sha2.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true
