@@ -1,0 +1,33 @@
+#!/bin/bash
+# Run a light command on the Mac: cargo for Taco crates, or a tool under uv.
+#
+#   scripts/mx cargo test -p taco-coder
+#   scripts/mx cargo clippy -p hardshell --all-targets -- -D warnings
+#   scripts/mx uv run --project tools python -m baseline.run
+#
+# The Mac runs the ARM half of the cross-machine check, and light work while devbox is not
+# available. The Mac has 8 GB of memory and little free disk, so: one command at a time (a lock;
+# a second caller waits), at most 2 build jobs at low priority, one target directory outside the
+# repository that is emptied when it grows past TACO_MAC_CAP_GB (default 4), and a refusal while
+# the disk has less than 8 GB free.
+set -euo pipefail
+case "${1:-}" in
+  cargo|uv) ;;
+  *) echo "mx: only cargo and uv commands run on the Mac" >&2; exit 64 ;;
+esac
+HOME_DIR=$HOME/.cache/taco-mac
+TARGET=$HOME_DIR/target
+LOCK=$HOME_DIR/lock
+CAP_GB=${TACO_MAC_CAP_GB:-4}
+mkdir -p "$HOME_DIR"
+free_gb=$(df -g "$HOME" | awk 'NR==2 {print $4}')
+if [ "${free_gb:-0}" -lt 8 ]; then
+  echo "mx: the Mac has only ${free_gb} GB free; refusing to run" >&2; exit 75
+fi
+if [ -d "$TARGET" ]; then
+  used_gb=$(du -sg "$TARGET" | awk '{print $1}')
+  if [ "${used_gb:-0}" -gt "$CAP_GB" ]; then rm -rf "$TARGET"; fi
+fi
+cd "$(dirname "$0")/.."
+export CARGO_TARGET_DIR=$TARGET CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0
+exec /usr/bin/lockf -k "$LOCK" nice -n 10 "$@"

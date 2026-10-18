@@ -1,0 +1,17 @@
+/target
+**/target
+.agent-status/
+.venv/
+__pycache__/
+*.pyc
+.env
+# Model weights, corpora and outputs: large, and made by tools.
+*.hsm
+!conformance/*.hsm
+*.safetensors
+*.gguf
+/data/
+/tools/data/
+/tools/out/
+/experiments/
+.DS_Store

@@ -1,0 +1,8 @@
+# Tests may unwrap, expect and panic: a failing test must fail loudly.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true
+allow-print-in-tests = true
+# A function with more arguments than this needs a parameter struct.
+too-many-arguments-threshold = 6

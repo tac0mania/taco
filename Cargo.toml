@@ -1,0 +1,58 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+[workspace.dependencies]
+# Libraries
+thiserror = "2"
+sha2 = "0.10"
+# Tests and benchmarks
+proptest = "1"
+criterion = "0.5"
+# Binaries and tests only
+anyhow = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_must_use = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Library code never panics on bad input and never prints.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+# Integer casts must be deliberate: the prediction path depends on exact integer results.
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_possible_wrap = "warn"
+# Things that hide cost or bugs.
+large_enum_variant = "warn"
+needless_pass_by_value = "warn"
+wildcard_imports = "warn"
+mem_forget = "deny"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 1
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"

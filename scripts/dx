@@ -1,0 +1,26 @@
+#!/bin/bash
+# Run a command for this repository on devbox, against a mirror of the working tree.
+#
+#   scripts/dx <lane> <command...>
+#
+# <lane> names a private build directory on the server, so parallel lanes do not wait on one
+# cargo lock. Use your agent name, or "main" for integration runs.
+#
+#   scripts/dx main cargo test --workspace
+#   scripts/dx coder cargo test -p taco-coder
+#   TACO_JOBS=8 scripts/dx main cargo build --release
+#
+# The server is shared with other work (Hippo, local AI). Everything here runs at a lower CPU
+# priority, and is the first thing to stop if memory runs out.
+#
+# The Linux disk of the server is one file on the Windows C: drive. That file only grows, and
+# Linux stopped twice when C: was full (2026-10-12, 2026-10-14, from the Hippo handoff). So this
+# script refuses to run while C: has less than TACO_MIN_WINDOWS_GB (default 15) GB free. Only
+# Rohit can compact the file.
+#
+# While a timing measurement holds ~/scratch/timing.lock, a command runs on processors 8-13 only,
+# with at most 3 build jobs.
+set -euo pipefail
+lane=${1:?usage: scripts/dx <lane> <command...>}; shift
+cd "$(dirname "$0")/.."
+exec "${DEVBOX:-$HOME/.local/bin/devbox}" run "c=\$(df -BG --output=avail /mnt/c 2>/dev/null | tail -1 | tr -dc 0-9); if [ -n \"\$c\" ] && [ \"\$c\" -lt ${TACO_MIN_WINDOWS_GB:-15} ]; then echo \"dx: Windows C: has only \${c} GB free and the Linux disk file is there; refusing to run. Stop and tell the lead.\" >&2; exit 75; fi; echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; renice -n 10 -p \$\$ >/dev/null 2>&1 || true; jobs=${TACO_JOBS:-4}; if ! flock -n \$HOME/scratch/timing.lock true 2>/dev/null; then taskset -cp 8-13 \$\$ >/dev/null; [ \$jobs -gt 3 ] && jobs=3; echo \"dx: a timing measurement holds the lock; running on processors 8-13 with \$jobs jobs\" >&2; fi; export PATH=\$HOME/.cargo/bin:\$HOME/.local/bin:\$PATH CARGO_TARGET_DIR=\$HOME/targets/taco-$lane CARGO_BUILD_JOBS=\$jobs CARGO_TERM_COLOR=never CARGO_INCREMENTAL=1 CARGO_PROFILE_DEV_DEBUG=0; $*"
