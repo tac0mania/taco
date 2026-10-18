@@ -48,12 +48,14 @@ Total: about 3 to 4 weeks of agent time, with several items in parallel (est.).
 The `logs` targets depend on items 5 and 6. If a gate fails, the release notes say so, and the
 team decides before the release.
 
-## §4 Open decisions for the owner
+## §4 Owner decisions (2026-10-19)
 
-1. **Repository and licence.** Where is the code published (a private or public GitHub
-   repository), and under which licence?
-2. **Model distribution.** Ship the model files with the binary (about 127 MB for `text`), or
-   download them on first use from a fixed URL with a hash check?
-3. **Platforms for version 1.** All of §1, or macOS and Linux first?
-4. **Windows.** devbox runs Windows. A native Windows build tests NVIDIA through DirectX 12 and
-   Vulkan, which WSL cannot do.
+1. **Repository and licence.** A private GitHub repository. Licence: Apache-2.0 (`LICENSE`).
+2. **Model distribution.** Rohit left it to the lead. Decision: `taco` finds a model file by its
+   hash in a local model directory. If the file is not there, it downloads it once from a fixed
+   URL and checks the SHA-256 before use. The release also offers a full archive with the model
+   files inside, for machines without network access. The download URL is a release decision:
+   a private repository cannot serve public downloads.
+3. **Platforms for version 1.** All of §1 where possible: macOS (ARM, x86), Linux (x86, ARM),
+   Windows (x86).
+4. **Windows.** Native Windows builds and tests on the Windows side of devbox are permitted.
