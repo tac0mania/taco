@@ -1,0 +1,18 @@
+[package]
+name = "hardshell"
+version = "0.1.0"
+description = "HardShell: the integer-only inference engine of Taco, and the .hsm model-file reader"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[lints]
+workspace = true
