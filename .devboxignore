@@ -1,0 +1,9 @@
+.git
+target
+.venv
+__pycache__
+.agent-status
+experiments
+tools/data/out
+tools/data/xcheck/linux
+tools/data/xcheck/back_on_linux

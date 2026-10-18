@@ -1,0 +1,73 @@
+#!/bin/bash
+# Cross-machine check (plan §11.3): fold on the Mac (ARM), unfold on devbox (x86), and the
+# reverse. Both machines must restore every input byte for byte, and must make identical .taco
+# files from the same input.
+#
+#   scripts/xcheck
+#
+# Inputs are made from the corpus in tools/data/corpus (tools/baseline fetches it) and from a
+# fixed random seed. Each machine uses its own tools/data/out/gpt2.hsm; the check refuses to
+# run if the two model hashes differ. Results: tools/data/xcheck/ (ignored by git).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+X=tools/data/xcheck
+MODEL=tools/data/out/gpt2.hsm
+[ -f "$MODEL" ] || { echo "xcheck: $MODEL is missing; run: cd tools && uv run python -m convert.gpt2" >&2; exit 66; }
+
+echo "== model hashes"
+mac_model=$(shasum -a 256 "$MODEL" | cut -d' ' -f1)
+linux_model=$(scripts/dx main "sha256sum $MODEL" | tail -1 | cut -d' ' -f1)
+echo "mac   $mac_model"; echo "linux $linux_model"
+[ "$mac_model" = "$linux_model" ] || { echo "xcheck: the model files differ; stop" >&2; exit 1; }
+
+echo "== inputs"
+rm -rf "$X/in" "$X/mac" && mkdir -p "$X/in" "$X/mac"
+C=tools/data/corpus
+head -c 4096 "$C/lcet10.txt" > "$X/in/english_4k.txt"
+head -c 32768 "$C/alice29.txt" > "$X/in/english_32k.txt"
+cp "$C/cp.html" "$X/in/page.html"
+head -c 8192 "$C/HDFS_2k.log" > "$X/in/server_8k.log"
+head -c 6144 "$C/pg24264.txt" > "$X/in/other_language_6k.txt"
+head -c 4096 "$C/kennedy.xls" > "$X/in/binary_4k.xls"
+python3 -c "import random,sys; r=random.Random(20261018); sys.stdout.buffer.write(bytes(r.randrange(256) for _ in range(3000)))" > "$X/in/random_3000.bin"
+printf 'dasdasdasdada' > "$X/in/dasdas.txt"
+: > "$X/in/empty.bin"
+
+echo "== build and fold on the Mac"
+scripts/mx cargo build --release -q -p taco-cli
+TACO=$HOME/.cache/taco-mac/target/release/taco
+for f in "$X"/in/*; do
+  n=$(basename "$f")
+  "$TACO" fold "$f" -o "$X/mac/$n.taco" --model "$MODEL" --threads 6 -f 2>/dev/null
+done
+
+echo "== on devbox: unfold the Mac files, fold the same inputs"
+scripts/dx main "set -e; cargo build --release -q -p taco-cli; T=\$CARGO_TARGET_DIR/release/taco; rm -rf $X/linux $X/back_on_linux; mkdir -p $X/linux $X/back_on_linux; \
+  for f in $X/mac/*.taco; do n=\$(basename \$f .taco); \$T unfold \$f -o $X/back_on_linux/\$n --model $MODEL --threads 6 -f 2>/dev/null; cmp -s $X/in/\$n $X/back_on_linux/\$n && echo \"restored-on-linux ok   \$n\" || echo \"restored-on-linux FAIL \$n\"; done; \
+  for f in $X/in/*; do n=\$(basename \$f); \$T fold \$f -o $X/linux/\$n.taco --model $MODEL --threads 6 -f 2>/dev/null; done; \
+  (cd $X/linux && sha256sum *.taco) > $X/linux/SHA256SUMS" | grep -E "restored-on-linux" | tee "$X/linux_restore.txt"
+
+echo "== copy the devbox files back"
+rm -rf "$X/linux" && mkdir -p "$X/linux"
+rsync -az "devbox:mirror/$(basename "$PWD")/$X/linux/" "$X/linux/"
+
+echo "== unfold the devbox files on the Mac"
+rm -rf "$X/back_on_mac" && mkdir -p "$X/back_on_mac"
+fail=0
+for f in "$X"/linux/*.taco; do
+  n=$(basename "$f" .taco)
+  "$TACO" unfold "$f" -o "$X/back_on_mac/$n" --model "$MODEL" --threads 6 -f 2>/dev/null
+  if cmp -s "$X/in/$n" "$X/back_on_mac/$n"; then echo "restored-on-mac ok     $n"; else echo "restored-on-mac FAIL   $n"; fail=1; fi
+done
+grep -q FAIL "$X/linux_restore.txt" && fail=1
+
+echo "== compare the .taco files of both machines"
+(cd "$X/mac" && shasum -a 256 *.taco) > "$X/mac/SHA256SUMS"
+if diff "$X/mac/SHA256SUMS" "$X/linux/SHA256SUMS" >/dev/null; then
+  echo "identical .taco files on both machines: $(wc -l < "$X/mac/SHA256SUMS") of $(ls "$X"/in | wc -l | tr -d ' ')"
+else
+  echo "the .taco files differ:"; diff "$X/mac/SHA256SUMS" "$X/linux/SHA256SUMS" || true; fail=1
+fi
+printf "%-24s %9s %9s\n" input bytes taco
+for f in "$X"/in/*; do n=$(basename "$f"); printf "%-24s %9d %9d\n" "$n" "$(wc -c < "$f")" "$(wc -c < "$X/mac/$n.taco")"; done
+[ $fail -eq 0 ] && echo "xcheck: PASS" || { echo "xcheck: FAIL" >&2; exit 1; }

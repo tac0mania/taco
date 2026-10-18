@@ -47,7 +47,7 @@ def vocabulary_and_merges(tok: Tokenizer) -> tuple[list[bytes], list[tuple[int, 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--recipe", default="max", choices=sorted(rc.RECIPES))
+    ap.add_argument("--recipe", default="clip", choices=sorted(rc.RECIPES))
     ap.add_argument("--stats", type=Path, default=STATS_PATH)
     ap.add_argument("--out", type=Path, default=OUT_DIR / "gpt2.hsm")
     args = ap.parse_args()
