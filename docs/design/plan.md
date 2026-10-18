@@ -108,13 +108,9 @@ Phase 2 uses GPT-2 small (124M parameters, 12 layers, width 768, context 1,024).
 - It uses learned position embeddings, LayerNorm and GELU. It has no rotary embeddings.
 - Published integer-only methods (I-BERT) cover all its operations.
 
-Later models (phase 6): a small model that we train for one data type (logs, code, JSON), and
-a model of 3B to 4B parameters. devbox has Nanbeige4.2-3B as a Q4_K_M GGUF file of
-2,684,023,968 bytes (published, `~/Documents/dev-server/local-ai/README.md`). It is in the
-Ollama Docker volume of the local AI stack. Q4_K_M has about 4.8 bits for each weight (est.),
-so the file holds about 4.4B parameters (est.). Read the parameter count from the GGUF header
-before you use it. Its weights are already 4-bit integers with block scales. Its licence and its
-architecture are UNVERIFIED.
+GPT-2 small is the only model of version 1 (ADR 0005). Rohit decided this on 2026-10-18.
+Nanbeige4.2-3B (on devbox) is not in the plan. Other models (a small model for one data type,
+a larger model) are phase 6 work, after version 1 is released.
 
 ## §7 HardShell numerics
 
@@ -264,7 +260,7 @@ weeks. All estimates are `est.`.
 | 3 | Quality: measure integer against float loss. Calibration, `i16` activations, short fine-tune if necessary | Integer loss is less than a target that phase 0 sets | 1 to 2 weeks |
 | 4 | Speed: SIMD on CPU, CUDA kernels on devbox, blocks in parallel | A GPU path with the same bits as the CPU path. A speed target that phase 2 sets | 1 to 3 months |
 | 5 | Product: format version 1 frozen, benchmark page, release | A public benchmark | 2 to 4 weeks |
-| 6 | Larger and special models (3B, logs, code), and other data types (images, audio) | Each one has its own plan | open |
+| 6 | After version 1: other models (logs, code, larger models) and other data types (images, audio) | Each one has its own plan | open |
 
 ## §13 Open questions
 
