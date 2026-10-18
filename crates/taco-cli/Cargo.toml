@@ -1,0 +1,21 @@
+[package]
+name = "taco-cli"
+version = "0.1.0"
+description = "The taco command: taco fold and taco unfold."
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "taco"
+path = "src/main.rs"
+
+[dependencies]
+taco = { path = "../taco" }
+
+[dev-dependencies]
+# The CLI test builds the tiny test model of crates/taco/tests/common.
+hardshell = { path = "../hardshell" }
+
+[lints]
+workspace = true

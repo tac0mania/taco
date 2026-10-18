@@ -795,6 +795,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "taco-cli"
+version = "0.1.0"
+dependencies = [
+ "hardshell",
+ "taco",
+]
+
+[[package]]
 name = "taco-coder"
 version = "0.1.0"
 dependencies = [
