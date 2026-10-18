@@ -14,6 +14,12 @@ thiserror = "2"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Container (taco-format), ADR 0011: the zstd block kind. Exact versions: the encoder bytes
+# (and so the container hashes) depend on the zstd library version (zstd 1.5.7). zstd-sys is
+# named only to pin the C library. No default features: no legacy formats, no dictionary
+# builder.
+zstd-safe = { version = "=8.2.0", default-features = false }
+zstd-sys = { version = "=2.1.2", default-features = false }
 # CUDA backend (hardshell-cuda): loads the driver library (libcuda) at run time.
 libloading = "0.8"
 # GPU backend (hardshell-gpu): portable compute through Vulkan, Metal, DX12 and GL.

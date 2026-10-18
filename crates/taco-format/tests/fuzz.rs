@@ -14,19 +14,19 @@
 
 mod common;
 
-use common::{MODEL, UnfoldError, bs, fold, unfold};
+use common::{MODEL, UnfoldError, bs, fold, phrases, unfold};
 use proptest::prelude::*;
 use taco_format::{BlockKind, Container, FormatError, HEADER_LEN, ModelHash, TABLE_ENTRY_LEN};
 
-/// Data with runs, so that the container has raw and coded blocks.
+/// Data with runs and phrases, so that the container has raw, coded and zstd blocks.
 fn runs() -> impl Strategy<Value = Vec<u8>> {
-    prop::collection::vec((any::<u8>(), 1usize..30, any::<bool>()), 0..40).prop_map(|parts| {
+    prop::collection::vec((any::<u8>(), 1usize..60, 0u8..3), 0..40).prop_map(|parts| {
         let mut out = Vec::new();
-        for (v, n, run) in parts {
-            if run {
-                out.extend(std::iter::repeat_n(v, n));
-            } else {
-                out.extend((0..n).map(|i| v.wrapping_add(i as u8)));
+        for (v, n, class) in parts {
+            match class {
+                0 => out.extend(std::iter::repeat_n(v, n)),
+                1 => out.extend(phrases(u64::from(v), n)),
+                _ => out.extend((0..n).map(|i| v.wrapping_add(i as u8))),
             }
         }
         out
@@ -97,7 +97,9 @@ proptest! {
     }
 
     /// A flip in the magic, the version or the flags always fails in the parser. A flip in a
-    /// raw block parses, and the checksum helper refuses the restored data.
+    /// raw block parses, and the checksum helper refuses the restored data. A flip in a coded
+    /// block always fails. A flip in a zstd block fails or gives the original data: some bits
+    /// of a zstd frame do not change the decoded bytes.
     #[test]
     fn flip_is_caught_where_it_lands(
         data in runs(),
@@ -129,30 +131,53 @@ proptest! {
                 (start..start + b.stored().len()).contains(&pos)
             })
             .unwrap();
-        let e = unfold(&damaged, MODEL).unwrap_err();
-        if block.kind() == BlockKind::Raw {
-            prop_assert!(
-                matches!(e, UnfoldError::Format(FormatError::ChecksumMismatch { .. })),
-                "{:?}", e
-            );
+        let result = unfold(&damaged, MODEL);
+        match block.kind() {
+            BlockKind::Raw => prop_assert!(
+                matches!(result, Err(UnfoldError::Format(FormatError::ChecksumMismatch { .. }))),
+                "{:?}", result
+            ),
+            BlockKind::Zstd => {
+                if let Ok(restored) = result {
+                    prop_assert_eq!(restored, data);
+                }
+            }
+            _ => prop_assert!(result.is_err()),
         }
     }
 
     /// Random bytes, with or without a valid start, never panic the parser.
     #[test]
     fn random_bytes_never_panic(
-        prefix in any::<bool>(),
+        prefix in 0u8..3,
         body in prop::collection::vec(any::<u8>(), 0..400),
     ) {
-        let mut bytes = if prefix { b"TACO\x01\x00\x00\x00".to_vec() } else { Vec::new() };
+        let mut bytes = match prefix {
+            0 => Vec::new(),
+            1 => b"TACO\x01\x00\x00\x00".to_vec(),
+            _ => b"TACO\x02\x00\x00\x00".to_vec(),
+        };
         bytes.extend_from_slice(&body);
         if let Ok(c) = Container::parse(&bytes) {
             // A container that parses obeys the layout rules.
             let stored: usize = c.blocks().iter().map(|b| b.stored().len()).sum();
-            prop_assert_eq!(bytes.len(), HEADER_LEN + TABLE_ENTRY_LEN * c.blocks().len() + stored);
+            let header = c.header().byte_len();
+            prop_assert_eq!(bytes.len(), header + TABLE_ENTRY_LEN * c.blocks().len() + stored);
+            // A zstd block decodes, or gives an error. It never gives a wrong length.
+            for b in c.blocks().iter().filter(|b| b.kind() == BlockKind::Zstd) {
+                let mut out = Vec::new();
+                if b.decode_zstd_into(&mut out).is_ok() {
+                    prop_assert_eq!(out.len(), b.original_len() as usize);
+                } else {
+                    prop_assert!(out.is_empty());
+                }
+            }
         }
     }
 }
+
+/// The offset of the profile byte in a version 2 header.
+const PROFILE_OFFSET: usize = 88;
 
 #[test]
 fn every_single_flip_of_a_small_container_is_caught() {
@@ -162,6 +187,14 @@ fn every_single_flip_of_a_small_container_is_caught() {
         for pos in 0..bytes.len() {
             for x in [0x01, 0x80, 0xFF] {
                 let damaged = apply(&bytes, &Damage::Flip(pos, x));
+                if (pos, x) == (PROFILE_OFFSET, 0x01) {
+                    // NOTE: text (0) becomes logs (1), a valid profile. The decoder does not use
+                    // the profile, so the data is the original data (ADR 0011 §7).
+                    let c = Container::parse(&damaged).unwrap();
+                    assert_eq!(c.header().profile(), taco_format::Profile::Logs);
+                    assert_eq!(unfold(&damaged, MODEL).unwrap(), data);
+                    continue;
+                }
                 assert!(unfold(&damaged, MODEL).is_err(), "flip {x:#04x} at {pos} was not caught");
             }
         }

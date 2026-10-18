@@ -47,6 +47,21 @@ is different, do not commit the new file. Tell the lead.
   test writes the model again with `hardshell::hsm::HsmWriter` and compares the bytes. Thus the
   Python writer and the Rust writer make the same file.
 
+## The version 1 container: `taco-v1-tiny.taco`
+
+| Item | Value |
+|---|---|
+| File | `conformance/taco-v1-tiny.taco` |
+| Size | 1,837 bytes (measured) |
+| SHA-256 | `c3ff718b1c9682589836078b36d936836077744b03b1cc8af3a6ced0d5821b8a` |
+| Made by | `golden_container_hash` in `crates/taco/tests/container.rs`, at commit `dc621ce` (container version 1) |
+| Model | the tiny model of `crates/taco/tests/common` (SHA-256 `5ba63e7c…4ff`), not `tiny.hsm` |
+| Blocks | 5 blocks of 512 bytes: coded, coded, raw, raw, coded (ADR 0007) |
+
+The writer of version 2 cannot make this file again. It is the proof that the reader still
+reads version 1 (plan §3 rule 8). `golden_v1_container_still_unfolds` in
+`crates/taco/tests/container.rs` checks its hash and unfolds it. Do not change the file.
+
 ## The GPT-2 model
 
 The GPT-2 model file is not committed (plan §11.1). `tools/convert/gpt2.py` makes it from the

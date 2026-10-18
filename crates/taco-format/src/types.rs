@@ -1,4 +1,5 @@
-//! Newtypes for the values of the header: hashes, the block size and the block kind.
+//! Newtypes for the values of the header: hashes, the block size, the block kind and the
+//! profile.
 
 use core::fmt;
 use core::num::NonZeroU32;
@@ -158,6 +159,9 @@ pub enum BlockKind {
     Raw = 0,
     /// The stored bytes are the output of the range coder. Kind byte 1.
     Coded = 1,
+    /// The stored bytes are one zstd frame (RFC 8878) of the original bytes. Kind byte 2.
+    /// Version 2 and later only (ADR 0011).
+    Zstd = 2,
 }
 
 impl BlockKind {
@@ -168,13 +172,70 @@ impl BlockKind {
         self as u8
     }
 
-    /// The kind of a kind byte, or `None` if version 1 does not define the byte.
+    /// The kind of a kind byte, or `None` if no version defines the byte. The reader also
+    /// checks that the version of the container permits the kind ([`BlockKind::min_version`]).
     #[must_use]
     #[inline]
     pub const fn from_u8(byte: u8) -> Option<Self> {
         match byte {
             0 => Some(Self::Raw),
             1 => Some(Self::Coded),
+            2 => Some(Self::Zstd),
+            _ => None,
+        }
+    }
+
+    /// The first container version that permits this kind: 1 for raw and coded, 2 for zstd.
+    #[must_use]
+    #[inline]
+    pub const fn min_version(self) -> u16 {
+        match self {
+            Self::Raw | Self::Coded => 1,
+            Self::Zstd => 2,
+        }
+    }
+
+    /// True if a block of this kind needs the model of the container to decode. Only a coded
+    /// block needs it.
+    #[must_use]
+    #[inline]
+    pub const fn needs_model(self) -> bool {
+        matches!(self, Self::Coded)
+    }
+}
+
+/// The profile of a container (ADR 0012): the kind of data that the encoder prepared the
+/// container for. The header of version 2 stores it. A version 1 container has the profile
+/// [`Profile::Text`].
+///
+/// The decoder does not select a model or coding parts from the profile. The model hash and the
+/// coding parts of the header do that (ADR 0010, not accepted yet).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+#[repr(u8)]
+pub enum Profile {
+    /// Prose, documents, HTML and source code. Profile byte 0.
+    #[default]
+    Text = 0,
+    /// Logs, JSON lines, CSV and telemetry. Profile byte 1.
+    Logs = 1,
+}
+
+impl Profile {
+    /// The profile byte in the header of version 2.
+    #[must_use]
+    #[inline]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// The profile of a profile byte, or `None` if version 2 does not define the byte.
+    #[must_use]
+    #[inline]
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Text),
+            1 => Some(Self::Logs),
             _ => None,
         }
     }
@@ -230,15 +291,37 @@ mod tests {
     }
 
     #[test]
-    fn block_kind_bytes_are_zero_and_one_only() {
+    fn block_kind_bytes_are_zero_one_and_two_only() {
         assert_eq!(BlockKind::Raw.as_u8(), 0);
         assert_eq!(BlockKind::Coded.as_u8(), 1);
+        assert_eq!(BlockKind::Zstd.as_u8(), 2);
         for b in 0..=255u8 {
             let k = BlockKind::from_u8(b);
             match b {
                 0 => assert_eq!(k, Some(BlockKind::Raw)),
                 1 => assert_eq!(k, Some(BlockKind::Coded)),
+                2 => assert_eq!(k, Some(BlockKind::Zstd)),
                 _ => assert_eq!(k, None),
+            }
+        }
+        assert_eq!(BlockKind::Raw.min_version(), 1);
+        assert_eq!(BlockKind::Coded.min_version(), 1);
+        assert_eq!(BlockKind::Zstd.min_version(), 2);
+        assert!(BlockKind::Coded.needs_model());
+        assert!(!BlockKind::Raw.needs_model() && !BlockKind::Zstd.needs_model());
+    }
+
+    #[test]
+    fn profile_bytes_are_zero_and_one_only() {
+        assert_eq!(Profile::default(), Profile::Text);
+        assert_eq!(Profile::Text.as_u8(), 0);
+        assert_eq!(Profile::Logs.as_u8(), 1);
+        for b in 0..=255u8 {
+            let p = Profile::from_u8(b);
+            match b {
+                0 => assert_eq!(p, Some(Profile::Text)),
+                1 => assert_eq!(p, Some(Profile::Logs)),
+                _ => assert_eq!(p, None),
             }
         }
     }

@@ -1,5 +1,7 @@
-//! One test for each field and each rule of the reader: a valid value passes, and each kind
-//! of bad value gives its typed error.
+//! Version 1 (ADR 0006): one test for each field and each rule of the reader. A valid value
+//! passes, and each kind of bad value gives its typed error. The reader of this crate writes
+//! version 2 only, but it must still read every version 1 container (plan §3 rule 8).
+//! `version2.rs` has the tests of the version 2 fields.
 
 #![allow(
     clippy::unwrap_used,
@@ -12,7 +14,8 @@ mod common;
 
 use common::{Craft, MODEL, bs, fold, unfold};
 use taco_format::{
-    BlockKind, Checksum, Container, FormatError, HEADER_LEN, MAGIC, ModelHash, VERSION,
+    BlockKind, Checksum, Container, FormatError, HEADER_LEN_V1, MAGIC, ModelHash, Profile,
+    VERSION_1,
 };
 
 /// A valid container of 10 original bytes in blocks of 4: raw, coded (2 bytes), raw.
@@ -37,7 +40,9 @@ fn sample_is_valid_and_gives_its_fields() {
     let bytes = sample().bytes();
     let c = Container::parse(&bytes).unwrap();
     let h = c.header();
-    assert_eq!(h.version(), VERSION);
+    assert_eq!(h.version(), VERSION_1);
+    assert_eq!(h.byte_len(), HEADER_LEN_V1);
+    assert_eq!(h.profile(), Profile::Text);
     assert_eq!(h.model_hash(), MODEL);
     assert!(h.needs_model());
     assert_eq!(h.original_len(), 10);
@@ -70,7 +75,7 @@ fn magic_must_be_taco() {
 
 #[test]
 fn short_input_with_the_magic_prefix_is_truncated() {
-    for len in 0..HEADER_LEN {
+    for len in 0..HEADER_LEN_V1 {
         let bytes = sample().bytes();
         let e = Container::parse(&bytes[..len]).unwrap_err();
         assert!(matches!(e, FormatError::Truncated { part: "header", needed: 88, .. }), "{e:?}");
@@ -79,7 +84,8 @@ fn short_input_with_the_magic_prefix_is_truncated() {
 
 #[test]
 fn unknown_version_is_refused_before_other_fields() {
-    for version in [0, 2, 3, 0x0100, u16::MAX] {
+    // Version 2 is known (`version2.rs`).
+    for version in [0, 3, 0x0100, 0x0200, u16::MAX] {
         assert_eq!(
             parse_err(&Craft { version, ..sample() }),
             FormatError::UnsupportedVersion { version }
@@ -142,7 +148,8 @@ fn original_length_must_agree_with_the_blocks() {
 }
 
 #[test]
-fn kind_must_be_raw_or_coded() {
+fn kind_must_be_raw_or_coded_in_version_1() {
+    // Kind 2 (zstd) is a kind of version 2 only.
     for kind in [2, 3, 0x80, u8::MAX] {
         let mut c = sample();
         c.entries[1].0 = kind;
@@ -219,7 +226,7 @@ fn table_outside_the_input_is_truncated_and_not_allocated() {
         ..sample()
     };
     let mut bytes = c.bytes();
-    bytes.truncate(HEADER_LEN + 7);
+    bytes.truncate(HEADER_LEN_V1 + 7);
     assert_eq!(
         Container::parse(&bytes).unwrap_err(),
         FormatError::Truncated {
@@ -230,7 +237,7 @@ fn table_outside_the_input_is_truncated_and_not_allocated() {
     );
     // Each length inside the table is short too.
     let full = sample().bytes();
-    for len in HEADER_LEN..HEADER_LEN + 15 {
+    for len in HEADER_LEN_V1..HEADER_LEN_V1 + 15 {
         let e = Container::parse(&full[..len]).unwrap_err();
         assert!(matches!(e, FormatError::Truncated { part: "block table", .. }), "{e:?}");
     }
@@ -240,7 +247,7 @@ fn table_outside_the_input_is_truncated_and_not_allocated() {
 fn input_must_end_at_the_last_block() {
     let full = sample().bytes();
     assert_eq!(full.len(), 88 + 15 + 8);
-    for len in HEADER_LEN + 15..full.len() {
+    for len in HEADER_LEN_V1 + 15..full.len() {
         assert_eq!(
             Container::parse(&full[..len]).unwrap_err(),
             FormatError::WrongTotalLength { expected: 111, found: len as u64 }
@@ -260,7 +267,7 @@ fn input_must_end_at_the_last_block() {
 fn empty_container_is_the_header_only() {
     let c = Craft { checksum: *Checksum::of(&[]).as_bytes(), ..Craft::default() };
     let bytes = c.bytes();
-    assert_eq!(bytes.len(), HEADER_LEN);
+    assert_eq!(bytes.len(), HEADER_LEN_V1);
     let parsed = Container::parse(&bytes).unwrap();
     assert_eq!(parsed.header().block_count(), 0);
     assert!(parsed.blocks().is_empty());

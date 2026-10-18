@@ -51,7 +51,7 @@ impl UnfoldOptions {
 ///    model.
 /// 3. Decode each coded block with a new HardShell context: the range decoder gives token
 ///    ids, and the vocabulary gives their bytes. The decoder never tokenizes. Copy each raw
-///    block. Each thread decodes groups of up to 8 blocks in lockstep in one
+///    block. Decode each zstd block (ADR 0011 §5) without the model. Each thread decodes groups of up to 8 blocks in lockstep in one
 ///    `hardshell::gpt2::Batch`, so each weight of the model is read once for the group. The
 ///    weights of each block are the same as with its own session (a HardShell test proves it).
 /// 4. Verify the length and the SHA-256 of the result (plan §3 rule 4).
@@ -64,7 +64,8 @@ impl UnfoldOptions {
 ///
 /// # Errors
 ///
-/// - [`TacoError::Format`] if the container is not valid.
+/// - [`TacoError::Format`] if the container is not valid, or a zstd block does not decode to
+///   its length (`FormatError::CorruptZstdBlock`).
 /// - [`TacoError::ModelRequired`] or [`TacoError::ModelHashMismatch`] for a wrong model.
 /// - [`TacoError::OutputTooLarge`] if the original length is more than the limit.
 /// - [`TacoError::CorruptBlock`] if a coded block does not decode to its length.
@@ -135,8 +136,8 @@ const MIN_LANES: usize = 4;
 // memory bandwidth on the M2; the step and batch measurements are in the simd agent report.
 const MAX_LANES: usize = 8;
 
-/// Decodes one group of blocks: raw blocks are copied, and the coded blocks run in lockstep
-/// in the lanes of `batch` (made on the first use, with `lanes` lanes).
+/// Decodes one group of blocks: raw blocks are copied, zstd blocks are decoded, and the coded
+/// blocks run in lockstep in the lanes of `batch` (made on the first use, with `lanes` lanes).
 ///
 /// If several blocks of the group fail, the result is the error of the block with the lowest
 /// index, so the error does not depend on the grouping.
@@ -158,8 +159,16 @@ fn decode_group<'m>(
                     Err(e) => errors.push((b.index(), e)),
                 }
             }
+            // A zstd block needs no model (ADR 0011 §3.2).
+            (BlockKind::Zstd, _) => {
+                let mut bytes = Vec::new();
+                match b.decode_zstd_into(&mut bytes) {
+                    Ok(()) => parts[slot] = Some(bytes),
+                    Err(e) => errors.push((b.index(), TacoError::Format(e))),
+                }
+            }
             // NOTE: the parser refuses a coded block in the raw-only mode, and `unfold`
-            // refuses a missing model. Thus this arm is for block kinds of later versions.
+            // refuses a missing model. Thus this arm is for block kinds of later versions only.
             _ => errors.push((
                 b.index(),
                 TacoError::CorruptBlock {

@@ -11,7 +11,7 @@ use taco::{
     BlockSize, FoldOptions, Model, TacoError, TokenId, Tokenizer, UnfoldOptions, container_hash,
     fold, unfold,
 };
-use taco_format::{BlockKind, Container, HEADER_LEN};
+use taco_format::{BlockKind, Container, HEADER_LEN, HEADER_LEN_V1, Profile, VERSION, VERSION_1};
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -44,19 +44,57 @@ fn golden_container_hash() {
         f.container.len(),
         hex(&Sha256::digest(&f.container))
     );
-    // The vector covers both kinds of block.
-    assert!(kinds.contains(&BlockKind::Raw) && kinds.contains(&BlockKind::Coded));
+    // The vector covers the three kinds of block of version 2 (ADR 0011).
+    assert_eq!(
+        kinds,
+        [BlockKind::Zstd, BlockKind::Zstd, BlockKind::Raw, BlockKind::Zstd, BlockKind::Coded]
+    );
+    assert_eq!(parsed.header().version(), VERSION);
+    assert_eq!(parsed.header().profile(), Profile::Text);
+    assert_eq!((f.stats.coded_blocks, f.stats.zstd_blocks), (1, 3));
     // CONFORMANCE: a change to these values changes the format, the model file or the coder.
     assert_eq!(
         hex(&Sha256::digest(&t.file)),
         "5ba63e7c69063caa1430de0df5a9b3ed76db63de1a779d5ecce25484c88de4ff",
         "the tiny model file changed (common/mod.rs or the .hsm writer)"
     );
-    assert_eq!(f.container.len(), 1837, "container length");
+    // NOTE: the zstd frames depend on the zstd library version (ADR 0011 §6: zstd 1.5.7,
+    // level 19). The version 1 vector of this input is `golden_v1_container_still_unfolds`.
+    assert_eq!(f.container.len(), 1660, "container length");
     assert_eq!(
         hex(&Sha256::digest(&f.container)),
-        "c3ff718b1c9682589836078b36d936836077744b03b1cc8af3a6ced0d5821b8a"
+        "0b0ba3f1bc8579247476163489ed3155a7828916d27e92f3435e9a8e74157c07"
     );
+    assert_eq!(unfold(Some(&t.model), &f.container, &UnfoldOptions::new()).unwrap(), data);
+}
+
+/// The golden container of `golden_input` as the version 1 code wrote it (commit `dc621ce`,
+/// ADR 0007). Plan §3 rule 8: the reader of version 2 still reads it.
+const GOLDEN_V1: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../conformance/taco-v1-tiny.taco"));
+
+#[test]
+fn golden_v1_container_still_unfolds() {
+    assert_eq!(GOLDEN_V1.len(), 1837);
+    assert_eq!(
+        hex(&Sha256::digest(GOLDEN_V1)),
+        "c3ff718b1c9682589836078b36d936836077744b03b1cc8af3a6ced0d5821b8a",
+        "conformance/taco-v1-tiny.taco changed"
+    );
+    let parsed = Container::parse(GOLDEN_V1).unwrap();
+    assert_eq!(parsed.header().version(), VERSION_1);
+    assert_eq!(parsed.header().byte_len(), HEADER_LEN_V1);
+    assert_eq!(parsed.header().profile(), Profile::Text);
+    let kinds: Vec<BlockKind> = parsed.blocks().iter().map(|b| b.kind()).collect();
+    assert_eq!(
+        kinds,
+        [BlockKind::Coded, BlockKind::Coded, BlockKind::Raw, BlockKind::Raw, BlockKind::Coded]
+    );
+    let t = tiny();
+    for threads in [1, 3] {
+        let opts = UnfoldOptions::new().with_threads(taco::Threads::new(threads).unwrap());
+        assert_eq!(unfold(Some(&t.model), GOLDEN_V1, &opts).unwrap(), golden_input());
+    }
 }
 
 #[test]

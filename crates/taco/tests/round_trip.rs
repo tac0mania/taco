@@ -58,14 +58,21 @@ fn one_byte_round_trips_raw() {
 fn english_round_trips_and_codes_smaller() {
     let data = ENGLISH.repeat(8);
     check_class(data.as_bytes());
+    // The text is the same paragraph 8 times, so zstd wins over the random tiny model.
     let f = round_trip(data.as_bytes(), 16 * 1024);
-    assert_eq!(f.stats.coded_blocks, 1);
+    assert_eq!((f.stats.coded_blocks, f.stats.zstd_blocks), (0, 1));
     assert!(f.container.len() < data.len(), "{} >= {}", f.container.len(), data.len());
+    // One paragraph has no repeats for zstd to find, and the model codes it smaller.
+    let one = round_trip(ENGLISH.as_bytes(), 16 * 1024);
+    assert_eq!((one.stats.coded_blocks, one.stats.zstd_blocks), (1, 0));
+    assert!(one.container.len() < ENGLISH.len(), "{} >= {}", one.container.len(), ENGLISH.len());
     eprintln!(
-        "English: {} bytes -> {} bytes, {} tokens",
+        "English: {} bytes -> {} bytes (zstd), {} bytes -> {} bytes (coded), {} tokens",
         data.len(),
         f.container.len(),
-        f.stats.tokens
+        ENGLISH.len(),
+        one.container.len(),
+        one.stats.tokens
     );
 }
 
@@ -98,9 +105,35 @@ fn random_letters_round_trip() {
 fn random_bytes_are_stored_raw() {
     let data = Rng::new(9).bytes(40_000);
     let f = round_trip(&data, 16 * 1024);
-    assert_eq!(f.stats.coded_blocks, 0);
+    assert_eq!((f.stats.coded_blocks, f.stats.zstd_blocks), (0, 0));
     // Plan §3 rule 6: the growth is the header and 5 bytes for each block only.
     assert_eq!(f.container.len(), HEADER_LEN + TABLE_ENTRY_LEN * 3 + data.len());
+    check_class(&data[..3000]);
+}
+
+/// Binary data with a structure, like the cells of a spreadsheet file: records of 16 bytes
+/// with a counter, a small value, a type code and zero padding.
+fn records(n: u32) -> Vec<u8> {
+    let mut rng = Rng::new(11);
+    let mut out = Vec::new();
+    for i in 0..n {
+        out.extend_from_slice(&i.to_le_bytes());
+        out.extend_from_slice(&((rng.next_u64() % 8) as u32).to_le_bytes());
+        out.extend_from_slice(&[0x02, 0x01, 0xFE, 0x00, 0, 0, 0, 0]);
+    }
+    out
+}
+
+#[test]
+fn structured_binary_is_stored_as_zstd() {
+    // ADR 0011: the model does not compress binary data, zstd does.
+    let data = records(2048);
+    let f = round_trip(&data, 16 * 1024);
+    assert_eq!((f.stats.blocks, f.stats.zstd_blocks, f.stats.coded_blocks), (2, 2, 0));
+    assert!(f.container.len() < data.len() / 4, "{} bytes", f.container.len());
+    let parsed = taco_format::Container::parse(&f.container).unwrap();
+    assert!(parsed.blocks().iter().all(|b| b.kind() == taco_format::BlockKind::Zstd));
+    eprintln!("records: {} bytes -> {} bytes", data.len(), f.container.len());
     check_class(&data[..3000]);
 }
 
@@ -139,15 +172,17 @@ fn large_mixed_file_round_trips() {
     let f = fold(&t.model, &t.tokenizer, &data, &options(16 * 1024).with_threads(threads)).unwrap();
     let uopts = UnfoldOptions::new().with_threads(threads);
     assert_eq!(unfold(Some(&t.model), &f.container, &uopts).unwrap(), data);
-    assert!(f.stats.coded_blocks > 0);
-    assert!(f.stats.coded_blocks < f.stats.blocks);
+    // The text parts repeat, so zstd or the model makes them smaller; the noise stays raw.
+    let smaller = f.stats.coded_blocks + f.stats.zstd_blocks;
+    assert!(smaller > 0 && smaller < f.stats.blocks, "{:?}", f.stats);
     let bound = worst_case_len(data.len() as u64, BlockSize::new(16 * 1024).unwrap()).unwrap();
     assert!(f.container.len() as u64 <= bound);
     eprintln!(
-        "mixed: {} bytes -> {} bytes, {} of {} blocks coded, {} tokens, {:?}",
+        "mixed: {} bytes -> {} bytes, {} coded and {} zstd of {} blocks, {} tokens, {:?}",
         data.len(),
         f.container.len(),
         f.stats.coded_blocks,
+        f.stats.zstd_blocks,
         f.stats.blocks,
         f.stats.tokens,
         start.elapsed()

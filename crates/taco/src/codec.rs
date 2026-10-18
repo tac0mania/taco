@@ -21,7 +21,6 @@
 use hardshell::TokenId;
 use hardshell::gpt2::{Model, Session};
 use taco_coder::{Decoder, Encoder, FreqBits, FreqTable, Symbol};
-use taco_format::Block;
 
 use crate::error::{Result, TacoError};
 use crate::payload::{read_varint, varint_len, write_varint};
@@ -36,8 +35,9 @@ fn freq_bits() -> Result<FreqBits> {
 /// The result of the encoder for one block.
 #[derive(Debug)]
 pub(crate) struct CodedBlock {
-    /// The stored form: coded if the payload is smaller than the block, else raw.
-    pub(crate) block: Block,
+    /// The payload (ADR 0007 §1), or `None` if the encoder stopped early because the payload
+    /// was not smaller than the bound.
+    pub(crate) payload: Option<Vec<u8>>,
     /// The number of tokens of the block.
     pub(crate) tokens: u64,
 }
@@ -59,37 +59,42 @@ pub(crate) fn tokens_restore(model: &Model, tokens: &[TokenId], data: &[u8]) -> 
     rest.is_empty()
 }
 
-/// Codes the tokens of one block of `original_len` bytes, and selects the stored form.
+/// Codes the tokens of one block, and stops early when the payload cannot be smaller than
+/// `stop` bytes.
 ///
-/// The encoder rule (ADR 0007): the block is raw if the payload is not smaller than the
-/// block. The encoder stops early, with a raw block, when the varint and the bytes that the
-/// range coder has written are already at least `original_len` bytes. This rule depends only
-/// on the input, so every machine selects the same form.
+/// `stop` is the smallest stored length of the other candidates: the original length of the
+/// block, or the length of its zstd frame if that is smaller (ADR 0007 §5, ADR 0011 §4.5). The
+/// encoder stops, with no payload, when the varint and the bytes that the range coder has
+/// written are already at least `stop` bytes. The bytes of the coder only grow, so the full
+/// payload then has at least `stop` bytes and loses to raw or zstd under
+/// `Block::choose_smallest` (zstd wins a tie with coded). Thus the stop does not change the
+/// selected block. The rule depends only on the input, so every machine selects the same form.
 ///
 /// All tokens are known, so the session runs them `session.chunk()` at a time
 /// (`Session::step_many`, the prefill path). The weights are the same as with one step for
 /// each token (a HardShell test proves it), so the coded bytes are the same too.
 ///
-/// Cost: one HardShell step and one frequency table for each token except the last.
+/// Cost: one HardShell step and one frequency table for each token except the last, up to the
+/// stop.
 pub(crate) fn encode_block(
     session: &mut Session<'_>,
     tokens: &[TokenId],
-    original_len: usize,
+    stop: usize,
 ) -> Result<CodedBlock> {
     let count = u64::try_from(tokens.len())
         .map_err(|_| TacoError::InputTooLarge { reason: "token count" })?;
-    let raw = Ok(CodedBlock { block: Block::Raw, tokens: count });
+    let stopped = Ok(CodedBlock { payload: None, tokens: count });
     let prefix = varint_len(count);
-    if prefix >= original_len {
-        return raw;
+    if prefix >= stop {
+        return stopped;
     }
     let bits = freq_bits()?;
-    let mut encoder = Encoder::with_capacity(original_len);
+    let mut encoder = Encoder::with_capacity(stop);
     let first = FreqTable::from_weights(session.start_block()?, bits)?;
     if let Some((&t0, rest)) = tokens.split_first() {
         encoder.encode(&first, Symbol::new(t0.get()))?;
-        if prefix + encoder.bytes_written() >= original_len {
-            return raw;
+        if prefix + encoder.bytes_written() >= stop {
+            return stopped;
         }
         // The weights after token `i` code token `i + 1`. The last token needs no step.
         let inputs = tokens.get(..tokens.len() - 1).unwrap_or(&[]);
@@ -99,8 +104,8 @@ pub(crate) fn encode_block(
                 let Some(&t) = next.next() else { break };
                 let table = FreqTable::from_weights(weights, bits)?;
                 encoder.encode(&table, Symbol::new(t.get()))?;
-                if prefix + encoder.bytes_written() >= original_len {
-                    return raw;
+                if prefix + encoder.bytes_written() >= stop {
+                    return stopped;
                 }
             }
         }
@@ -109,7 +114,7 @@ pub(crate) fn encode_block(
     let mut payload = Vec::with_capacity(prefix + coded.len());
     write_varint(count, &mut payload);
     payload.extend_from_slice(&coded);
-    Ok(CodedBlock { block: Block::choose(payload, original_len), tokens: count })
+    Ok(CodedBlock { payload: Some(payload), tokens: count })
 }
 
 /// The decoder state of one coded block: the range decoder, the bytes so far and the count.
@@ -186,5 +191,97 @@ impl<'a> BlockDecoder<'a> {
             });
         }
         Ok(self.out)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::cast_possible_truncation)] // Test data from integer generators.
+mod tests {
+    use hardshell::gpt2::{Model, Session, SessionConfig};
+    use taco_format::{Block, BlockKind, compress_zstd};
+
+    use super::encode_block;
+    use crate::tokenizer::Tokenizer;
+
+    /// The committed tiny model of the conformance vectors (random weights, with merges).
+    const TINY: &[u8] =
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../conformance/tiny.hsm"));
+
+    #[test]
+    fn the_stop_at_the_zstd_length_does_not_change_the_selected_block() {
+        // ADR 0007 §5.2, ADR 0011 §4.5.
+        let model = Model::load(TINY).unwrap();
+        let merges: Vec<_> = model
+            .vocabulary()
+            .merges()
+            .unwrap_or(&[])
+            .iter()
+            .map(|m| (m.left(), m.right()))
+            .collect();
+        let tokenizer =
+            Tokenizer::for_vocabulary(model.vocabulary(), model.eot_token(), &merges).unwrap();
+        let mut session = Session::with_config(&model, SessionConfig::new().with_chunk(8));
+        let text = "The quick brown fox jumps over the lazy dog. ";
+        let mut inputs: Vec<Vec<u8>> = vec![
+            b"a".to_vec(),
+            text.as_bytes().to_vec(),
+            text.repeat(20).into_bytes(),
+            "dasdasdasdada".repeat(30).into_bytes(),
+            (0..=255u8).collect(),
+            (0..600u32).flat_map(|i| [(i % 7) as u8, 0, 0, 1]).collect(),
+        ];
+        let mut x = 0x7AC0_u64;
+        inputs.push(
+            (0..900)
+                .map(|_| {
+                    x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    (x >> 56) as u8
+                })
+                .collect(),
+        );
+        // The random tiny model codes single bytes at about 8.2 bits each (est.), so only text of
+        // merged (multi-byte) tokens codes smaller than raw. Merged tokens in a random order
+        // (coded wins or zstd wins) and repeated (zstd wins).
+        let vocab = model.vocabulary();
+        let merged: Vec<&[u8]> = (256..u32::try_from(model.vocab_size()).unwrap())
+            .filter_map(|i| vocab.token(hardshell::TokenId::new(i)))
+            .filter(|b| b.len() > 1)
+            .collect();
+        let mut picked = Vec::new();
+        for _ in 0..400 {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            picked.extend_from_slice(merged[(x >> 33) as usize % merged.len()]);
+        }
+        inputs.push(picked[..picked.len() / 40].to_vec());
+        inputs.push(picked[..picked.len() / 8].to_vec());
+        inputs.push(picked.clone());
+        inputs.push(picked[..picked.len() / 4].repeat(3));
+        let mut early = 0;
+        let mut kinds = Vec::new();
+        for data in &inputs {
+            let tokens = tokenizer.encode(data);
+            let zstd = compress_zstd(data).unwrap();
+            let full = encode_block(&mut session, &tokens, data.len()).unwrap();
+            let stop = data.len().min(zstd.len());
+            let short = encode_block(&mut session, &tokens, stop).unwrap();
+            assert_eq!(full.tokens, short.tokens);
+            if full.payload.is_some() && short.payload.is_none() {
+                early += 1;
+            }
+            let selected = Block::choose_smallest(data.len(), short.payload, Some(zstd.clone()));
+            assert_eq!(
+                Block::choose_smallest(data.len(), full.payload, Some(zstd)),
+                selected,
+                "{} bytes",
+                data.len()
+            );
+            kinds.push(selected.kind());
+        }
+        // The stop happened before the original length for some inputs, and the inputs give
+        // each kind.
+        assert!(early > 0);
+        for kind in [BlockKind::Raw, BlockKind::Coded, BlockKind::Zstd] {
+            assert!(kinds.contains(&kind), "{kinds:?}");
+        }
     }
 }

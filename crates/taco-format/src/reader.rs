@@ -5,108 +5,12 @@
 //! block only after it checks that the block table is inside the input. Thus a header field
 //! cannot cause an allocation larger than the input.
 
+use crate::TABLE_ENTRY_LEN;
 use crate::error::{FormatError, Result};
-use crate::layout::{HEADER_LEN_U64, OriginalLens, expected_block_count, header_and_table_len};
-use crate::types::{BlockKind, BlockSize, Checksum, ModelHash};
-use crate::{HEADER_LEN, MAGIC, TABLE_ENTRY_LEN, VERSION};
-
-/// The fields of a valid version 1 header.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Header {
-    model_hash: ModelHash,
-    original_len: u64,
-    checksum: Checksum,
-    block_size: BlockSize,
-    /// INVARIANT: `ceil(original_len / block_size)`.
-    block_count: u32,
-}
-
-impl Header {
-    /// The format version of the container. This crate reads version [`VERSION`] only.
-    #[must_use]
-    pub const fn version(&self) -> u16 {
-        VERSION
-    }
-
-    /// The hash of the model that coded the blocks, or [`ModelHash::RAW_ONLY`].
-    #[must_use]
-    pub const fn model_hash(&self) -> ModelHash {
-        self.model_hash
-    }
-
-    /// True if the decoder needs a model: the model hash is not [`ModelHash::RAW_ONLY`].
-    ///
-    /// A container with a model hash needs that model even if all its blocks are raw (plan §3
-    /// rule 3).
-    #[must_use]
-    pub fn needs_model(&self) -> bool {
-        !self.model_hash.is_raw_only()
-    }
-
-    /// The number of bytes of the original data. The parser does not limit this value. A
-    /// coded block of a few bytes can hold many original bytes, so do not allocate this length
-    /// before the blocks decode.
-    #[must_use]
-    pub const fn original_len(&self) -> u64 {
-        self.original_len
-    }
-
-    /// The SHA-256 of the original data.
-    #[must_use]
-    pub const fn checksum(&self) -> Checksum {
-        self.checksum
-    }
-
-    /// The number of original bytes in each block. The last block can be shorter.
-    #[must_use]
-    pub const fn block_size(&self) -> BlockSize {
-        self.block_size
-    }
-
-    /// The number of blocks: `ceil(original_len / block_size)`.
-    #[must_use]
-    pub const fn block_count(&self) -> u32 {
-        self.block_count
-    }
-
-    /// Refuses a container that needs a different model than the loaded model (plan §3
-    /// rule 3). A container in the raw-only mode needs no model, so it passes with any
-    /// `loaded` hash. Call this before the blocks decode. Cost: 64 byte compares.
-    ///
-    /// # Errors
-    ///
-    /// [`FormatError::ModelHashMismatch`], with both hashes, if the hashes are different.
-    pub fn verify_model_hash(&self, loaded: &ModelHash) -> Result<()> {
-        if self.model_hash.is_raw_only() || self.model_hash == *loaded {
-            Ok(())
-        } else {
-            Err(FormatError::ModelHashMismatch { container: self.model_hash, loaded: *loaded })
-        }
-    }
-
-    /// Verifies the restored data against the original length and the checksum (plan §3
-    /// rule 4). A failure is an error, never a silent wrong output. Cost: one SHA-256 pass
-    /// over `restored`.
-    ///
-    /// # Errors
-    ///
-    /// - [`FormatError::RestoredLengthMismatch`] if `restored` does not have the original
-    ///   length. The function does not calculate the SHA-256 then.
-    /// - [`FormatError::ChecksumMismatch`] if the SHA-256 of `restored` is different.
-    pub fn verify_checksum(&self, restored: &[u8]) -> Result<()> {
-        let found = u64::try_from(restored.len())
-            .map_err(|_| FormatError::LengthOverflow { part: "restored data" })?;
-        if found != self.original_len {
-            return Err(FormatError::RestoredLengthMismatch { expected: self.original_len, found });
-        }
-        let found = Checksum::of(restored);
-        if found == self.checksum {
-            Ok(())
-        } else {
-            Err(FormatError::ChecksumMismatch { expected: self.checksum, found })
-        }
-    }
-}
+use crate::header::Header;
+use crate::layout::{OriginalLens, header_and_table_len};
+use crate::types::BlockKind;
+use crate::zstd_block;
 
 /// One block of a parsed container: its kind, its original length and its stored bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,15 +50,40 @@ impl<'a> BlockRef<'a> {
     }
 
     /// The stored bytes, a slice of the container. For a raw block, these are the original
-    /// bytes. For a coded block, these are the bytes for the range decoder, and they are
-    /// fewer than the original bytes.
+    /// bytes. For a coded block, these are the bytes for the range decoder. For a zstd block,
+    /// these are one zstd frame. A coded or zstd block has fewer stored bytes than original
+    /// bytes.
     #[must_use]
     pub const fn stored(&self) -> &'a [u8] {
         self.stored
     }
+
+    /// Decodes a zstd block and appends exactly [`BlockRef::original_len`] bytes to `out`. On
+    /// an error, `out` keeps its old length. The rules are in ADR 0011 §5.
+    ///
+    /// The memory is bounded: the zstd window is at most 8 MiB, and `out` grows only with the
+    /// bytes that the frame really gives, up to the original length of the block. Thus a
+    /// damaged header cannot make the decoder allocate a large buffer from a few bytes.
+    ///
+    /// Cost: one zstd decode of the block and one copy of the output.
+    ///
+    /// # Errors
+    ///
+    /// - [`FormatError::NotZstd`] if the block is not a zstd block.
+    /// - [`FormatError::CorruptZstdBlock`] if the frame is not one zstd frame with the
+    ///   content size of the block, if the zstd decoder refuses it, or if it gives more or
+    ///   fewer bytes than the original length.
+    /// - [`FormatError::Zstd`] if the zstd library fails, for example with no memory.
+    pub fn decode_zstd_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        if self.kind != BlockKind::Zstd {
+            return Err(FormatError::NotZstd { block: self.index });
+        }
+        zstd_block::decode_into(self.stored, self.original_len, self.index, out)
+    }
 }
 
-/// A valid version 1 container: its header and its blocks. The blocks borrow the input.
+/// A valid container of version 1 or version 2: its header and its blocks. The blocks borrow
+/// the input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Container<'a> {
     header: Header,
@@ -166,69 +95,19 @@ fn to_usize(x: u64, part: &'static str) -> Result<usize> {
     usize::try_from(x).map_err(|_| FormatError::LengthOverflow { part })
 }
 
-/// Takes the first `N` bytes of `rest`. The caller checked the length of the header, so this
-/// does not fail on a valid path. It returns an error and does not panic if it does.
-fn take<const N: usize>(rest: &mut &[u8]) -> Result<[u8; N]> {
-    let (head, tail) = rest
-        .split_first_chunk::<N>()
-        .ok_or(FormatError::LengthOverflow { part: "header field" })?;
-    *rest = tail;
-    Ok(*head)
-}
-
-/// Reads and checks the 88 bytes of the header. The magic and the version are already
-/// checked.
-fn read_header(bytes: &[u8; HEADER_LEN]) -> Result<Header> {
-    let mut rest: &[u8] = bytes;
-    let _magic: [u8; 4] = take(&mut rest)?;
-    let _version: [u8; 2] = take(&mut rest)?;
-    let flags = u16::from_le_bytes(take(&mut rest)?);
-    if flags != 0 {
-        return Err(FormatError::UnknownFlags { flags });
-    }
-    let model_hash = ModelHash::from_bytes(take(&mut rest)?);
-    let original_len = u64::from_le_bytes(take(&mut rest)?);
-    let checksum = Checksum::from_bytes(take(&mut rest)?);
-    let block_size = BlockSize::new(u32::from_le_bytes(take(&mut rest)?))?;
-    let block_count = u32::from_le_bytes(take(&mut rest)?);
-    let expected = expected_block_count(original_len, block_size);
-    if expected != u64::from(block_count) {
-        return Err(FormatError::WrongBlockCount {
-            original_len,
-            block_size: block_size.get(),
-            expected,
-            found: u64::from(block_count),
-        });
-    }
-    Ok(Header { model_hash, original_len, checksum, block_size, block_count })
-}
-
-/// Checks the magic and the version. A reader refuses an unknown version before it reads any
-/// other field, because another version can have another header.
-fn check_magic_and_version(bytes: &[u8], found: u64) -> Result<()> {
-    let truncated = FormatError::Truncated { part: "header", needed: HEADER_LEN_U64, found };
-    match bytes.first_chunk::<4>() {
-        Some(magic) if *magic == MAGIC => {}
-        Some(_) => return Err(FormatError::BadMagic),
-        None if MAGIC.starts_with(bytes) => return Err(truncated),
-        None => return Err(FormatError::BadMagic),
-    }
-    let version = bytes.get(4..6).and_then(|v| v.first_chunk::<2>()).ok_or(truncated)?;
-    let version = u16::from_le_bytes(*version);
-    if version == VERSION { Ok(()) } else { Err(FormatError::UnsupportedVersion { version }) }
-}
-
-/// Decodes and checks one entry of the block table.
+/// Decodes and checks one entry of the block table of a container of `header.version()`.
 fn entry(
     index: u32,
     bytes: &[u8; TABLE_ENTRY_LEN],
     original_len: u32,
-    raw_only: bool,
+    header: &Header,
 ) -> Result<(BlockKind, u32)> {
     let [kind, l0, l1, l2, l3] = *bytes;
     let stored_len = u32::from_le_bytes([l0, l1, l2, l3]);
-    let kind =
-        BlockKind::from_u8(kind).ok_or(FormatError::UnknownBlockKind { block: index, kind })?;
+    let raw_only = !header.needs_model();
+    let kind = BlockKind::from_u8(kind)
+        .filter(|k| k.min_version() <= header.version())
+        .ok_or(FormatError::UnknownBlockKind { block: index, kind })?;
     match kind {
         BlockKind::Raw if stored_len != original_len => Err(FormatError::RawLengthMismatch {
             block: index,
@@ -241,7 +120,12 @@ fn entry(
             original_len,
             stored_len: u64::from(stored_len),
         }),
-        BlockKind::Raw | BlockKind::Coded => Ok((kind, stored_len)),
+        BlockKind::Zstd if stored_len >= original_len => Err(FormatError::ZstdNotSmaller {
+            block: index,
+            original_len,
+            stored_len: u64::from(stored_len),
+        }),
+        BlockKind::Raw | BlockKind::Coded | BlockKind::Zstd => Ok((kind, stored_len)),
     }
 }
 
@@ -258,12 +142,16 @@ impl<'a> Container<'a> {
     /// # Errors
     ///
     /// - [`FormatError::BadMagic`], [`FormatError::UnsupportedVersion`] and
-    ///   [`FormatError::UnknownFlags`] for an input that is not a version 1 container.
+    ///   [`FormatError::UnknownFlags`] for an input that is not a version 1 or version 2
+    ///   container.
+    /// - [`FormatError::UnknownProfile`], [`FormatError::UnknownCodingParts`] and
+    ///   [`FormatError::ReservedNotZero`] for a bad field of a version 2 header.
     /// - [`FormatError::Truncated`] if the header or the block table is not complete.
     /// - [`FormatError::ZeroBlockSize`] and [`FormatError::WrongBlockCount`] for a header that
     ///   does not agree with itself.
-    /// - [`FormatError::UnknownBlockKind`], [`FormatError::RawLengthMismatch`],
-    ///   [`FormatError::CodedNotSmaller`] and [`FormatError::CodedBlockInRawOnly`] for a bad
+    /// - [`FormatError::UnknownBlockKind`] (also kind 2 in version 1),
+    ///   [`FormatError::RawLengthMismatch`], [`FormatError::CodedNotSmaller`],
+    ///   [`FormatError::ZstdNotSmaller`] and [`FormatError::CodedBlockInRawOnly`] for a bad
     ///   entry of the block table.
     /// - [`FormatError::WrongTotalLength`] if the input does not end at the end of the last
     ///   block.
@@ -271,29 +159,26 @@ impl<'a> Container<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
         let found = u64::try_from(bytes.len())
             .map_err(|_| FormatError::LengthOverflow { part: "container" })?;
-        check_magic_and_version(bytes, found)?;
-        let (header, rest) = bytes
-            .split_first_chunk::<HEADER_LEN>()
-            .ok_or(FormatError::Truncated { part: "header", needed: HEADER_LEN_U64, found })?;
-        let header = read_header(header)?;
+        let (header, rest) = Header::parse(bytes, found)?;
+        let header_len = u64::try_from(header.byte_len())
+            .map_err(|_| FormatError::LengthOverflow { part: "header" })?;
 
-        let table_end = header_and_table_len(u64::from(header.block_count))?;
+        let table_end = header_and_table_len(header_len, u64::from(header.block_count()))?;
         if table_end > found {
             return Err(FormatError::Truncated { part: "block table", needed: table_end, found });
         }
         // INVARIANT: table_end <= found, so the subtraction cannot wrap.
-        let table_len = to_usize(table_end - HEADER_LEN_U64, "block table")?;
+        let table_len = to_usize(table_end - header_len, "block table")?;
         let (table, mut payload) = rest
             .split_at_checked(table_len)
             .ok_or(FormatError::Truncated { part: "block table", needed: table_end, found })?;
         let (table, _) = table.as_chunks::<TABLE_ENTRY_LEN>();
-        let raw_only = header.model_hash.is_raw_only();
-        let lens = || OriginalLens::new(header.original_len, header.block_size);
+        let lens = || OriginalLens::new(header.original_len(), header.block_size());
 
         // Pass 1: check each entry and add the stored lengths, before any allocation.
         let mut expected = table_end;
-        for (index, (e, len)) in (0..header.block_count).zip(table.iter().zip(lens())) {
-            let (_, stored_len) = entry(index, e, len, raw_only)?;
+        for (index, (e, len)) in (0..header.block_count()).zip(table.iter().zip(lens())) {
+            let (_, stored_len) = entry(index, e, len, &header)?;
             expected = expected
                 .checked_add(u64::from(stored_len))
                 .ok_or(FormatError::LengthOverflow { part: "container" })?;
@@ -305,10 +190,10 @@ impl<'a> Container<'a> {
         // Pass 2: cut the payload into blocks. The table is inside the input, so the
         // allocation is at most bytes.len() / 5 entries.
         let mut blocks = Vec::with_capacity(table.len());
-        let block_size = u64::from(header.block_size.get());
+        let block_size = u64::from(header.block_size().get());
         let mut original_offset = 0u64;
-        for (index, (e, len)) in (0..header.block_count).zip(table.iter().zip(lens())) {
-            let (kind, stored_len) = entry(index, e, len, raw_only)?;
+        for (index, (e, len)) in (0..header.block_count()).zip(table.iter().zip(lens())) {
+            let (kind, stored_len) = entry(index, e, len, &header)?;
             let (stored, tail) = payload
                 .split_at_checked(to_usize(u64::from(stored_len), "block")?)
                 .ok_or(FormatError::WrongTotalLength { expected, found })?;

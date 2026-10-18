@@ -1,5 +1,6 @@
 //! Helpers for the integration tests: an integer PRNG, a toy block coder, a full fold and
-//! unfold over the container, and a builder for hand-made (also invalid) containers.
+//! unfold over the container (raw, coded and zstd blocks), and a builder for hand-made (also
+//! invalid) containers of version 1 and version 2.
 
 #![allow(dead_code, reason = "each test file uses a different part")]
 #![allow(clippy::unwrap_used, reason = "test code: a failure must stop the test")]
@@ -61,16 +62,31 @@ pub(crate) fn toy_decode(stored: &[u8], original_len: usize) -> Option<Vec<u8>> 
     (out.len() == original_len).then_some(out)
 }
 
-/// Compresses `data` with the toy coder and the raw fallback.
+/// Compresses `data` with the toy coder, zstd and the raw fallback: the smallest form of each
+/// block (ADR 0011 §4). In the raw-only mode, the candidates are raw and zstd.
 pub(crate) fn fold(data: &[u8], block_size: BlockSize, model: ModelHash) -> Vec<u8> {
-    let blocks: Vec<Block> =
-        block_size
-            .split(data)
-            .map(|b| {
-                if model.is_raw_only() { Block::Raw } else { Block::choose(toy_encode(b), b.len()) }
-            })
-            .collect();
+    let blocks: Vec<Block> = block_size
+        .split(data)
+        .map(|b| {
+            let coded = (!model.is_raw_only()).then(|| toy_encode(b));
+            let zstd = taco_format::compress_zstd(b).unwrap();
+            Block::choose_smallest(b.len(), coded, Some(zstd))
+        })
+        .collect();
     Container::build(&ContainerParams::new(model, block_size), data, &blocks).unwrap()
+}
+
+/// Phrases of a small vocabulary: zstd makes them smaller, and the toy coder does not.
+pub(crate) fn phrases(seed: u64, len: usize) -> Vec<u8> {
+    const WORDS: [&[u8]; 8] =
+        [b"error ", b"info ", b"user=42 ", b"GET /index.html ", b"200 ", b"ms ", b"\n", b"ok "];
+    let mut s = seed;
+    let mut out = Vec::with_capacity(len + 16);
+    while out.len() < len {
+        out.extend_from_slice(WORDS[usize::try_from(splitmix64(&mut s) % 8).unwrap()]);
+    }
+    out.truncate(len);
+    out
 }
 
 /// Why an unfold failed.
@@ -101,14 +117,16 @@ pub(crate) fn unfold(bytes: &[u8], loaded: ModelHash) -> Result<Vec<u8>, UnfoldE
             BlockKind::Coded => {
                 out.extend(toy_decode(b.stored(), len).ok_or(UnfoldError::Decode(b.index()))?);
             }
-            _ => unreachable!("version 1 has two kinds"),
+            BlockKind::Zstd => b.decode_zstd_into(&mut out)?,
+            _ => unreachable!("version 2 has three kinds"),
         }
     }
     c.header().verify_checksum(&out)?;
     Ok(out)
 }
 
-/// The fields of a hand-made container. The default is a valid container of 0 blocks.
+/// The fields of a hand-made container. The default is a valid version 1 container of 0
+/// blocks. [`Craft::v2`] makes it a version 2 container.
 #[derive(Clone, Debug)]
 pub(crate) struct Craft {
     pub(crate) magic: [u8; 4],
@@ -119,6 +137,9 @@ pub(crate) struct Craft {
     pub(crate) checksum: [u8; 32],
     pub(crate) block_size: u32,
     pub(crate) block_count: u32,
+    /// The bytes after the block count and before the block table: empty in version 1, the
+    /// 16 bytes of the profile section in version 2.
+    pub(crate) section: Vec<u8>,
     pub(crate) entries: Vec<(u8, u32)>,
     pub(crate) payload: Vec<u8>,
 }
@@ -134,6 +155,7 @@ impl Default for Craft {
             checksum: [0; 32],
             block_size: 16,
             block_count: 0,
+            section: Vec::new(),
             entries: Vec::new(),
             payload: Vec::new(),
         }
@@ -141,6 +163,13 @@ impl Default for Craft {
 }
 
 impl Craft {
+    /// The same container as version 2, with the profile `profile` and all reserved fields 0.
+    pub(crate) fn v2(self, profile: u8) -> Self {
+        let mut section = vec![0; 16];
+        section[0] = profile;
+        Self { version: 2, section, ..self }
+    }
+
     /// The bytes of the container, with no checks.
     pub(crate) fn bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -152,6 +181,7 @@ impl Craft {
         out.extend_from_slice(&self.checksum);
         out.extend_from_slice(&self.block_size.to_le_bytes());
         out.extend_from_slice(&self.block_count.to_le_bytes());
+        out.extend_from_slice(&self.section);
         for &(kind, len) in &self.entries {
             out.push(kind);
             out.extend_from_slice(&len.to_le_bytes());

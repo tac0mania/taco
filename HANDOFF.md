@@ -46,15 +46,21 @@ Key measurements (all measured on the Mac):
   (xz 3,164); kennedy.xls (8 KiB) stored raw, 8,285 (xz 1,672). Speed: about 0.5 KB/s with 6
   threads.
 
-Golden hashes (conformance vectors, plan §11). The Mac computed them. devbox has not checked
-them yet.
+Golden hashes (conformance vectors, plan §11). The Mac computed them. devbox checked them on 2026-10-18 (234 tests, and again after
+container version 2).
 
 | Vector | SHA-256 |
 |---|---|
 | Coder stream | `91676cdc669fca0eb22ed18f5f629882212523261f41d0d5c568b647e78d798f` |
 | HardShell tiny model output | `d4063522517854fdcab605c3d3159bd3ac9a15eb92fa6721ff4a276658f90078` |
-| Container vector A | `c1c07402a5dae2993c596345a696d35b7c1c0502fe304d31fa33d4f5ecefeeec` |
-| taco golden container (tiny model) | `c3ff718b1c9682589836078b36d936836077744b03b1cc8af3a6ced0d5821b8a` |
+| Container vector A (version 1, ADR 0006) | `c1c07402a5dae2993c596345a696d35b7c1c0502fe304d31fa33d4f5ecefeeec` |
+| Container empty vector (version 1, ADR 0006) | `2f8a2052a618a4ca1adfc67aa07836c7d4fda0b10738142e9327228ddd0bcdf7` |
+| Container vector B (version 2, ADR 0011) | `18d7b8a97cf26ffc0a28d7e4575f870ed7463cabefded8450ee7f912d723e8d9` |
+| zstd frame of block 2 of vector B (zstd 1.5.7, level 19) | `4a62d79659c63a4dbc2ea9236d5001543baea7f608f045b4563b8262b11fe83d` |
+| Container vector C (version 2, ADR 0011) | `72dcd44f9b87a9e0fd7f4be6b6e8de252597ec98eac4b5e0bc5215b06ccb7a59` |
+| Container empty vector (version 2, ADR 0011) | `03de05c54a2e192c7dd046526ef8a3c9882b16465b9ab577b42c3477e130c390` |
+| taco golden container (tiny model, version 2, 1,660 bytes) | `0b0ba3f1bc8579247476163489ed3155a7828916d27e92f3435e9a8e74157c07` |
+| taco golden container (tiny model, version 1, 1,837 bytes, `conformance/taco-v1-tiny.taco`) | `c3ff718b1c9682589836078b36d936836077744b03b1cc8af3a6ced0d5821b8a` |
 | `gpt2.hsm` | `aaa03eb96e9ad7957432168c8ac6b4a99ed55d57e637e4786a664b51001ba5c2` |
 | `conformance/tiny.hsm` | `eb78b89a4f0f17c7245865aed22f86512a49e0272b7583a831c47e1a401418f8` |
 

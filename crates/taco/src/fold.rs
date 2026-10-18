@@ -1,7 +1,7 @@
 //! `fold`: input bytes to a `.taco` container (plan §4).
 
 use hardshell::gpt2::{Model, Session, SessionConfig};
-use taco_format::{Block, BlockSize, Container, ContainerParams};
+use taco_format::{Block, BlockSize, Container, ContainerParams, Profile, compress_zstd};
 
 use crate::codec::{encode_block, tokens_restore};
 use crate::error::{Result, TacoError};
@@ -63,9 +63,12 @@ pub struct FoldStats {
     pub container_len: u64,
     /// The number of blocks.
     pub blocks: u64,
-    /// The number of blocks that are stored coded. The others are raw.
+    /// The number of blocks that are stored coded.
     pub coded_blocks: u64,
-    /// The number of tokens of all blocks, coded and raw.
+    /// The number of blocks that are stored as a zstd frame (ADR 0011). The blocks that are
+    /// not coded and not zstd are raw.
+    pub zstd_blocks: u64,
+    /// The number of tokens of all blocks, of every kind.
     pub tokens: u64,
 }
 
@@ -82,16 +85,21 @@ pub struct Folded {
 /// Compresses `input` into a `.taco` container (plan §4, §9).
 ///
 /// The input is divided into blocks of `options.block_size` bytes. Each block is tokenized,
-/// and coded with a new HardShell session and the range coder. A block whose coded form is not
-/// smaller is stored raw (plan §3 rule 6). The container stores the model hash and the
-/// SHA-256 of the input. The output is the same for every number of threads and on every
-/// machine.
+/// and coded with a new HardShell session and the range coder. Each block is also compressed
+/// into one zstd frame (ADR 0011). The smallest of raw, zstd and coded is stored, with the tie
+/// order of `Block::choose_smallest` (plan §3 rule 6, ADR 0011 §4). The model stops when the
+/// payload reaches the smaller of the block length and the zstd length; this does not change
+/// the selected block. The container is version 2 with the profile `text` (ADR 0012). It
+/// stores the model hash and the SHA-256 of the input. The output is the same for every number
+/// of threads and on every machine.
 ///
 /// Before a block is coded, its tokens are checked against the vocabulary of the model: they
 /// must give the block bytes exactly. Thus a tokenizer that does not agree with the model is an
 /// error here, not a damaged container.
 ///
-/// Cost: for each token, one HardShell step and one frequency table of the full vocabulary.
+/// Cost: one zstd compression of each block at level 19 (1.5 to 5.4 MB/s on one thread,
+/// measured by the zstdblock agent), then, for each token up to the stop, one HardShell step
+/// and one frequency table of the full vocabulary.
 /// The steps of a block run 32 tokens at a time (`Session::step_many`). Each thread holds one
 /// session (for GPT-2 small, about 19 MB of KV cache and 19 MB of work buffers, est.). Memory:
 /// the input, the container, and the tokens and payload of each block.
@@ -127,20 +135,29 @@ pub fn fold(
             if !tokens_restore(model, &tokens, data) {
                 return Err(TacoError::TokenizerRoundTrip { block: index });
             }
-            encode_block(session, &tokens, data.len())
+            // ADR 0011 §4.5: the zstd frame comes first, so the model can stop at its length.
+            let zstd = compress_zstd(data)?;
+            let coded = encode_block(session, &tokens, data.len().min(zstd.len()))?;
+            let block = Block::choose_smallest(data.len(), coded.payload, Some(zstd));
+            Ok((block, coded.tokens))
         },
     )?;
     let mut stats = FoldStats::default();
     let mut blocks = Vec::with_capacity(coded.len());
-    for c in coded {
+    for (block, tokens) in coded {
         stats.blocks += 1;
-        stats.tokens += c.tokens;
-        if matches!(c.block, Block::Coded(_)) {
-            stats.coded_blocks += 1;
+        stats.tokens += tokens;
+        match block {
+            Block::Coded(_) => stats.coded_blocks += 1,
+            Block::Zstd(_) => stats.zstd_blocks += 1,
+            _ => {}
         }
-        blocks.push(c.block);
+        blocks.push(block);
     }
-    let params = ContainerParams::new(container_hash(model), options.block_size);
+    // NOTE: the profile is `text` until the logs profile exists (ADR 0012). The decoder does
+    // not use it.
+    let params =
+        ContainerParams::new(container_hash(model), options.block_size).with_profile(Profile::Text);
     let container = Container::build(&params, input, &blocks)?;
     let to_u64 =
         |n: usize| u64::try_from(n).map_err(|_| TacoError::InputTooLarge { reason: "length" });

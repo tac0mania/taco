@@ -66,10 +66,17 @@ These rules select raw or coded. A decoder does not depend on them, but they cha
 of the container. Thus the conformance vectors depend on them.
 
 1. A block is raw if the payload is not smaller than the original bytes (`Block::choose`, plan
-   §3 rule 6).
-2. The encoder stops with a raw block when the varint and the bytes that the coder has already
-   written have at least the original length. This saves the model time on bytes that do not
-   compress. The rule depends only on the input, so every machine selects the same form.
+   §3 rule 6). From container version 2, the encoder selects with
+   `Block::choose_smallest(original length, payload, zstd frame)` (ADR 0011 §4).
+2. The encoder stops, with no payload, when the varint and the bytes that the coder has
+   already written have at least the stop length. Version 1: the stop length is the original
+   length. Version 2 (ADR 0011 §4.5): the stop length is the smaller of the original length
+   and the length of the zstd frame of the block. The coder bytes only grow, so a payload that
+   reaches the stop length loses to raw or to zstd (zstd wins a tie with coded). Thus the stop
+   does not change the selected block. This saves the model time on bytes that do not compress
+   (`kennedy.xls`, first 8,192 bytes: fold 11.2 s before, 4.5 s after, 6 threads, measured on
+   the Mac). The rule depends only on the input, so every machine selects the same form. A
+   test (`codec::tests`) compares the selected block with and without the stop.
 3. The encoder checks that the tokens give the original bytes with the vocabulary of the model
    before it codes the block. A failure is an error, not a damaged container.
 
