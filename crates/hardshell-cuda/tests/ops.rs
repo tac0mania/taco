@@ -11,6 +11,9 @@ use hardshell_cuda::{KERNEL_SOURCE, MatKernel, PTX_SOURCE_LINE, matmul_i8, matmu
 use sha2::{Digest, Sha256};
 use support::{Rng, device};
 
+const KERNELS: [MatKernel; 4] =
+    [MatKernel::TensorCore, MatKernel::TensorCore64, MatKernel::TensorCore128, MatKernel::Dp4a];
+
 fn cpu_matmul(w: &Matrix<i8>, a: &[i8], m: usize) -> Vec<i32> {
     let mut out = vec![0i32; m * w.rows()];
     for (row, o) in a.chunks(w.cols()).zip(out.chunks_mut(w.rows())) {
@@ -35,12 +38,15 @@ fn matmul_equals_hardshell_kernels() {
         (2, 4100, 130),
         (2304, 768, 256),
         (50, 768, 1000),
+        (768, 3072, 224),
+        (300, 128, 129),
+        (1000, 64, 513),
     ];
     for (n, k, m) in shapes {
         let w = Matrix::new(n, k, (0..n * k).map(|_| r.i8()).collect()).unwrap();
         let a: Vec<i8> = (0..m * k).map(|_| r.i8()).collect();
         let want = cpu_matmul(&w, &a, m);
-        for kernel in [MatKernel::TensorCore, MatKernel::Dp4a] {
+        for kernel in KERNELS {
             assert_eq!(
                 matmul_i8(&dev, &w, &a, m, kernel).unwrap(),
                 want,
@@ -58,11 +64,13 @@ fn matmul_is_exact_at_the_accumulator_bound() {
         let w = Matrix::new(3, k, vec![wv; 3 * k]).unwrap();
         let a = vec![av; 2 * k];
         let want = cpu_matmul(&w, &a, 2);
-        for kernel in [MatKernel::TensorCore, MatKernel::Dp4a] {
+        for kernel in KERNELS {
             assert_eq!(matmul_i8(&dev, &w, &a, 2, kernel).unwrap(), want, "{wv} {av} {kernel:?}");
         }
-        let got = matmul_i8_split(&dev, &w, &a, 2, MatKernel::TensorCore, 5).unwrap();
-        assert_eq!(got, want, "{wv} {av} split");
+        for kernel in [MatKernel::TensorCore, MatKernel::TensorCore64, MatKernel::TensorCore128] {
+            let got = matmul_i8_split(&dev, &w, &a, 2, kernel, 5).unwrap();
+            assert_eq!(got, want, "{wv} {av} split {kernel:?}");
+        }
     }
 }
 

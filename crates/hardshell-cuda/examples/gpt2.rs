@@ -3,6 +3,7 @@
 //!   gpt2 equiv <model.hsm> <text files...>   per-window SHA-256 of all weights: CPU, CUDA decode,
 //!                                            CUDA prefill; and every coder interval
 //!   gpt2 bench <model.hsm> [batch sizes]     decode tokens/s, prefill tokens/s, time by op
+//!   gpt2 window <model.hsm> <batch sizes>    decode tokens/s over a full window, for each batch size
 //!
 //! The text is tokenized with the longest vocabulary match: deterministic, not the canonical
 //! GPT-2 tokenization, which is enough for an equivalence test.
@@ -110,26 +111,33 @@ fn equiv(bytes: &[u8], files: &[String]) {
     }
     let v = gpu.vocab_size();
     let eot = gpu.eot_token();
-    // CUDA decode: one slot for each window, one token for each slot in each call.
-    let t0 = Instant::now();
-    let mut batch = CudaBatch::new(&gpu, windows.len(), windows.len() + 1).unwrap();
-    let mut dh: Vec<Sha256> = windows.iter().map(|_| Sha256::new()).collect();
+    // CUDA decode: one slot for each window, one token for each slot in each call; on the fused
+    // path (the default) and on the op-level path (one kernel for each op, ADR 0013).
     let max_len = windows.iter().map(|w| w.1.len()).max().unwrap_or(0);
-    for i in 0..=max_len {
-        let inputs: Vec<(usize, TokenId)> = windows
-            .iter()
-            .enumerate()
-            .filter_map(
-                |(s, w)| if i == 0 { Some((s, eot)) } else { w.1.get(i - 1).map(|&t| (s, t)) },
-            )
-            .collect();
-        let out = batch.run_weights(&inputs).unwrap();
-        for (k, &(s, _)) in inputs.iter().enumerate() {
-            out[k * v..(k + 1) * v].iter().for_each(|x| dh[s].update(x.to_le_bytes()));
+    let decode_on = |op_level: bool| -> Vec<String> {
+        let mut batch = CudaBatch::new(&gpu, windows.len(), windows.len() + 1).unwrap();
+        batch.set_op_level(op_level);
+        let mut dh: Vec<Sha256> = windows.iter().map(|_| Sha256::new()).collect();
+        for i in 0..=max_len {
+            let inputs: Vec<(usize, TokenId)> =
+                windows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(s, w)| {
+                        if i == 0 { Some((s, eot)) } else { w.1.get(i - 1).map(|&t| (s, t)) }
+                    })
+                    .collect();
+            let out = batch.run_weights(&inputs).unwrap();
+            for (k, &(s, _)) in inputs.iter().enumerate() {
+                out[k * v..(k + 1) * v].iter().for_each(|x| dh[s].update(x.to_le_bytes()));
+            }
         }
-    }
-    let decode: Vec<String> = dh.into_iter().map(|h| hex(&h.finalize())).collect();
+        dh.into_iter().map(|h| hex(&h.finalize())).collect()
+    };
+    let t0 = Instant::now();
+    let decode = decode_on(false);
     let decode_s = t0.elapsed().as_secs_f64();
+    let decode_op = decode_on(true);
     // CUDA prefill: each window in one call (passes of up to 512 rows).
     let t0 = Instant::now();
     let mut pre = CudaBatch::new(&gpu, 1, 512).unwrap();
@@ -174,15 +182,16 @@ fn equiv(bytes: &[u8], files: &[String]) {
     let mut iv_diff = 0;
     for (i, (name, w)) in windows.iter().enumerate() {
         let (c, civ) = &cpu_res[i];
-        let same = *c == decode[i] && *c == prefill[i];
+        let same = *c == decode[i] && *c == prefill[i] && *c == decode_op[i];
         ok &= same;
         iv_diff += civ.iter().zip(&giv[i]).filter(|(a, b)| a != b).count()
             + civ.len().abs_diff(giv[i].len());
         steps += w.len() + 1;
         println!(
-            "window {name:<14} {:>5} steps  cpu {c}  decode {}  prefill {}  {}",
+            "window {name:<14} {:>5} steps  cpu {c}  decode {}  op-level decode {}  prefill {}  {}",
             w.len() + 1,
             &decode[i][..16],
+            &decode_op[i][..16],
             &prefill[i][..16],
             if same { "EQUAL" } else { "DIFFERENT" }
         );
@@ -203,6 +212,44 @@ fn tok(s: usize, i: usize) -> TokenId {
     TokenId::new(((s * 7919 + i * 104_729) % 50_000) as u32)
 }
 
+/// A batch for the measurements; with TACO_OP_LEVEL set, on the op-level path.
+fn bench_batch<'m>(
+    gpu: &'m CudaModel<'m>,
+    slots: usize,
+    rows: usize,
+) -> hardshell_cuda::Result<CudaBatch<'m>> {
+    let mut b = CudaBatch::new(gpu, slots, rows)?;
+    b.set_op_level(std::env::var_os("TACO_OP_LEVEL").is_some());
+    Ok(b)
+}
+
+/// A full window: every slot of a batch of `b` decodes positions 0 to 1,023 (the whole context
+/// of GPT-2), with the coder op.
+fn full_window(gpu: &CudaModel<'_>, b: usize) {
+    let mut batch = match bench_batch(gpu, b, b) {
+        Ok(x) => x,
+        Err(e) => {
+            println!("full window, batch {b}: not possible: {e}");
+            return;
+        }
+    };
+    let all: Vec<usize> = (0..b).collect();
+    let t0 = Instant::now();
+    for i in 0..gpu.n_ctx() {
+        let inputs: Vec<(usize, TokenId)> = all.iter().map(|&s| (s, tok(s, i))).collect();
+        let queries: Vec<CoderQuery> =
+            all.iter().map(|&s| CoderQuery::Encode(tok(s, i + 1))).collect();
+        batch.run_coded(&inputs, &queries, 32).unwrap();
+    }
+    let s = t0.elapsed().as_secs_f64();
+    println!(
+        "decode batch {b}, full window (positions 0 to {}): {:.0} tokens/s ({:.1} s, coder op)",
+        gpu.n_ctx() - 1,
+        (b * gpu.n_ctx()) as f64 / s,
+        s
+    );
+}
+
 fn bench(bytes: &[u8], sizes: &[usize]) {
     let dev = CudaDevice::open(0).unwrap();
     let (free0, total) = dev.memory().unwrap();
@@ -220,7 +267,7 @@ fn bench(bytes: &[u8], sizes: &[usize]) {
         gpu.cache_bytes_per_slot() as f64 / 1e6
     );
     for &b in sizes {
-        let mut batch = match CudaBatch::new(&gpu, b, b) {
+        let mut batch = match bench_batch(&gpu, b, b) {
             Ok(x) => x,
             Err(e) => {
                 println!("batch {b}: not possible: {e}");
@@ -246,6 +293,11 @@ fn bench(bytes: &[u8], sizes: &[usize]) {
         coded(&mut batch, &mut i, 3);
         let n = 16;
         let early = coded(&mut batch, &mut i, n);
+        if b == *sizes.iter().max().unwrap_or(&b) {
+            let prof = batch.profile(&inputs(i)).unwrap();
+            print_profile(&format!("decode batch {b}, position {i}"), &prof);
+            i += 1;
+        }
         let t0 = Instant::now();
         for _ in 0..4 {
             batch.run_weights(&inputs(i)).unwrap();
@@ -267,44 +319,16 @@ fn bench(bytes: &[u8], sizes: &[usize]) {
             (used as f64 + gpu.weight_bytes() as f64) / 1e6
         );
         if b == *sizes.iter().max().unwrap_or(&b) {
-            let times: Vec<(&'static str, f64)> = batch
-                .profile(&inputs(i))
-                .unwrap()
-                .into_iter()
-                .map(|(l, ns)| (l, ns as f64 * 1e-9))
-                .collect();
-            let tot: f64 = times.iter().map(|x| x.1).sum();
-            let parts: Vec<String> =
-                times.iter().map(|(l, t)| format!("{l} {:.2}", t * 1e3)).collect();
-            println!(
-                "  time by op at batch {b}, position {i} (ms, GPU timer marks): total {:.2}; {}",
-                tot * 1e3,
-                parts.join(", ")
-            );
+            let prof = batch.profile(&inputs(i)).unwrap();
+            print_profile(&format!("decode batch {b}, position {i}"), &prof);
         }
     }
-    // A full window: every slot decodes positions 0 to 1,023 (the whole context of GPT-2).
     if let Some(&b) = sizes.iter().max() {
-        let mut batch = CudaBatch::new(&gpu, b, b).unwrap();
-        let all: Vec<usize> = (0..b).collect();
-        let t0 = Instant::now();
-        for i in 0..gpu.n_ctx() {
-            let inputs: Vec<(usize, TokenId)> = all.iter().map(|&s| (s, tok(s, i))).collect();
-            let queries: Vec<CoderQuery> =
-                all.iter().map(|&s| CoderQuery::Encode(tok(s, i + 1))).collect();
-            batch.run_coded(&inputs, &queries, 32).unwrap();
-        }
-        let s = t0.elapsed().as_secs_f64();
-        println!(
-            "decode batch {b}, full window (positions 0 to {}): {:.0} tokens/s ({:.1} s, coder op)",
-            gpu.n_ctx() - 1,
-            (b * gpu.n_ctx()) as f64 / s,
-            s
-        );
+        full_window(&gpu, b);
     }
     // Prefill: windows of 512 tokens, 8 slots, passes of 512 rows.
     for (slots, len, rows) in [(1usize, 512usize, 512usize), (8, 512, 512), (8, 1024, 1024)] {
-        let mut batch = match CudaBatch::new(&gpu, slots, rows) {
+        let mut batch = match bench_batch(&gpu, slots, rows) {
             Ok(x) => x,
             Err(e) => {
                 println!("prefill {slots} x {len}: not possible: {e}");
@@ -329,14 +353,84 @@ fn bench(bytes: &[u8], sizes: &[usize]) {
             inputs.len() as f64 / s,
             s * 1e3
         );
+        (0..slots).for_each(|s| batch.reset(s));
+        print_profile(&format!("prefill {slots} x {len}"), &batch.profile(&inputs).unwrap());
     }
+}
+
+/// GPU time of the GPT-2 products for each kernel and split at the given numbers of rows.
+fn gemm(rows: &[String]) {
+    use hardshell_cuda::{MatKernel, matmul_gpu_ns};
+    let dev = CudaDevice::open(0).unwrap();
+    let shapes = [
+        ("qkv", 2304, 768),
+        ("proj", 768, 768),
+        ("fc", 3072, 768),
+        ("mlp", 768, 3072),
+        ("logits", 50257, 768),
+    ];
+    for m in rows.iter().map(|r| r.parse::<usize>().unwrap()) {
+        for (name, n, k) in shapes {
+            let mut line = format!("m {m:>5} {name:<7}");
+            for kernel in [MatKernel::TensorCore, MatKernel::TensorCore64, MatKernel::TensorCore128]
+            {
+                for splits in [1u32, 2, 3, 4, 6, 8] {
+                    let reps = 20;
+                    let ns = matmul_gpu_ns(&dev, (n, k, m), kernel, splits, reps).unwrap()
+                        / u64::from(reps);
+                    let tmac = (m * n * k) as f64 / ns as f64 / 1e3;
+                    line += &format!(" {kernel:?}/{splits} {:.1}us {tmac:.1}T", ns as f64 / 1e3);
+                }
+            }
+            println!("{line}");
+        }
+    }
+}
+
+fn print_profile(what: &str, prof: &[(&'static str, u64)]) {
+    let tot: u64 = prof.iter().map(|x| x.1).sum();
+    let parts: Vec<String> =
+        prof.iter().map(|(l, ns)| format!("{l} {:.2}", *ns as f64 * 1e-6)).collect();
+    println!(
+        "  time by op, {what} (ms, GPU timer marks): total {:.2}; {}",
+        tot as f64 * 1e-6,
+        parts.join(", ")
+    );
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args[1] == "resources" {
+        let dev = CudaDevice::open(0).unwrap();
+        for (name, regs, local, shared) in dev.kernel_resources().unwrap() {
+            println!(
+                "{name:<20} registers {regs:>4}  local bytes {local:>5}  shared bytes {shared:>6}"
+            );
+        }
+        return;
+    }
+    if args[1] == "bandwidth" {
+        let dev = CudaDevice::open(0).unwrap();
+        for mb in [64usize, 512, 2048] {
+            let ns = hardshell_cuda::read_gpu_ns(&dev, mb << 20, 10).unwrap();
+            println!("read {mb} MB x 10: {:.1} GB/s", (10 * (mb << 20)) as f64 / ns as f64);
+        }
+        return;
+    }
+    if args[1] == "gemm" {
+        gemm(&args[2..]);
+        return;
+    }
     let bytes = std::fs::read(&args[2]).unwrap();
     match args[1].as_str() {
         "equiv" => equiv(&bytes, &args[3..]),
+        "window" => {
+            let dev = CudaDevice::open(0).unwrap();
+            let gpu = CudaModel::load(&dev, &bytes).unwrap();
+            for b in args[3..].iter().map(|s| s.parse::<usize>().unwrap()) {
+                full_window(&gpu, b);
+            }
+        }
         "bench" => {
             let sizes: Vec<usize> = if args.len() > 3 {
                 args[3..].iter().map(|s| s.parse().unwrap()).collect()
@@ -345,6 +439,6 @@ fn main() {
             };
             bench(&bytes, &sizes);
         }
-        _ => panic!("usage: gpt2 equiv|bench <model.hsm> ..."),
+        _ => panic!("usage: gpt2 equiv|bench|window|gemm <model.hsm> ..."),
     }
 }

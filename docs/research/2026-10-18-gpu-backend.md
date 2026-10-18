@@ -18,6 +18,9 @@ uses little CPU, but the numbers can be lower than on an idle machine.
 - **Speed gate (10,000 tokens/s, RTX 3060): PASS for decode at short context (18,565 tokens/s,
   batch 128) and for prefill (12,012 to 22,355 tokens/s). FAIL for decode over a full
   1,024-token window (7,229 tokens/s, batch 224).** Section 5 gives the reason.
+- Update of 2026-10-19 (section 7): fused kernels, new tile plan, new attention kernels. Full
+  window at batch 224: 8,691 to 9,195 tokens/s (HEAD: 6,803 to 7,252, same conditions). Still
+  below 10,000. The GPU ran at a 45 W power limit (default 80 W), at 300 to 500 MHz.
 
 ## 2. Equivalence evidence
 
@@ -172,3 +175,115 @@ pub trait IntervalPredictor {
   `FreqTable`.
 - Device choice: `hardshell_cuda::CudaDevice::open(0)`, else `hardshell_gpu::GpuDevice::open`,
   else the CPU. Each choice gives the same bytes. The container needs no flag for it.
+
+## 7. Tuning of 2026-10-19 (kernels agent)
+
+All numbers in this section are measured on devbox, RTX 3060 Laptop, on 2026-10-19 between
+00:40 and 01:30 +04. "HEAD" is commit 74de31f. "Final" is the working tree with the changes
+below. Each A/B pair ran back to back, with the same command (`gpt2 bench`, `gpt2 window`).
+
+### 7.1 Conditions
+
+- **GPU power limit: 45 W** (`nvidia-smi -q`: current power limit 45.00 W, default 80.00 W;
+  "SW Power Cap" and "SW Thermal Slowdown" active). The laptop was on mains power (Windows:
+  battery status 2, power online). Under load the GPU stayed at 44 to 45 W, and the SM clock
+  fell to 300 to 500 MHz (mean of the busy samples, `nvidia-smi` every 0.5 s); the maximum is
+  2,100 MHz. The memory clock stayed at 6,001 MHz. Idle power was 23 W.
+- Memory bandwidth (`gpt2 bandwidth`, a streaming read): 274 to 280 GB/s.
+- CPU load: 18 to 57 on 14 processors (other agents: `taco` benchmarks, HardShell evaluations).
+  The timing runs used processors 0 to 5 and held `~/scratch/timing.lock`.
+- No other process used the GPU during a timing run.
+- Variation: about 2% between repeated runs of the same binary; the first run after a pause
+  is faster (a cooler GPU).
+
+### 7.2 Equivalence
+
+The final tree gives the CPU weights bit for bit:
+
+- `cargo test -p hardshell-cuda --release -- --include-ignored`: 22 of 22 pass (4 fused-path,
+  14 GPT-2, 4 product and PTX tests). New tests: row-group attention with head size 64 and 128,
+  runs of many slots in one pass, rows of more than 1,024 values in the norm.
+- `gpt2 equiv` on `gpt2.hsm` (`aaa03eb9…a5c2`): 7 of 7 windows equal for fused decode, op-level
+  decode and prefill (CPU SHA-256 values of section 2); 2,643 of 2,643 coder intervals equal.
+- Golden tiny vector `d4063522…0078`: equal (decode and prefill).
+- The PTX test: the committed PTX names the SHA-256 of the committed source.
+
+### 7.3 Changes
+
+| Change | Why it is exact |
+|---|---|
+| Fused kernels (previous agent): `linear_qkv` (linear output and KV store), `residual_norm` (linear output, add, norm), `linear_gelu`, logits product with compact u16 logits and `coder_d16` | The same expressions in one kernel; `tests/fused.rs` compares every weight and interval with the op-level path |
+| Tensor-core tiles 64 x 128 and 128 x 128 with `ldmatrix` (previous agent) | Exact i32 sums; the tile order does not change an integer sum |
+| A measured plan of kernel and split-K for each product shape (`ops::plan_product`, table of 7.5) | Each kernel and split gives the same exact sum |
+| Decode attention keeps the i32 dots in shared memory (4 KB less); the row max is `max(score(max dot), score(min dot))` | The score is monotonic in the dot for each sign of the multiplier (the DETERMINISM note in the kernel) |
+| `attend_rows`: prefill attention of groups of up to 16 rows of one slot, with `mma.sync` (s8 x s8 for the dots, u8 x s8 for the byte planes of p times the values), three passes over the keys | The same dots, row max, sum, p and plane sums as `attend`, as exact integer sums |
+| The fused epilogues use an i64 rescale when \|x\| < 2^31 | Then \|x * m\| < 2^62, and the i64 form gives the i128 value |
+| Norm: blocks of 128 threads (one wave for 224 rows), the row in registers, u64 forms of `isqrt` and of the variance division when the value is below 2^64 | The same functions; the product `centred * inv * (gamma * m)` is the same integer |
+
+### 7.4 Results, HEAD against final
+
+Tokens/s with the coder op. Two runs of each binary (in the order HEAD, final, HEAD, final, with
+45 s pauses); the "full window" line also has 2 runs of `gpt2 window 224` of the same final binary.
+
+| Measurement | HEAD | Final | Change |
+|---|---|---|---|
+| Decode batch 32, positions 3-19 | 11,291 to 11,500 | 8,124 to 12,368 | the low value is one slow run |
+| Decode batch 32, positions 512-528 | 5,033 to 5,556 | 6,829 to 6,916 | +30% |
+| Decode batch 128, positions 3-19 | 16,472 to 17,975 | 21,371 to 24,598 | +35% |
+| Decode batch 128, positions 512-528 | 6,889 to 7,139 | 9,067 to 9,640 | +33% |
+| Decode batch 224, positions 3-19 | 16,461 to 17,296 | 26,900 to 27,823 | +62% |
+| Decode batch 224, positions 512-528 | 6,964 to 7,317 | 8,637 to 9,126 | +25% |
+| **Decode batch 224, full window (0 to 1,023)** | **6,901 to 7,178** | **8,691 to 9,195** | **+27%** |
+| Prefill 1 slot x 512 | 16,167 to 16,225 | 28,100 to 40,573 | +2.1x |
+| Prefill 8 slots x 512 | 15,367 to 15,407 | 27,781 to 30,469 | +1.9x |
+| Prefill 8 slots x 1,024 | 11,403 to 12,427 | 25,819 to 26,191 | +2.2x |
+
+GPU time by op at batch 224, position 528 (ms, GPU timer marks, final tree): total 20.7 to 20.9;
+attention 9.2 to 9.4, products 6.7 to 6.8 (qkv 1.3, proj 0.7, fc 1.5, mlp 1.3, logits 1.8 to
+1.9), residual norm 1.8, linear qkv 0.8, linear gelu 0.8, coder 1.3. HEAD: total 28.9 to 31.5;
+attention 11.5 to 12.4.
+
+Prefill attention, 8 slots x 1,024 tokens: 214.8 ms (one block for each row, before
+`attend_rows`) and 110 to 124 ms (`attend_rows`).
+
+### 7.5 The plan of the products
+
+`gpt2 gemm 32 64 128 224 256 512 1024`, three runs, median GPU time of each kernel and split
+(A: 64 x 64 tiles, B: 64 x 128, C: 128 x 128; the number is the split-K factor). The runs used
+zero operands, at 1,100 to 1,340 MHz, so the absolute times are lower than in a decode step.
+
+| Rows | qkv | proj | fc | mlp |
+|---|---|---|---|---|
+| 32 | B2 14 µs | A2 13 | A1 19 | A4 19 |
+| 64 | B2 21 | B2 14 | C1 19 | B4 20 |
+| 128 | C2 29 | C3 18 | A1 26 | A2 26 |
+| 224 | C1 36 | B1 20 | B1 33 | B2 33 |
+| 512 | B1 56 | C1 26 | A1 64 | B1 56 |
+| 1,024 | C1 97 | B1 40 | B1 126 | C1 99 |
+
+The rule before (enough blocks for 60 slots, so 2 to 10 splits) took 25% to 40% more time at
+128 and 224 rows. Split-K helps only when a product has few tiles and a long k (mlp). The
+logits product keeps the 64 x 128 or 128 x 128 kernel, because the compact logits need tiles of
+128 columns: 64 x 64 tiles are faster for the product alone (519 against 671 µs at 224 rows),
+but the op-level logits path then costs about 2 ms more for each step (section 4.3).
+
+Not kept: 12 instead of 8 blocks of `attend` on each SM (40 registers, no spill): 9,158 and
+9,227 against 9,195 and 9,076 tokens/s over a full window; the difference is in the noise.
+
+### 7.6 The gate
+
+Full-window decode is 8,691 to 9,195 tokens/s at batch 224: **below 10,000**. At 45 W the GPU
+is power-bound: a step at position 528 takes 20.7 ms of GPU time at about 450 MHz. Attention
+reads 2.18 GB in 9.2 ms (237 GB/s, 85% of the measured read bandwidth). The other ops are
+instruction-bound at the low clock.
+
+Next steps (est., not measured):
+
+1. Measure again at the default power limit (80 W). The SM clock is then not limited by power;
+   the products, norms and the coder (11 ms of the 20.7 ms) are instruction-bound and become
+   faster with the clock. This is a setting of the laptop (power mode), not of Taco.
+2. Batch 256 (about 5.2 GB; the card has 5.37 GB free).
+3. A 64 x 64 tile with the compact logits epilogue (about 0.15 ms for each step at 224 rows
+   at the survey clock).
+4. Skip the zero byte planes of p in decode attention: most p are below 2^24, so plane 3 is
+   zero for most keys.

@@ -20,8 +20,11 @@ use crate::device::{bytes_u64, u32_bytes, u32_of};
 use crate::driver::{Arg, DevBuf, Graph};
 use crate::error::{Error, Result};
 use crate::kernels::padded_rows;
-use crate::model::{CudaModel, LinearW, NormW};
-use crate::ops::{Mat, MatKernel, launch_matmul, splits_for};
+use crate::model::CudaModel;
+use crate::ops::MatKernel;
+
+mod fused;
+mod record;
 
 /// A question to the coder op for one input (see [`CudaBatch::run_coded`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,7 +94,12 @@ struct Bufs {
     weights: DevBuf,
     queries: DevBuf,
     intervals: DevBuf,
+    /// The compact logits of the fused path: u16 differences and the tile maxima (i64).
+    d16: DevBuf,
+    tmax: DevBuf,
     stamps: DevBuf,
+    /// The row groups of `attend_rows`: (first row, count) for each group.
+    groups: DevBuf,
 }
 
 /// Many sessions of one model on one CUDA device.
@@ -110,6 +118,8 @@ pub struct CudaBatch<'m> {
     /// The recorded graphs of the pass shapes that ran.
     graphs: RefCell<HashMap<GraphKey, Graph>>,
     bytes: u64,
+    /// Run one kernel for each op (the reference structure) instead of the fused kernels.
+    op_level: bool,
 }
 
 impl std::fmt::Debug for CudaBatch<'_> {
@@ -127,15 +137,50 @@ struct Stamps<'a> {
     labels: Vec<&'static str>,
 }
 
+/// Adds a timer mark named `name` after the kernels before it, if `stamps` is set.
+fn mark(
+    dev: &crate::device::CudaDevice,
+    stamps: &mut Option<Stamps<'_>>,
+    name: &'static str,
+) -> Result<()> {
+    if let Some(st) = stamps.as_mut()
+        && st.labels.len() < MAX_STAMPS
+    {
+        let i = u32_of(st.labels.len(), "too many marks")?;
+        dev.launch(&dev.k.stamp, (1, 1), 1, &[Arg::Ptr(st.buf.ptr()), Arg::U32(i)])?;
+        st.labels.push(name);
+    }
+    Ok(())
+}
+
+/// The columns of one tile of the logits product with the compact epilogue (`BN` of the
+/// tensor-core kernels).
+const LOGIT_TILE: u32 = 128;
+
+/// The most tiles of compact logits that `coder_d16` keeps in shared memory (`CODER_TILES`).
+const CODER_TILES: u32 = 2048;
+
+/// The block size of the `layer_norm` and `residual_norm` kernels (`NORM_T` in
+/// kernels/hardshell.cu): one block for each row.
+const NORM_THREADS: u32 = 128;
+
 /// The block size of the `attend` kernel (`ATT_T` in kernels/hardshell.cu).
 const ATTEND_THREADS: u32 = 128;
+
+/// The most rows of a group of `attend_rows` (`ATG_ROWS` in kernels/hardshell.cu).
+const ATTEND_GROUP_ROWS: u32 = 16;
+
+/// The longest context whose scores `attend` keeps in shared memory (`ATT_CTX`); a longer one
+/// uses 12 bytes of `sc` for each position, row and head.
+const ATTEND_SMEM_CTX: u32 = 1024;
 
 /// The most timer marks of one profiled pass.
 const MAX_STAMPS: usize = 1024;
 
-/// The key of a recorded graph: the number of rows and the output (0: no coder op; otherwise
-/// `freq_bits` of the coder op).
-type GraphKey = (u32, u32);
+/// The key of a recorded graph: the number of rows, the output (0: no coder op; otherwise
+/// `freq_bits` of the coder op), and the number of row groups of the attention (0: one block for
+/// each row).
+type GraphKey = (u32, u32, u32);
 
 impl<'m> CudaBatch<'m> {
     /// Makes a batch of `slots` sessions with empty contexts, and work buffers for passes of
@@ -160,6 +205,7 @@ impl<'m> CudaBatch<'m> {
         let max_splits = (accn / (3 * d.d).max(d.d_ff).max(1)).clamp(1, 16);
         let tmpn = d.d.max(d.d_ff);
         let us = |x: u32| x as usize;
+        let ctx4 = d.n_ctx.next_multiple_of(4);
         let sizes = [
             16 * r,
             4 * r * us(d.d),
@@ -169,12 +215,15 @@ impl<'m> CudaBatch<'m> {
             4 * rp * us(d.fw),
             4 * r * us(accn),
             4 * r * us(tmpn),
-            8 * r * us(d.n_head) * us(d.n_ctx),
+            if ctx4 > ATTEND_SMEM_CTX { 12 * r * us(d.n_head) * us(ctx4) } else { 0 },
             8 * r * us(d.vocab),
             8 * r * us(d.vocab),
             16 * r,
             24 * r,
             8 * MAX_STAMPS,
+            2 * r * us(d.vocab),
+            8 * r * us(d.vocab.div_ceil(LOGIT_TILE)),
+            8 * r,
         ];
         let mut it = sizes.iter().map(|&s| dev.zeroed(s));
         let mut next = || it.next().unwrap_or_else(|| dev.zeroed(0));
@@ -193,8 +242,11 @@ impl<'m> CudaBatch<'m> {
             queries: next()?,
             intervals: next()?,
             stamps: next()?,
+            d16: next()?,
+            tmax: next()?,
+            groups: next()?,
         };
-        let cache = slots * us(d.n_ctx) * us(d.d);
+        let cache = slots * us(ctx4) * us(d.d);
         let kv = (0..d.n_layer)
             .map(|_| Ok((dev.zeroed(cache)?, dev.zeroed(cache)?)))
             .collect::<Result<Vec<_>>>()?;
@@ -212,7 +264,19 @@ impl<'m> CudaBatch<'m> {
             max_splits,
             graphs: RefCell::new(HashMap::new()),
             bytes,
+            op_level: false,
         })
+    }
+
+    /// Selects the op-level path (one kernel for each op, ADR 0013) or the fused path (the
+    /// default: fused kernels that a test proves equal to the op-level path). Both give the same
+    /// bits; the op-level path is for tests and measurements. Cost: the recorded graphs are
+    /// dropped.
+    pub fn set_op_level(&mut self, op_level: bool) {
+        if self.op_level != op_level {
+            self.op_level = op_level;
+            self.graphs.borrow_mut().clear();
+        }
     }
 
     /// The number of slots.
@@ -357,7 +421,7 @@ impl<'m> CudaBatch<'m> {
     }
 
     /// Runs the inputs as [`CudaBatch::run_coded`] does (with encode queries of token 0 and
-    /// 32 bits), without graphs, with a GPU timer mark after each kernel, and reads nothing
+    /// 32 bits), in a graph that is not kept, with a GPU timer mark after each kernel, and reads nothing
     /// back. Gives the GPU nanoseconds of each op name (summed over the layers and the passes),
     /// in pass order. For measurements.
     ///
@@ -488,10 +552,24 @@ impl<'m> CudaBatch<'m> {
             info.extend([u32_of(r.slot, "slot")?, r.token.get(), u32_of(r.pos, "position")?, 0]);
         }
         dev.ctx.write(&self.b.rows, 0, &u32_bytes(&info))?;
+        let groups = match self.att_groups(pass) {
+            Some(words) => {
+                dev.ctx.write(&self.b.groups, 0, &u32_bytes(&words))?;
+                u32_of(words.len() / 2, "too many groups")?
+            }
+            None => 0,
+        };
         let kernel = MatKernel::for_rows(pass.len());
         if let Some(prof) = prof {
             let mut st = Some(Stamps { buf: &self.b.stamps, labels: Vec::new() });
-            self.record(n, kernel, out, &mut st)?;
+            // NOTE: the marks run in a graph, as a normal pass does, so the gaps between the
+            // kernels are the gaps of a replayed graph.
+            dev.ctx.begin_capture()?;
+            let recorded = self.record_path(n, kernel, out, groups, &mut st);
+            let graph = dev.ctx.end_capture();
+            recorded?;
+            let graph = graph?;
+            dev.ctx.launch_graph(&graph)?;
             let labels = st.map(|s| s.labels).unwrap_or_default();
             let mut bytes = vec![0u8; 8 * labels.len()];
             dev.ctx.read(&self.b.stamps, &mut bytes)?;
@@ -509,13 +587,13 @@ impl<'m> CudaBatch<'m> {
             }
             return Ok(());
         }
-        let key: GraphKey = (n, if let Out::Intervals(bits) = out { bits } else { 0 });
+        let key: GraphKey = (n, if let Out::Intervals(bits) = out { bits } else { 0 }, groups);
         let mut graphs = self.graphs.borrow_mut();
         let graph = match graphs.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
                 dev.ctx.begin_capture()?;
-                let recorded = self.record(n, kernel, out, &mut None);
+                let recorded = self.record_path(n, kernel, out, groups, &mut None);
                 // NOTE: end the capture also after an error, so the stream leaves capture mode.
                 let graph = dev.ctx.end_capture();
                 recorded?;
@@ -523,294 +601,5 @@ impl<'m> CudaBatch<'m> {
             }
         };
         dev.ctx.launch_graph(graph)
-    }
-
-    /// Launches all kernels of a pass of `n` rows (the rows are already on the GPU).
-    fn record(
-        &self,
-        n: u32,
-        kernel: MatKernel,
-        out: Out,
-        stamps: &mut Option<Stamps<'_>>,
-    ) -> Result<()> {
-        let model = self.model;
-        let dev = model.dev;
-        let d = model.dims;
-        let mut op = |name: &'static str| -> Result<()> {
-            if let Some(st) = stamps.as_mut()
-                && st.labels.len() < MAX_STAMPS
-            {
-                let i = u32_of(st.labels.len(), "too many marks")?;
-                dev.launch(&dev.k.stamp, (1, 1), 1, &[Arg::Ptr(st.buf.ptr()), Arg::U32(i)])?;
-                st.labels.push(name);
-            }
-            Ok(())
-        };
-        op("start")?;
-        let b = &self.b;
-        let k = &dev.k;
-        let tmpn = self.tmpn;
-        let ptr = |x: &DevBuf| Arg::Ptr(x.ptr());
-        dev.launch(
-            &k.embed,
-            (d.d.div_ceil(128), n),
-            128,
-            &[
-                ptr(&model.wte.w),
-                ptr(&model.embed_m),
-                ptr(&model.wpe),
-                ptr(&model.pos_m),
-                ptr(&b.rows),
-                ptr(&b.x),
-                Arg::U32(d.d),
-                Arg::U32(4 * d.dw),
-                Arg::U32(model.embed_s),
-                Arg::U32(model.pos_s),
-            ],
-        )?;
-        op("embed")?;
-        for (l, (kc, vc)) in model.layers.iter().zip(&self.kv) {
-            self.norm(&l.ln_1, n)?;
-            op("norm")?;
-            let z = self.matmul(kernel, &l.c_attn, &b.a, n, true)?;
-            op("matmul qkv")?;
-            self.linear_out(&l.c_attn, LinOut::I8(&b.qkv, 3 * d.d), (-127, 127), n, z)?;
-            op("linear out")?;
-            dev.launch(
-                &k.kv_store,
-                (d.d.div_ceil(128), n),
-                128,
-                &[
-                    ptr(&b.qkv),
-                    ptr(kc),
-                    ptr(vc),
-                    ptr(&b.rows),
-                    Arg::U32(d.d),
-                    Arg::U32(3 * d.d),
-                    Arg::U32(d.n_ctx),
-                    Arg::U32(d.head_dim),
-                ],
-            )?;
-            op("attention kv")?;
-            dev.launch(
-                &k.attend,
-                (d.n_head, n),
-                ATTEND_THREADS,
-                &[
-                    ptr(&b.qkv),
-                    ptr(kc),
-                    ptr(vc),
-                    ptr(&b.sc),
-                    ptr(&model.attn_exp),
-                    ptr(&b.rows),
-                    ptr(&b.att),
-                    Arg::U32(d.d),
-                    Arg::U32(3 * d.d),
-                    Arg::U32(d.head_dim),
-                    Arg::U32(d.n_ctx),
-                    Arg::U32(d.n_head),
-                    Arg::I32(l.score.0),
-                    Arg::U32(l.score.1),
-                    Arg::I32(l.attn_out.0),
-                    Arg::U32(l.attn_out.1),
-                    Arg::U32(model.softmax_p),
-                    Arg::U32(model.attn_len),
-                    Arg::U32(4 * d.dw),
-                ],
-            )?;
-            op("attention")?;
-            let z = self.matmul(kernel, &l.c_proj, &b.att, n, true)?;
-            op("matmul proj")?;
-            self.linear_out(&l.c_proj, LinOut::I32(&b.tmp, tmpn), (i32::MIN, i32::MAX), n, z)?;
-            op("linear out")?;
-            self.add(n)?;
-            op("add")?;
-            self.norm(&l.ln_2, n)?;
-            op("norm")?;
-            let z = self.matmul(kernel, &l.c_fc, &b.a, n, true)?;
-            op("matmul fc")?;
-            self.linear_out(
-                &l.c_fc,
-                LinOut::I32(&b.tmp, tmpn),
-                (-l.gelu_offset, l.gelu_offset - 1),
-                n,
-                z,
-            )?;
-            op("linear out")?;
-            dev.launch(
-                &k.table_lookup,
-                (d.d_ff.div_ceil(128), n),
-                128,
-                &[
-                    ptr(&b.tmp),
-                    ptr(&l.gelu),
-                    ptr(&b.g),
-                    Arg::U32(d.d_ff),
-                    Arg::U32(tmpn),
-                    Arg::U32(4 * d.fw),
-                    Arg::I32(l.gelu_offset),
-                    Arg::I32(l.gelu_len),
-                ],
-            )?;
-            op("table")?;
-            let z = self.matmul(kernel, &l.mlp_proj, &b.g, n, true)?;
-            op("matmul mlp")?;
-            self.linear_out(&l.mlp_proj, LinOut::I32(&b.tmp, tmpn), (i32::MIN, i32::MAX), n, z)?;
-            op("linear out")?;
-            self.add(n)?;
-            op("add")?;
-        }
-        self.norm(&model.ln_f, n)?;
-        op("norm")?;
-        self.matmul(kernel, &model.wte, &b.a, n, false)?;
-        op("matmul logits")?;
-        dev.launch(
-            &k.logits_scale,
-            (d.vocab.div_ceil(128), n),
-            128,
-            &[
-                ptr(&b.acc),
-                ptr(&model.wte.m),
-                ptr(&b.logit),
-                Arg::U32(d.vocab),
-                Arg::U32(d.vocab),
-                Arg::U32(model.wte.shift),
-            ],
-        )?;
-        op("logits")?;
-        dev.launch(
-            &k.logits_weights,
-            (n, 1),
-            256,
-            &[
-                ptr(&b.logit),
-                ptr(&model.logits_exp),
-                ptr(&b.weights),
-                Arg::U32(d.vocab),
-                Arg::U32(model.logits_len),
-            ],
-        )?;
-        op("logits")?;
-        if let Out::Intervals(bits) = out {
-            dev.launch(
-                &k.coder_interval,
-                (n, 1),
-                256,
-                &[
-                    ptr(&b.weights),
-                    ptr(&b.queries),
-                    ptr(&b.intervals),
-                    Arg::U32(d.vocab),
-                    Arg::U64(1u64 << bits),
-                ],
-            )?;
-            op("coder interval")?;
-        }
-        Ok(())
-    }
-
-    fn norm(&self, nw: &NormW, n: u32) -> Result<()> {
-        let m = self.model;
-        let (k, j, eps) = m.ln;
-        m.dev.launch(
-            &m.dev.k.layer_norm,
-            (n, 1),
-            256,
-            &[
-                Arg::Ptr(self.b.x.ptr()),
-                Arg::Ptr(nw.g.ptr()),
-                Arg::Ptr(nw.b.ptr()),
-                Arg::Ptr(self.b.a.ptr()),
-                Arg::U32(m.dims.d),
-                Arg::U32(4 * m.dims.dw),
-                Arg::U32(k),
-                Arg::U32(j),
-                Arg::U64(eps),
-                Arg::I32(nw.m),
-                Arg::U32(nw.s),
-            ],
-        )
-    }
-
-    /// The product of a linear layer into `acc`: rows of `lin.rows` values, and with `split`,
-    /// split-K partials `n * lin.rows` values apart. Gives the number of partials.
-    ///
-    /// INVARIANT: at most 16 partials of `n * lin.rows <= max_rows * max(3d, d_ff)` values fit
-    /// in `acc` (`max_rows * max(3d, d_ff, vocab)` values); `new` checks it.
-    fn matmul(
-        &self,
-        kernel: MatKernel,
-        lin: &LinearW,
-        a: &DevBuf,
-        n: u32,
-        split: bool,
-    ) -> Result<u32> {
-        let splits = if split && kernel == MatKernel::TensorCore {
-            splits_for(lin.rows, lin.kw, n).min(self.max_splits)
-        } else {
-            1
-        };
-        let mat = Mat {
-            w: &lin.w,
-            a,
-            out: &self.b.acc,
-            out_stride: lin.rows,
-            n: lin.rows,
-            kw: lin.kw,
-            m: n,
-            splits,
-        };
-        launch_matmul(self.model.dev, kernel, &mat)?;
-        Ok(splits)
-    }
-
-    fn linear_out(
-        &self,
-        lin: &LinearW,
-        out: LinOut<'_>,
-        range: (i32, i32),
-        n: u32,
-        splits: u32,
-    ) -> Result<()> {
-        let m = self.model;
-        let (o8, o32, stride) = match out {
-            LinOut::I8(b, s) => (b.ptr(), 0, s),
-            LinOut::I32(b, s) => (0, b.ptr(), s),
-        };
-        m.dev.launch(
-            &m.dev.k.linear_out,
-            (lin.rows.div_ceil(128), n),
-            128,
-            &[
-                Arg::Ptr(self.b.acc.ptr()),
-                Arg::Ptr(lin.b.ptr()),
-                Arg::Ptr(lin.m.ptr()),
-                Arg::Ptr(o8),
-                Arg::Ptr(o32),
-                Arg::U32(lin.rows),
-                Arg::U32(lin.rows),
-                Arg::U32(stride),
-                Arg::U32(lin.shift),
-                Arg::I32(range.0),
-                Arg::I32(range.1),
-                Arg::U32(splits),
-                Arg::U32(n * lin.rows),
-            ],
-        )
-    }
-
-    fn add(&self, n: u32) -> Result<()> {
-        let m = self.model;
-        m.dev.launch(
-            &m.dev.k.add_clamp,
-            (m.dims.d.div_ceil(128), n),
-            128,
-            &[
-                Arg::Ptr(self.b.x.ptr()),
-                Arg::Ptr(self.b.tmp.ptr()),
-                Arg::U32(m.dims.d),
-                Arg::U32(self.tmpn),
-            ],
-        )
     }
 }

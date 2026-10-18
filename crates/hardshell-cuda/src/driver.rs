@@ -62,6 +62,7 @@ struct Api {
     graph_launch: unsafe extern "C" fn(CuGraphExec, CuStream) -> CuResult,
     graph_exec_destroy: unsafe extern "C" fn(CuGraphExec) -> CuResult,
     graph_destroy: unsafe extern "C" fn(CuGraph) -> CuResult,
+    func_get_attribute: unsafe extern "C" fn(*mut c_int, c_int, CuFunction) -> CuResult,
     #[allow(clippy::type_complexity)]
     launch_kernel: unsafe extern "C" fn(
         CuFunction,
@@ -138,6 +139,7 @@ impl Api {
                 graph_launch: sym(&lib, "cuGraphLaunch")?,
                 graph_exec_destroy: sym(&lib, "cuGraphExecDestroy")?,
                 graph_destroy: sym(&lib, "cuGraphDestroy")?,
+                func_get_attribute: sym(&lib, "cuFuncGetAttribute")?,
                 launch_kernel: sym(&lib, "cuLaunchKernel")?,
                 _lib: lib,
             })
@@ -436,6 +438,21 @@ impl Context {
         self.api.check("cuGraphLaunch", unsafe { (self.api.graph_launch)(g.exec, self.stream) })
     }
 
+    /// The registers for each thread, the local memory bytes for each thread (register spills)
+    /// and the static shared memory bytes of `k`, from the driver's compile of the PTX.
+    pub(crate) fn kernel_resources(&self, k: &Kernel) -> Result<(i32, i32, i32)> {
+        self.current()?;
+        let get = |attr: c_int| -> Result<i32> {
+            let mut v: c_int = 0;
+            // SAFETY: valid out-pointer; `k.f` is a function of the loaded module.
+            let r = unsafe { (self.api.func_get_attribute)(&raw mut v, attr, k.f) };
+            self.api.check("cuFuncGetAttribute", r)?;
+            Ok(v)
+        };
+        // CU_FUNC_ATTRIBUTE_NUM_REGS = 4, LOCAL_SIZE_BYTES = 3, SHARED_SIZE_BYTES = 1.
+        Ok((get(4)?, get(3)?, get(1)?))
+    }
+
     /// Launches `k` on the stream of the context.
     ///
     /// The caller gives the arguments in the order and with the sizes of the kernel signature
@@ -486,4 +503,11 @@ impl Context {
 pub(crate) struct Kernel {
     f: CuFunction,
     name: &'static str,
+}
+
+impl Kernel {
+    /// The name of the kernel in the module.
+    pub(crate) fn name(&self) -> &'static str {
+        self.name
+    }
 }

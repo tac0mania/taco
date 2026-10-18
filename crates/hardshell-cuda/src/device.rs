@@ -57,6 +57,22 @@ impl CudaDevice {
         self.ctx.mem_info()
     }
 
+    /// For each kernel: its name, registers for each thread, local memory bytes for each thread
+    /// (spills) and static shared memory bytes, as the driver compiled them. For measurements.
+    ///
+    /// # Errors
+    /// [`Error::Cuda`] if a driver call fails.
+    pub fn kernel_resources(&self) -> Result<Vec<(&'static str, i32, i32, i32)>> {
+        self.k
+            .all()
+            .into_iter()
+            .map(|k| {
+                let (r, l, s) = self.ctx.kernel_resources(k)?;
+                Ok((k.name(), r, l, s))
+            })
+            .collect()
+    }
+
     pub(crate) fn launch(
         &self,
         k: &Kernel,
