@@ -117,8 +117,13 @@ zstd (71a1192, xcheck PASS), taco-match crate and ADR 0010 (proposed) with the l
 Logs result (simulation of the exact integer rules, 1 MiB blocks): GPT-2 + match 0.497 bits per
 byte against xz 0.554 and zstd --long 0.597 on 16 Loghub files. Not yet wired into `taco fold`.
 Agents that may still run (uncommitted work in the tree): kernels (CUDA tuning), finetune
-(Colab session `finetune-t4b`; stop it with `colab stop -s finetune-t4b` if it still runs),
-bench (benchmark notes). Next: wire the logs profile into fold/unfold (ADR 0010, 0012), then
+(now on the RTX 3060, artifacts in ~/taco-train on devbox), bench (benchmark notes), profile
+(the logs profile in fold/unfold).
+
+**Colab lesson (2026-10-18):** the free tier terminated both GPU sessions (after 16 min, and
+after about 3 h while the model downloaded at about 20 MB per minute). The second training run
+finished (best float val 0.217 bits per byte), but the model was lost with the VM. Do not use
+the free tier for long jobs. Keep job outputs on a machine we control. Next: wire the logs profile into fold/unfold (ADR 0010, 0012), then
 speculative decoding and the skip rule, then the number/field model for logs.
 
 ## 5. Next steps, in order
