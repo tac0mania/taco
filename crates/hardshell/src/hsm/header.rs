@@ -53,6 +53,9 @@ pub struct Constants {
 pub(crate) struct Header {
     pub(crate) model: ModelConfig,
     pub(crate) vocabulary: Section,
+    /// The BPE merges for the encoder (optional; see the module documentation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) merges: Option<Section>,
     pub(crate) tensors: Vec<TensorEntry>,
 }
 

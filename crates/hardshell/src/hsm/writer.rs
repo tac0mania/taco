@@ -1,9 +1,11 @@
 //! The `.hsm` writer: the reference for the layout of format version 1.
 
 use super::header::{Header, ModelConfig, Section, TensorEntry};
+use super::merges;
 use super::reader::{HsmFile, TensorData, Vocabulary};
 use super::{MAGIC, PREAMBLE_LEN, VERSION, align64};
 use crate::error::{Error, Result};
+use crate::types::TokenId;
 
 /// Builds a `.hsm` file in memory.
 ///
@@ -14,18 +16,25 @@ use crate::error::{Error, Result};
 pub struct HsmWriter {
     config: ModelConfig,
     vocabulary: Vec<Vec<u8>>,
+    merges: Vec<(TokenId, TokenId)>,
     tensors: Vec<(String, TensorData, Option<u8>)>,
 }
 
 impl HsmWriter {
     /// Starts a file for this model description.
     pub fn new(config: ModelConfig) -> Self {
-        Self { config, vocabulary: Vec::new(), tensors: Vec::new() }
+        Self { config, vocabulary: Vec::new(), merges: Vec::new(), tensors: Vec::new() }
     }
 
     /// Sets the vocabulary: the bytes of each token, in token-id order.
     pub fn set_vocabulary(&mut self, tokens: Vec<Vec<u8>>) {
         self.vocabulary = tokens;
+    }
+
+    /// Sets the BPE merges of the encoder: `(left, right)` pairs in rank order. An empty list
+    /// (the default) writes no merges section.
+    pub fn set_merges(&mut self, pairs: Vec<(TokenId, TokenId)>) {
+        self.merges = pairs;
     }
 
     /// Adds a tensor. `shift` is the rescale shift of an `i32` tensor of multipliers, else
@@ -45,6 +54,8 @@ impl HsmWriter {
     pub fn finish(&self) -> Result<Vec<u8>> {
         let vocab = Vocabulary::encode(&self.vocabulary)?;
         let vocab_len = u64::try_from(vocab.len()).map_err(|_| too_large("vocabulary"))?;
+        let merges = merges::encode(&self.merges);
+        let merges_len = u64::try_from(merges.len()).map_err(|_| too_large("merges"))?;
         let mut lens = Vec::with_capacity(self.tensors.len());
         for (_, data, _) in &self.tensors {
             lens.push(data.byte_len().ok_or(too_large("tensor"))?);
@@ -53,7 +64,7 @@ impl HsmWriter {
         // The offsets depend on the header length; repeat until the header fits (module docs).
         let mut header_len: u64 = 0;
         let (json, header) = loop {
-            let header = self.header(header_len, vocab_len, &lens)?;
+            let header = self.header(header_len, vocab_len, merges_len, &lens)?;
             let json = serde_json::to_vec(&header).map_err(|_| too_large("header JSON"))?;
             let n = u64::try_from(json.len()).map_err(|_| too_large("header JSON"))?;
             if n <= header_len {
@@ -71,6 +82,10 @@ impl HsmWriter {
         pad_to(&mut out, PREAMBLE_LEN + header_len, b' ')?;
         pad_to(&mut out, header.vocabulary.offset, 0)?;
         out.extend_from_slice(&vocab);
+        if let Some(m) = header.merges {
+            pad_to(&mut out, m.offset, 0)?;
+            out.extend_from_slice(&merges);
+        }
         for ((_, data, _), entry) in self.tensors.iter().zip(&header.tensors) {
             pad_to(&mut out, entry.offset, 0)?;
             data.write_le(&mut out);
@@ -79,9 +94,21 @@ impl HsmWriter {
         Ok(out)
     }
 
-    fn header(&self, header_len: u64, vocab_len: u64, lens: &[u64]) -> Result<Header> {
+    fn header(
+        &self,
+        header_len: u64,
+        vocab_len: u64,
+        merges_len: u64,
+        lens: &[u64],
+    ) -> Result<Header> {
         let vocab_offset = align64(PREAMBLE_LEN + header_len).ok_or(too_large("layout"))?;
         let mut cursor = vocab_offset.checked_add(vocab_len).ok_or(too_large("layout"))?;
+        let mut merges = None;
+        if merges_len > 0 {
+            let offset = align64(cursor).ok_or(too_large("layout"))?;
+            merges = Some(Section { offset, length: merges_len });
+            cursor = offset.checked_add(merges_len).ok_or(too_large("layout"))?;
+        }
         let mut tensors = Vec::with_capacity(self.tensors.len());
         for ((name, data, shift), &length) in self.tensors.iter().zip(lens) {
             let offset = align64(cursor).ok_or(too_large("layout"))?;
@@ -99,6 +126,7 @@ impl HsmWriter {
         Ok(Header {
             model: self.config.clone(),
             vocabulary: Section { offset: vocab_offset, length: vocab_len },
+            merges,
             tensors,
         })
     }

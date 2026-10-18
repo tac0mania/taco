@@ -157,3 +157,40 @@ the context, runs `<|endoftext|>` at position 0, and runs the token at position 
   not predict the GPT-2 loss.
 - A change to a constant changes the model file and the compressed bytes. It needs new
   conformance vectors.
+
+## Addendum A: the BPE merges section (2026-10-18)
+
+Status: accepted (proposed by the convert agent). Format version 1 is not frozen, so the
+version stays 1.
+
+### Context
+
+The Rust tokenizer needs the GPT-2 BPE merge ranks (plan §10). The model hash must identify
+the tokenizer (plan §8). Thus the merges go into the model file and not into a separate file.
+
+### Decision
+
+1. The header has an optional field `merges` with `offset` and `length`, between
+   `vocabulary` and `tensors`.
+2. The merges section starts at `align64` of the end of the vocabulary. The tensors follow at
+   `align64` of the end of the merges section. Gap bytes are zero.
+3. The section holds the merges in rank order (rank 0 first). Each merge is two `u32` values,
+   little-endian: the id of the left token, then the id of the right token. Thus
+   `length = 8 * count`.
+4. A file with no merges omits the field. An empty section (`length` 0) is an error, so one
+   model has exactly one file.
+5. The reader refuses an id that is not in the vocabulary, a part with no bytes, a pair that
+   occurs two times, and a pair whose joined bytes are not the bytes of exactly one token. The
+   reader gives the merged token with each pair (`hardshell::hsm::MergePair`).
+6. `HsmFile::merges()` and `Vocabulary::merges()` give the merges, read-only, in rank order.
+
+### Consequences
+
+- **The model hash covers the merges**, because the hash is the SHA-256 of the full file. A
+  different merge list gives a different model hash.
+- **The decoder does not need the merges.** The decoder changes token ids to bytes with the
+  vocabulary only (plan §10). Only the encoder reads the merges.
+- A file without the field is the same file as before this addendum. Thus the files that the
+  tests made before this change still load.
+- For GPT-2, merge rank `i` makes token `256 + i` (measured: all 50,000 merges). The file
+  stores 400,000 bytes of merges.

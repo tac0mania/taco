@@ -15,6 +15,7 @@
 //! | 12 | 4 | `header_len`, `u32` |
 //! | 16 | `header_len` | the JSON header, UTF-8 |
 //! | `align64(16 + header_len)` | `vocabulary.length` | the vocabulary |
+//! | `align64(end of the vocabulary)` | `merges.length` | the BPE merges (optional) |
 //! | `align64(end of the section before)` | `length` | each tensor, in header order |
 //!
 //! `align64(x)` is the smallest multiple of 64 that is not less than `x`. The bytes between
@@ -27,6 +28,16 @@
 //!
 //! The vocabulary has, for each token id from 0 to `vocab_size - 1`: a `u16` length, then the
 //! bytes of the token. The section has no other bytes.
+//!
+//! The merges section is optional. It holds the BPE merges of the encoder in rank order (rank 0
+//! first): for each merge, the `u32` id of the left token, then the `u32` id of the right token,
+//! so `length = 8 * count`. If the header has no `merges` field, the file has no merges
+//! section, and the tensors follow the vocabulary. An empty merges section is not permitted
+//! (omit the field), so one model has one file. The reader checks that each id is in the
+//! vocabulary, that each part has at least one byte, that no pair occurs two times, and that
+//! the joined bytes of each pair are the bytes of exactly one token. Only the encoder uses the
+//! merges; the decoder does not need them. The model hash covers them, because it covers the
+//! full file (ADR 0004, addendum A).
 //!
 //! A tensor holds its values in row-major order, `dtype.size()` bytes for each value, so
 //! `length = product(shape) * size`.
@@ -47,9 +58,10 @@
 //!     "constants": {"ln_k": 48, "ln_j": 8, "ln_eps": 1234, "softmax_p": 30}
 //!   },
 //!   "vocabulary": {"offset": 4096, "length": 1234},
+//!   "merges": {"offset": 5376, "length": 16},
 //!   "tensors": [
-//!     {"name": "wte", "dtype": "i8", "shape": [300, 64], "offset": 5376, "length": 19200},
-//!     {"name": "wte.rescale_embed", "dtype": "i32", "shape": [300], "offset": 24576,
+//!     {"name": "wte", "dtype": "i8", "shape": [300, 64], "offset": 5440, "length": 19200},
+//!     {"name": "wte.rescale_embed", "dtype": "i32", "shape": [300], "offset": 24640,
 //!      "length": 1200, "shift": 27}
 //!   ]
 //! }
@@ -66,6 +78,7 @@
 //! | `model.constants.ln_eps` | `u64` | LayerNorm `eps`, 1 to 2^62 |
 //! | `model.constants.softmax_p` | `u8` | softmax `P`, at most 30 |
 //! | `vocabulary.offset`, `.length` | `u64` | the vocabulary section |
+//! | `merges.offset`, `.length` | `u64`, optional | the merges section; omit the field for no merges |
 //! | `tensors[].name` | string | unique |
 //! | `tensors[].dtype` | string | `i8`, `i16`, `i32` or `u64` |
 //! | `tensors[].shape` | array of `u64` | 1 to 4 dimensions, each at least 1 |
@@ -85,10 +98,12 @@
 //! (0x20) at the end. JSON permits these spaces, and the reader accepts them.
 
 mod header;
+mod merges;
 mod reader;
 mod writer;
 
 pub use header::{Constants, ModelConfig};
+pub use merges::{MERGE_PAIR_LEN, MergePair};
 pub use reader::{HsmFile, StoredTensor, TensorData, Vocabulary};
 pub use writer::HsmWriter;
 

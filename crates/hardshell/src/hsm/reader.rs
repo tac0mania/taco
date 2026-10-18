@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use sha2::{Digest, Sha256};
 
 use super::header::{Header, ModelConfig, TensorEntry};
+use super::merges::{self, MergePair};
 use super::{MAGIC, MAX_VOCAB, PREAMBLE_LEN, VERSION, align64, is_valid_name};
 use crate::error::{Error, Result};
 use crate::layernorm::LnConstants;
@@ -106,12 +107,15 @@ impl StoredTensor {
     }
 }
 
-/// The vocabulary: the bytes of each token id.
+/// The vocabulary: the bytes of each token id, and the BPE merges of the encoder if the file
+/// has them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vocabulary {
     bytes: Vec<u8>,
     /// `ends[i]` is the end of token `i` in `bytes`; token `i` starts at `ends[i - 1]` (or 0).
     ends: Vec<usize>,
+    /// The merges in rank order, if the file has a merges section.
+    merges: Option<Box<[MergePair]>>,
 }
 
 impl Vocabulary {
@@ -139,6 +143,13 @@ impl Vocabulary {
         self.bytes.get(start..end)
     }
 
+    /// The BPE merges in rank order (rank 0 first), or `None` if the file has no merges
+    /// section. Only the encoder uses them; the decoder needs only [`Vocabulary::token`].
+    #[must_use]
+    pub fn merges(&self) -> Option<&[MergePair]> {
+        self.merges.as_deref()
+    }
+
     /// Parses the vocabulary section: exactly `count` entries that fill `section`.
     fn parse(section: &[u8], count: u32) -> Result<Self> {
         let mut ends = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
@@ -159,7 +170,7 @@ impl Vocabulary {
         if pos != section.len() {
             return Err(Error::Vocabulary { token: count, reason: "the section has extra bytes" });
         }
-        Ok(Self { bytes, ends })
+        Ok(Self { bytes, ends, merges: None })
     }
 
     /// Encodes tokens in the format of the vocabulary section.
@@ -318,9 +329,22 @@ impl HsmFile {
         }
         check_padding(bytes, header_end, vocab_offset)?;
         let section = slice(bytes, vocab_offset, header.vocabulary.length)?;
-        let vocabulary = Vocabulary::parse(section, header.model.vocab_size)?;
+        let mut vocabulary = Vocabulary::parse(section, header.model.vocab_size)?;
 
         let mut cursor = vocab_offset + header.vocabulary.length;
+        if let Some(m) = header.merges {
+            let offset = align64(cursor).ok_or(layout_err("merges", "overflow"))?;
+            if m.offset != offset {
+                return Err(layout_err(
+                    "merges",
+                    "the offset is not align64 of the vocabulary end",
+                ));
+            }
+            check_padding(bytes, cursor, offset.min(u64::try_from(bytes.len()).unwrap_or(0)))?;
+            let section = slice(bytes, m.offset, m.length)?;
+            vocabulary.merges = Some(merges::parse(section, &vocabulary)?);
+            cursor = offset + m.length;
+        }
         let mut tensors = BTreeMap::new();
         let mut order = Vec::with_capacity(header.tensors.len());
         for e in &header.tensors {
@@ -360,6 +384,13 @@ impl HsmFile {
     #[must_use]
     pub fn vocabulary(&self) -> &Vocabulary {
         &self.vocabulary
+    }
+
+    /// The BPE merges in rank order, or `None` if the file has no merges section. The same as
+    /// `self.vocabulary().merges()`.
+    #[must_use]
+    pub fn merges(&self) -> Option<&[MergePair]> {
+        self.vocabulary.merges()
     }
 
     /// The SHA-256 of the full file.
