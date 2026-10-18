@@ -1,0 +1,59 @@
+# Calibration statistics of the tiny conformance model (measured).
+# Made by `python -m convert.tiny --calibrate`.
+# The converter (`python -m convert.tiny`) reads this file. It does not run the model.
+# 8 random sequences of 64 tokens, float64, `convert.model.forward`.
+
+[residual]
+max = 4.0009733540888455
+row_std_min = 0.2375240141986401
+
+[site."h.0.ln_1"]
+max = 4.418199150885178
+
+[site."h.0.q"]
+max = 6.219701212904812
+
+[site."h.0.k"]
+max = 6.154897467691166
+
+[site."h.0.v"]
+max = 6.888010829934271
+
+[site."h.0.att"]
+max = 4.924436319680889
+
+[site."h.0.ln_2"]
+max = 4.226070311156652
+
+[site."h.0.fc"]
+max = 4.550933636321118
+
+[site."h.0.gelu"]
+max = 4.262914079013225
+
+[site."h.1.ln_1"]
+max = 4.940197499841799
+
+[site."h.1.q"]
+max = 6.936696842022907
+
+[site."h.1.k"]
+max = 6.198722394308136
+
+[site."h.1.v"]
+max = 6.60478618457173
+
+[site."h.1.att"]
+max = 4.458685982147822
+
+[site."h.1.ln_2"]
+max = 4.016724279089801
+
+[site."h.1.fc"]
+max = 4.754544523650223
+
+[site."h.1.gelu"]
+max = 4.293882119087529
+
+[site."ln_f"]
+max = 4.101910268923914

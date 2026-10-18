@@ -91,11 +91,19 @@ def load_gpt2(path: Path, dtype: type = np.float32, n_head: int = 12) -> FModel:
         keys = set(f.keys())
         pre = "transformer." if "transformer.wte.weight" in keys else ""
 
+        def raw(name: str) -> np.ndarray:
+            t = f.get_tensor(pre + name)
+            # DETERMINISM (ADR 0014): the converter reads the exact float32 values. A float16
+            # value widens to float32 exactly. A float64 value would need a rounding: refuse.
+            if dtype == np.float32 and t.dtype not in (np.float32, np.float16):
+                raise ValueError(f"{name}: dtype {t.dtype}; the converter needs float32")
+            return t
+
         def get(name: str) -> np.ndarray:
-            return np.ascontiguousarray(f.get_tensor(pre + name), dtype=dtype)
+            return np.ascontiguousarray(raw(name), dtype=dtype)
 
         def get_t(name: str) -> np.ndarray:
-            return np.ascontiguousarray(f.get_tensor(pre + name).T, dtype=dtype)
+            return np.ascontiguousarray(raw(name).T, dtype=dtype)
 
         n_layer = 0
         while f"{pre}h.{n_layer}.ln_1.weight" in keys:

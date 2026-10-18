@@ -144,13 +144,18 @@ def to_bytes(m: HsmModel) -> bytes:
     return bytes(out)
 
 
-def write(m: HsmModel, path) -> tuple[int, str]:
-    """Write the file. Returns (size in bytes, SHA-256 hex)."""
-    data = to_bytes(m)
+def write_bytes(data: bytes, path) -> None:
+    """Write the bytes of a model file (through a `.part` file, then a rename)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".part")
     tmp.write_bytes(data)
     tmp.replace(path)
+
+
+def write(m: HsmModel, path) -> tuple[int, str]:
+    """Write the file. Returns (size in bytes, SHA-256 hex)."""
+    data = to_bytes(m)
+    write_bytes(data, path)
     return len(data), hashlib.sha256(data).hexdigest()
 
 

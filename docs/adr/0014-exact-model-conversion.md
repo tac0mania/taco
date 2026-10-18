@@ -1,6 +1,7 @@
 # ADR 0014: model conversion is exact and reproducible on every machine
 
-Date: 2026-10-19. Status: accepted (requirement). Decided by: Rohit. Implementation: not started.
+Date: 2026-10-19. Status: accepted, implemented (2026-10-19). Decided by: Rohit. Implementation:
+the exact agent, research note `docs/research/2026-10-19-exact-conversion.md`.
 
 ## Context
 
@@ -60,3 +61,44 @@ The converter is exact. Its output depends only on its input files, never on the
   integer arithmetic).
 - This ADR applies to every converter, including the general converter of
   `docs/design/anymodel.md` and the converter of fine-tuned models (Route A).
+
+## Implementation (2026-10-19)
+
+The converter in `tools/convert` obeys points 1 to 7. The research note
+`docs/research/2026-10-19-exact-conversion.md` has the list of the float operations of
+version 1 and the measurements.
+
+1. **The tie rule.** Every rounding is `R`: the nearest integer, and the even integer for an
+   exact tie (`exact.rhe`). This is the rule of `np.rint` in version 1.
+2. **Weights.** `exact.quantise_rows` reads the float32 bits (`uint32` view) and calculates
+   `R(127 * m / (m_max * 2^sh))` with `int64` arrays. The scale of a row is the exact fraction
+   `max|row| / 127`.
+3. **Rescale constants, biases, eps and the beta correction.** Exact `Fraction` calculations,
+   then `R` (`convert.build`). The beta correction uses an exact integer matrix product
+   (`exact.matvec`), not a float matrix product. The eps of GPT-2 is 1/100,000 exactly. An
+   irrational ratio (`sqrt(2)`, `sqrt(hd)`) is never rounded directly: the converter compares
+   squares.
+4. **The range grid.** The 18 grid points of version 1 are fixed integer constants
+   (`exact.GRID`). Thus the scales of version 1 did not change.
+5. **Tables.** `decimal` at 50 digits in one fixed context, then `R`. The converter stops if an
+   entry is nearer than 1e-30 to a tie (`exact.TIE_MARGIN`).
+6. **Statistics.** The converter reads `calib_stats.toml` (GPT-2) and `tiny_stats.toml` (the
+   tiny model) as exact binary64 values. `exact.no_float_model` makes a call of the float model
+   an error during the conversion. `gpt2.ranges.json` records the SHA-256 of each input.
+7. **Self-check.** `tools/convert/expected.toml` holds the expected SHA-256 and size for each
+   set of inputs. The converter stops with an error and does not write the file on a mismatch
+   or when no entry exists. `--new-hash` accepts a deliberate change and prints the new entry.
+8. **No hidden variation.** One thread. The conversion has no float matrix product, so no BLAS.
+   NumPy is pinned in `tools/uv.lock`.
+
+Proof (measured):
+
+- The Mac (arm64, Python 3.12.11) and devbox (x86_64, Python 3.12.15) make `gpt2.hsm` with
+  the SHA-256 `aaa03eb9…a5c2`. This is the published file of version 1, so no weight and no
+  table entry changed, and old `.taco` files still unfold.
+- Both machines make `conformance/tiny.hsm` with the SHA-256 `eb78b89a…18f8`, the committed
+  file.
+- 4 of 124,337,664 GPT-2 weights are exact ties. Version 1 rounded them as `R` does, one of
+  them by chance (research note, section 4).
+- The conversion of GPT-2 small takes 70.7 s on the Mac and 48.1 s on devbox (version 1:
+  16.9 s on the Mac).

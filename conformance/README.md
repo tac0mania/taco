@@ -37,8 +37,9 @@ tables (96 KiB) and the `i16` GELU table (64 KiB) have the sizes of GPT-2 small.
 2. Run `nice uv run python -m convert.tiny`.
 3. Compare the SHA-256 that the tool prints with the SHA-256 above.
 
-The tool uses only splitmix64 and IEEE 754 basic operations for the weights. The calibration
-ranges are rounded to the grid 2^(k/16), so a different machine gives the same file. If the hash
+The tool uses splitmix64 and IEEE 754 basic operations for the weights. The calibration
+statistics are committed data (`tools/convert/tiny_stats.toml`), and the conversion is exact
+(ADR 0014), so a different machine gives the same file. If the hash
 is different, do not commit the new file. Tell the lead.
 
 ## Tests that use the tiny model

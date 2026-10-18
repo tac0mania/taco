@@ -2,20 +2,25 @@
 
 A recipe selects, for each site, which calibration statistic is the range: the largest value
 (`max`, the rule of ADR 0004 section 7) or a quantile of |x| (`q9999` and so on). Values above
-the range saturate (clamp). Each range is rounded up to the grid 2^(k/16), so a calibration on
-another machine gives the same model file (`numerics.round_range`).
+the range saturate (clamp). Each range is rounded up to the grid of `exact.GRID` (steps of
+about 2^(1/16)), so a calibration on another machine gives the same model file.
 
 The residual rule (ADR 0004 section 1): the residual scale gives the smallest row standard
 deviation of the calibration 2^12.5 units (a margin above the 2^12 limit), and the largest
 residual value must stay at or below 2^28 units (4 times below the clamp at 2^30).
+
+DETERMINISM (ADR 0014): the statistics are data. `load_stats` reads each number as its exact
+binary64 value, and every step here is exact arithmetic on fractions. This module does not run
+the float model.
 """
 
 from __future__ import annotations
 
-import tomllib
+import hashlib
+from fractions import Fraction
 from pathlib import Path
 
-from convert import numerics as nm
+from convert import exact as ex
 from convert.build import Scales
 
 RES_STD_LOG2 = 12.5
@@ -36,35 +41,45 @@ RECIPES: dict[str, dict[str, str]] = {
 
 
 def load_stats(path: Path) -> dict:
-    with path.open("rb") as f:
-        return tomllib.load(f)
+    """Read a statistics file. Each number is an exact fraction (`exact.binary64_of_text`)."""
+    return ex.load_toml_exact(path)
 
 
-def residual_scale(stats: dict) -> float:
+def stats_sha256(path: Path) -> str:
+    """The SHA-256 of a statistics file. The self-check of the converter uses it."""
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def residual_scale(stats: dict) -> Fraction:
+    """The residual scale: the grid point at or above row_std_min / 2^12.5, exact.
+
+    2^12.5 = 2^12 * sqrt(2) is irrational, so the converter rounds the square
+    row_std_min^2 / 2^25 (`exact.round_range_sq`).
+    """
     r = stats["residual"]
-    s = r["row_std_min"] / nm.pow2(12) / 2.0**0.5  # 2^RES_STD_LOG2 = 2^12 * sqrt(2)
-    s = nm.round_range(s)
-    if r["max"] / s > nm.pow2(RES_MAX_LOG2):
+    s = ex.round_range_sq(Fraction(r["row_std_min"]) ** 2 / (1 << 25))
+    if Fraction(r["max"]) / s > 1 << RES_MAX_LOG2:
         raise ValueError(
-            f"the residual rule fails: max {r['max']} is {r['max'] / s:.3g} units > 2^28"
+            f"the residual rule fails: max {float(r['max'])} is "
+            f"{float(r['max'] / s):.3g} units > 2^28"
         )
     return s
 
 
-def ranges(stats: dict, recipe: dict[str, str], overrides: dict[str, float] | None = None
-           ) -> dict[str, float]:
+def ranges(stats: dict, recipe: dict[str, str], overrides: dict[str, Fraction] | None = None
+           ) -> dict[str, Fraction]:
     """The range of each site. `overrides[site]` replaces the statistic for one site."""
     out = {}
     for site, st in stats["site"].items():
         kind = "ln_f" if site == "ln_f" else site.split(".", 2)[2]
         key = recipe[kind]
-        value = st[key] if not key.startswith("x") else st["max"] * float(key[1:])
-        out[site] = nm.round_range(value)
+        value = st[key] if not key.startswith("x") else st["max"] * Fraction(key[1:])
+        out[site] = ex.round_range(value)
     for site, v in (overrides or {}).items():
-        out[site] = nm.round_range(v)
+        out[site] = ex.round_range(Fraction(v))
     return out
 
 
-def scales(stats: dict, recipe: dict[str, str], overrides: dict[str, float] | None = None
+def scales(stats: dict, recipe: dict[str, str], overrides: dict[str, Fraction] | None = None
            ) -> Scales:
     return Scales.from_ranges(residual_scale(stats), ranges(stats, recipe, overrides))

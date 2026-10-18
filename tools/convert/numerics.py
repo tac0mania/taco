@@ -1,15 +1,20 @@
-"""The converter rules of ADR 0004: constants, rescale constants, quantisation and tables.
+"""The constants of ADR 0004, and the float form of the converter rules of version 1.
 
-All float work of the conversion happens here, one time, before publication (plan §7).
+The converter does not use the float functions of this module. It uses the exact rules of
+`convert.exact` (ADR 0014). The float functions stay for two uses only:
 
-DETERMINISM: the functions here use only IEEE 754 basic operations (+, -, *, /, sqrt), exact
-operations (abs, max, ldexp, comparisons) and round-half-even (np.rint). Each of these has one
-correctly rounded result on every machine. No function calls exp, tanh, log or pow from the
-platform math library, because those results can differ in the last bit (ADR 0002). Thus the
-same inputs give the same model file on every machine.
+- The measurement tools (`convert.model`, `convert.fq`, `convert.intsim`) use them with
+  floats, for example the fake quantisation of `fq`.
+- `convert.test_exact` compares the exact rules with these float rules on random inputs.
+
+The float functions use only IEEE 754 basic operations, exact operations and np.rint, but the
+result of a chain of float operations near a rounding border can depend on the order of the
+operations. ADR 0014 thus requires exact arithmetic for the model file.
 """
 
 from __future__ import annotations
+
+from fractions import Fraction
 
 import numpy as np
 
@@ -21,7 +26,8 @@ DELTA_LOG2 = -8  # One score unit and one logit unit: 2^-8 (ADR 0004 sections 4 
 TABLE_LEN = 8192
 ATTN_EXP_E = 30
 LOGITS_EXP_E = 40
-LN_EPS = 1e-5  # GPT-2 LayerNorm epsilon (published).
+LN_EPS = 1e-5  # GPT-2 LayerNorm epsilon (published), float form for the float model.
+LN_EPS_EXACT = Fraction(1, 100000)  # The same epsilon, exact, for the converter.
 I8_MAX = 127
 I16_MAX = 32767
 I32_MAX = 2**31 - 1

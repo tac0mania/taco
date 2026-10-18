@@ -1,0 +1,22 @@
+# The expected SHA-256 of each model file that the exact converter makes (ADR 0014 point 5).
+#
+# One entry for each set of inputs: the model name, the weights (the SHA-256 of the float
+# weights, or the seed of a generated model), the recipe and the SHA-256 of the statistics
+# file. `convert.selfcheck` reads this file. The converter stops with an error when its output
+# is not the expected file. Add an entry only after a deliberate change (`--new-hash`).
+
+[[model]]
+model = "gpt2"
+weights = "248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707"
+recipe = "clip"
+stats_sha256 = "8f7731d98c363316488d515a523aa5b73123e59b35705bc744a2c55bf90d12c2"
+hsm_sha256 = "aaa03eb96e9ad7957432168c8ac6b4a99ed55d57e637e4786a664b51001ba5c2"
+hsm_size = 127237568
+
+[[model]]
+model = "tiny"
+weights = "splitmix64 seed 0x7ac020261018"
+recipe = "max"
+stats_sha256 = "a5336d212921971c3dbed8747627ac97240ca7d010c1c12cc527d231ec0ea9a4"
+hsm_sha256 = "eb78b89a4f0f17c7245865aed22f86512a49e0272b7583a831c47e1a401418f8"
+hsm_size = 306368

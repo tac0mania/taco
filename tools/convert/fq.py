@@ -55,14 +55,16 @@ def kind_of(site: str) -> str:
 
 
 def make_hook(sc: Scales, kinds: set[str]):
+    res, site_scale = sc.floats()  # a measurement tool: float scales are enough here
+
     def hook(site: str, x: np.ndarray) -> np.ndarray | None:
         k = kind_of(site)
         if k not in kinds:
             return None
         if site == "res":
-            q = np.clip(np.rint(x / sc.res), -nm.RESIDUAL_LIMIT, nm.RESIDUAL_LIMIT)
-            return (q * sc.res).astype(x.dtype)
-        s = sc.site[site]
+            q = np.clip(np.rint(x / res), -nm.RESIDUAL_LIMIT, nm.RESIDUAL_LIMIT)
+            return (q * res).astype(x.dtype)
+        s = site_scale[site]
         qmax = nm.I16_MAX if k == "fc" else nm.I8_MAX
         return (np.clip(np.rint(x / s), -qmax, qmax) * s).astype(x.dtype)
 
