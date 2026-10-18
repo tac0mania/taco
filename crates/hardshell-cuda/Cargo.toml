@@ -1,0 +1,20 @@
+[package]
+name = "hardshell-cuda"
+version = "0.1.0"
+description = "HardShell on NVIDIA GPUs: the integer GPT-2 of hardshell with int8 tensor cores, bit for bit equal to the CPU reference; needs only the GPU driver"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+hardshell = { path = "../hardshell" }
+thiserror.workspace = true
+# NOTE: crate-local version spec. The lead moves it to [workspace.dependencies] at commit time.
+libloading.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+taco-coder = { path = "../taco-coder" }
+
+[lints]
+workspace = true

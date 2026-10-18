@@ -67,6 +67,12 @@ fn summary(a: &wgpu::Adapter) -> AdapterSummary {
     }
 }
 
+/// `true` if the adapter runs compute shaders. The kernels need them; some OpenGL adapters do
+/// not have them.
+fn has_compute(a: &wgpu::Adapter) -> bool {
+    a.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+}
+
 fn rank(t: wgpu::DeviceType) -> Option<u8> {
     match t {
         wgpu::DeviceType::DiscreteGpu => Some(0),
@@ -90,8 +96,9 @@ impl GpuDevice {
     /// the adapter. Cost: the driver makes a device (some milliseconds).
     ///
     /// # Errors
-    /// [`Error::NoAdapter`] if no adapter agrees with `choice`; [`Error::Device`] if the adapter
-    /// refuses the device.
+    /// [`Error::NoAdapter`] if no adapter agrees with `choice` ([`AdapterChoice::BestHardware`]
+    /// skips adapters with no compute shaders); [`Error::Device`] if the chosen adapter has no
+    /// compute shaders or refuses the device.
     pub fn open(choice: &AdapterChoice) -> Result<Self> {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
@@ -99,6 +106,7 @@ impl GpuDevice {
         let picked = match choice {
             AdapterChoice::BestHardware => all
                 .into_iter()
+                .filter(has_compute)
                 .filter_map(|a| rank(a.get_info().device_type).map(|r| (r, a)))
                 .min_by_key(|(r, _)| *r)
                 .map(|(_, a)| a),
@@ -111,6 +119,11 @@ impl GpuDevice {
             }
         };
         let adapter = picked.ok_or_else(|| Error::NoAdapter { choice: format!("{choice:?}") })?;
+        if !has_compute(&adapter) {
+            return Err(Error::Device {
+                reason: format!("{} has no compute shaders", summary(&adapter)),
+            });
+        }
         let limits = adapter.limits();
         // NOTE: timestamps are only for measurements (`GpuBatch::profile_step`); they do not
         // change a result. The device asks for them when the adapter has them.

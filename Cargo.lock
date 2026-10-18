@@ -565,6 +565,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hardshell-cuda"
+version = "0.1.0"
+dependencies = [
+ "hardshell",
+ "libloading",
+ "sha2",
+ "taco-coder",
+ "thiserror",
+]
+
+[[package]]
 name = "hardshell-gpu"
 version = "0.1.0"
 dependencies = [
