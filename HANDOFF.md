@@ -110,6 +110,17 @@ Owner decisions of 2026-10-18 evening (Rohit):
 - Later ideas for speed (not started): speculative decoding with the match model, a skip of the
   model for very confident tokens, small specialist models (5M to 20M).
 
+## 4b. State at the end of the session of 2026-10-18 (read this first)
+
+Committed and pushed: CUDA backend (2367f15), CPU SIMD (2319ea7), container version 2 with
+zstd (71a1192, xcheck PASS), taco-match crate and ADR 0010 (proposed) with the logs results.
+Logs result (simulation of the exact integer rules, 1 MiB blocks): GPT-2 + match 0.497 bits per
+byte against xz 0.554 and zstd --long 0.597 on 16 Loghub files. Not yet wired into `taco fold`.
+Agents that may still run (uncommitted work in the tree): kernels (CUDA tuning), finetune
+(Colab session `finetune-t4b`; stop it with `colab stop -s finetune-t4b` if it still runs),
+bench (benchmark notes). Next: wire the logs profile into fold/unfold (ADR 0010, 0012), then
+speculative decoding and the skip rule, then the number/field model for logs.
+
 ## 5. Next steps, in order
 
 1. **Phase 2 gate: passed** on 2026-10-18 (`docs/research/2026-10-18-cross-machine.md`). Run

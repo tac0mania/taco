@@ -1,0 +1,155 @@
+# Log corpus for the match-model measurement (ADR 0010, research note 2026-10-18-logs).
+# The files are not committed. `python -m logs.fetch` downloads them to tools/data/logs and
+# checks the size and the SHA-256 (measured on 2026-10-18).
+#
+# Loghub (logpai/loghub, master): the 2k samples, 2,000 lines of each system.
+# Elastic examples (elastic/examples, master, Apache-2.0): two web access logs. They are larger
+# than 1 MiB, so the measurement uses the first `cap` bytes, and a 1 MiB block exists.
+# NOTE: the files come from `master` branches. If a branch changes, the hash check fails.
+#
+# `cap`: the number of bytes from the start of the file that the measurement uses. 0 = all.
+# `group`: "loghub" (system logs), "access" (web access logs), "jsonl" (JSON lines).
+
+[[file]]
+name = "HDFS_2k.log"
+group = "loghub"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/HDFS/HDFS_2k.log"
+size = 287848
+sha256 = "7c967000980c086ed55fa6544ba4f05fe66d44622795e890c68caf8bbb635035"
+cap = 0
+
+[[file]]
+name = "Apache_2k.log"
+group = "loghub"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/Apache/Apache_2k.log"
+size = 171239
+sha256 = "c7efa3eb686e3a96bd2f8f4457b2a7887e9cf2f3649327f1b4e87af841363ce8"
+cap = 0
+
+[[file]]
+name = "BGL_2k.log"
+group = "loghub"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/BGL/BGL_2k.log"
+size = 317150
+sha256 = "2a819ea540909db682005c9cf948387a40729b5c2e9f19d430e29ce704825496"
+cap = 0
+
+[[file]]
+name = "Linux_2k.log"
+group = "loghub"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/Linux/Linux_2k.log"
+size = 216485
+sha256 = "b3e20bc1afe732ab1bf3ed1de4bf9c809e4194e02f7dea911d918e5342e8e173"
+cap = 0
+
+[[file]]
+name = "OpenSSH_2k.log"
+group = "loghub"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/OpenSSH/OpenSSH_2k.log"
+size = 225216
+sha256 = "1e4912727fa88245113d41b16a0cd25ceadba7f931e1c406542885b91254264f"
+cap = 0
+
+[[file]]
+name = "Spark_2k.log"
+group = "loghub"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/Spark/Spark_2k.log"
+size = 196268
+sha256 = "2e8b9a37fc5c238253e0b8e18a8bd5e489671def91767ae1192d28c8e1f95901"
+cap = 0
+
+[[file]]
+name = "Zookeeper_2k.log"
+group = "loghub"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/Zookeeper/Zookeeper_2k.log"
+size = 279891
+sha256 = "e40e0af5ef9eb6e4097200f260b9d1f626b3676f861a432e87977242e75543d8"
+cap = 0
+
+[[file]]
+name = "Android_2k.log"
+group = "loghub"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/Android/Android_2k.log"
+size = 279076
+sha256 = "47641549915e662ff590291df266a45f635eedca7c5f1b41a4fa853fe5d2f409"
+cap = 0
+
+[[file]]
+name = "Windows_2k.log"
+group = "loghub"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/Windows/Windows_2k.log"
+size = 285433
+sha256 = "372fb809464a6d6016e599e9272d7cf1e8b644f25c90c7f76f19c936362456d0"
+cap = 0
+
+[[file]]
+name = "Mac_2k.log"
+group = "loghub"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/Mac/Mac_2k.log"
+size = 319414
+sha256 = "d9ea495488728d8c989dc942fca3324a3cc7b19b0a6f409a5fd568ad547fd931"
+cap = 0
+
+[[file]]
+name = "HealthApp_2k.log"
+group = "loghub"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/HealthApp/HealthApp_2k.log"
+size = 187456
+sha256 = "95ec36322f5db1e6faaab764c568b67023d7d6733793106289dbf30516fc13ee"
+cap = 0
+
+[[file]]
+name = "Proxifier_2k.log"
+group = "loghub"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/Proxifier/Proxifier_2k.log"
+size = 236962
+sha256 = "94b6a9d98d76e7ad7841ed10caa463cd4e638a229b92a220a2bf1707552adbb9"
+cap = 0
+
+[[file]]
+name = "Hadoop_2k.log"
+group = "loghub"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/Hadoop/Hadoop_2k.log"
+size = 384948
+sha256 = "9ecaeb807d50d5fb5a20982ea66f1c8d32545259a51ce7456c1ab78db0509732"
+cap = 0
+
+[[file]]
+name = "HPC_2k.log"
+group = "loghub"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/HPC/HPC_2k.log"
+size = 151178
+sha256 = "826e5957b461e65780a8bda5c186c2fcf90fd6c1863721ef9c1ccfa9ada86f88"
+cap = 0
+
+[[file]]
+name = "Thunderbird_2k.log"
+group = "loghub"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/Thunderbird/Thunderbird_2k.log"
+size = 325192
+sha256 = "903bbfa61c34d4803e4adcb0d726ff2eeb9a2e11971243269a2035fa6c3bbeb0"
+cap = 0
+
+[[file]]
+name = "OpenStack_2k.log"
+group = "loghub"
+url = "https://raw.githubusercontent.com/logpai/loghub/master/OpenStack/OpenStack_2k.log"
+size = 595119
+sha256 = "025a1bc64ff5b2ef4a4bda6c4ad5c5c5f18478b71cd1ad2b0676e01625629f2f"
+cap = 0
+
+[[file]]
+name = "apache_access.log"
+group = "access"
+url = "https://raw.githubusercontent.com/elastic/examples/master/Common%20Data%20Formats/apache_logs/apache_logs"
+size = 2370789
+sha256 = "f15c31e905f86c7b4b6ab44aee74d0a2086dce89f010187d983edea7ef0364ef"
+cap = 1048576
+
+[[file]]
+name = "nginx_json.log"
+group = "jsonl"
+url = "https://raw.githubusercontent.com/elastic/examples/master/Common%20Data%20Formats/nginx_json_logs/nginx_json_logs"
+size = 12137777
+sha256 = "05131a0ec5c40884fbf4a066f8a9244b6475ae6a5844b1f10fb38d42d8ff6967"
+cap = 1048576

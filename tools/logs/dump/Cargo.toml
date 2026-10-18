@@ -1,0 +1,18 @@
+# A measurement program for tools/logs (ADR 0010): the integer GPT-2 facts of each token, from
+# hardshell-cuda (bit for bit equal to the CPU HardShell). It is not a member of the Taco
+# workspace, so the crates of the workspace do not depend on it.
+[package]
+name = "logs-dump"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+hardshell = { path = "../../../crates/hardshell" }
+hardshell-cuda = { path = "../../../crates/hardshell-cuda" }
+taco-coder = { path = "../../../crates/taco-coder" }
+
+[profile.release]
+debug = false

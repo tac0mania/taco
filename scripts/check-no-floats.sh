@@ -4,7 +4,7 @@
 # values; src/ may not.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-KERNEL="taco-coder hardshell"
+KERNEL="taco-coder hardshell taco-match"
 status=0
 for c in $KERNEL; do
   [ -d "crates/$c/src" ] || continue

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 601b387ba400380cbb5cd041a6cff662688929a3dbd3d57e3f4a81d75e2d5028 # shrinks to tokens = [1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0], p = MatchParams { orders: [2, 0, 0, 0, 0, 0, 0, 0], count: 1, hash_bits: 4, verify_max: 2, max_len: 1 }, k = 0
