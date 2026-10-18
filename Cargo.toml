@@ -54,6 +54,14 @@ debug = "line-tables-only"
 opt-level = 1
 debug = false
 
+# The model and the coder run in debug tests too. A 256 KiB round trip takes 126 s at opt-level 0
+# and 3.8 s in release (measured, taco agent, 2026-10-18).
+[profile.dev.package.hardshell]
+opt-level = 2
+
+[profile.dev.package.taco-coder]
+opt-level = 2
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
