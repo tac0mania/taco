@@ -15,7 +15,10 @@ taco unfold notes.txt.taco   # restores notes.txt, byte for byte
 
 > **Status: pre-release (2026-10-19).** Fold and unfold work and are bit-exact on every machine
 > that we tested: macOS ARM, Linux x86 and ARM, Windows x86, and NVIDIA, Apple and AMD GPUs.
-> The file format is not frozen yet, so do not keep important data only in `.taco` files. Read
+> The container format (version 2) is frozen: later versions of Taco read the files that this
+> version makes. This is a pre-release, so keep a second copy of important data. The goal of
+> the beta is bit-exact results on every machine, not speed (see
+> [Planned speed-ups](#planned-speed-ups-after-the-beta)). Read
 > [Hardware support and limits](#2-hardware-support-and-limits) before you use Taco.
 
 ---
@@ -91,6 +94,19 @@ Measured on an RTX 3060 Laptop GPU at 95 W (`docs/research/2026-10-19-full-power
 One token is about 3 to 4 bytes of English. For comparison, `zstd -3` compresses at hundreds of
 MB/s and `xz -9e` at about 0.7 MB/s (measured). Taco is much slower than these tools. It makes
 smaller files, and its files decompress on every machine.
+
+### Planned speed-ups (after the beta)
+
+The beta is about one property: the same bits on every machine. These items make Taco faster
+or smaller. None of them changes that property, and files from the beta stay readable.
+
+| Item | What it changes | Expected gain | Source |
+|---|---|---|---|
+| Speculative decoding in `taco unfold` | A draft pass predicts several tokens, and one model step checks them all. The output bytes do not change. | Unfold 1.8 to 3.7 times faster (est., from a simulation) | ADR 0017, `docs/research/2026-10-19-speculative.md` |
+| Skip rule (mixer rule 2) for the profile `logs` | The match model codes tokens that it predicts with high confidence, and the language model is skipped for them. | Logs 4.8 to 7.3 % smaller (est., simulation on 18 log files) | ADR 0017 |
+| Smaller blocks for small text files | More blocks decode in parallel. | Unfold of a 25 KB file 13.7 s to 4.7 s, for 1 to 2 % more bytes (measured) | gpucli trace, 2026-10-19 |
+| Range coder on the GPU | Removes one CPU-GPU round trip for each token. | Not measured | — |
+| CUDA path for older NVIDIA GPUs (compute capability 6.1 and 7.5) | These GPUs use the CUDA backend instead of the portable GPU backend or the CPU. Bits do not change. | Not measured | ADR 0008 |
 
 ---
 
@@ -481,8 +497,8 @@ vectors, and an ADR. See `CLAUDE.md` §1 and §8.
 | 2 | Reference implementation, bit-exact on two machines | **Done (gate passed)** |
 | 3 | Quality: integer model within 0.2% of float | Done for text |
 | 4 | Speed: CPU SIMD, CUDA (gate: 10,000 tokens/s on the RTX 3060), portable GPU (AMD, Intel, Apple) | Gate passed: 20,472 tokens/s at 95 W (`docs/research/2026-10-19-full-power.md`) |
-| 5 | Two profiles: `text` (GPT-2) and `logs` (log model, match model, mixer, skip rule, speculative decoding) | In progress (ADR 0012) |
-| 6 | Container version 2 (profiles, zstd blocks, context overlap), streaming, builds for macOS, Linux and Windows, release | Container version 2 built; CI and release scripts built; streaming and the release planned |
+| 5 | Two profiles: `text` (GPT-2) and `logs` (GPT-2, match model, mixer) | Done. Skip rule and speculative decoding: after the beta (ADR 0017) |
+| 6 | Container version 2 (profiles, zstd blocks, context overlap), streaming, builds for macOS, Linux and Windows, release | Container version 2 frozen; streaming done (ADR 0018); CI and release scripts built; private beta next |
 | 7 | Other models with an automatic converter | Designed (`docs/design/anymodel.md`) |
 
 ---
