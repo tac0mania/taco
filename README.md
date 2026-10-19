@@ -13,23 +13,25 @@ taco fold notes.txt          # makes notes.txt.taco
 taco unfold notes.txt.taco   # restores notes.txt, byte for byte
 ```
 
-> **Status: research prototype (2026-10-19).** Fold and unfold work and are bit-exact between
-> an Apple M2 Mac and an x86 Linux machine. The file format is not frozen yet, so do not keep
-> important data only in `.taco` files. Speed work (CPU SIMD, GPU) is in progress.
+> **Status: pre-release (2026-10-19).** Fold and unfold work and are bit-exact on every machine
+> that we tested: macOS ARM, Linux x86 and ARM, Windows x86, and NVIDIA, Apple and AMD GPUs.
+> The file format is not frozen yet, so do not keep important data only in `.taco` files. Read
+> [Hardware support and limits](#2-hardware-support-and-limits) before you use Taco.
 
 ---
 
 ## Contents
 
 1. [Results](#1-results)
-2. [How it works](#2-how-it-works)
-3. [Architecture](#3-architecture)
-4. [Local setup](#4-local-setup)
-5. [Usage](#5-usage)
-6. [Development](#6-development)
-7. [Roadmap](#7-roadmap)
-8. [Documents](#8-documents)
-9. [Licence](#9-licence)
+2. [Hardware support and limits](#2-hardware-support-and-limits)
+3. [How it works](#3-how-it-works)
+4. [Architecture](#4-architecture)
+5. [Local setup](#5-local-setup)
+6. [Usage](#6-usage)
+7. [Development](#7-development)
+8. [Roadmap](#8-roadmap)
+9. [Documents](#9-documents)
+10. [Licence](#10-licence)
 
 ---
 
@@ -76,18 +78,115 @@ paths on the same Mac, 269 of 270 windows did not decode.
 
 ### Speed (the weak point today)
 
-| Engine | Tokens per second |
-|---|---:|
-| CPU reference, one thread (Apple M2) | 135 |
-| CPU prefill path, one thread (in progress) | 345 |
-| Portable GPU path, RTX 3060 through OpenGL on DirectX 12 (in progress) | 1,311 (batch 32) |
+Measured on an RTX 3060 Laptop GPU at 95 W (`docs/research/2026-10-19-full-power.md`):
 
-One token is about 3 to 4 bytes of text. The target for the CUDA path is 10,000 tokens per
-second or more (`docs/design/product-v1.md` §3).
+| What | Speed |
+|---|---:|
+| Engine, decode over a full 1,024-token window (batch 224) | 20,472 tokens/s |
+| Engine, prefill (8 x 1,024 tokens) | 50,203 tokens/s |
+| `taco fold`, English text, whole files | 85 to 129 KB/s |
+| `taco unfold`, English text, whole files | 26 to 31 KB/s |
+| `taco fold` and `unfold` on the CPU only | about 0.3 to 2 KB/s |
+
+One token is about 3 to 4 bytes of English. For comparison, `zstd -3` compresses at hundreds of
+MB/s and `xz -9e` at about 0.7 MB/s (measured). Taco is much slower than these tools. It makes
+smaller files, and its files decompress on every machine.
 
 ---
 
-## 2. How it works
+## 2. Hardware support and limits
+
+This section says what works, what does not work, and what we did not test. All numbers are
+measured unless they are labelled "est.".
+
+### What is guaranteed
+
+- **No floating-point arithmetic in compression or decompression.** The engine, the coder and
+  the mixer use integers only. The GPU kernels (CUDA C++ and WGSL) use integers only too.
+  `scripts/check-no-floats.sh` refuses a float type in all of them, and CI runs it on each push.
+- **Integer results do not depend on the machine.** `7 x 3 = 21` on every CPU and GPU. An
+  integer sum has the same result in every order, so a GPU can add in parallel in any order.
+  Every rounding step is an integer operation with one defined result (ADR 0004). A compiler,
+  an optimisation level, a CPU type or a GPU driver cannot change these results.
+- **The model file is the same on every machine.** The converter reads each float32 weight
+  exactly as `mantissa x 2^exponent` and calculates with exact fractions (ADR 0014). It runs
+  one time, before publication. The Mac and Linux make the same `gpt2.hsm`, byte for byte.
+- **A wrong result is never silent.** Each `.taco` file stores the SHA-256 of the original
+  data. `taco unfold` checks it. If a result is wrong, `taco unfold` stops with an error, and
+  you can decompress the file again with `--backend cpu` or on a different machine.
+
+### What can still go wrong
+
+The float problem cannot occur. These other problems can occur, as in every program:
+
+- **A bug in our code**, for example in one SIMD or GPU kernel. Each fast path is tested
+  against the reference path, with conformance vectors, a cross-machine check and fuzzing. Tests
+  cannot prove that a bug does not exist.
+- **A bug in a GPU driver or its shader compiler.** Taco runs a self-test before it uses a GPU.
+  If the self-test fails, Taco uses the next backend.
+- **A hardware fault**, for example a memory bit flip or an unstable overclock.
+
+In each case the SHA-256 check finds the error.
+
+### Tested hardware
+
+| Hardware | Backend | Result |
+|---|---|---|
+| Apple M2 (macOS) | CPU (NEON) | bit-exact |
+| Apple M2 (macOS) | GPU: wgpu on Metal | bit-exact |
+| AMD Ryzen 7 5800H (Linux in WSL2, and native Windows) | CPU (AVX2) | bit-exact |
+| NVIDIA RTX 3060 Laptop | CUDA | bit-exact |
+| NVIDIA RTX 3060 Laptop | wgpu on OpenGL (WSL2) and DX12 with DXC (native Windows) | bit-exact, all GPU tests and the conformance model |
+| NVIDIA RTX 3060 Laptop, AMD Radeon iGPU (Ryzen 7 5800H) | wgpu on Vulkan (native Windows) | the 4 op tests pass, bit-exact; the full model tests did not run on Vulkan yet |
+| AMD Radeon iGPU (Ryzen 7 5800H), native Windows | wgpu on DX12 with DXC | bit-exact, all GPU tests and the conformance model |
+| GitHub Actions: Linux x86-64 and Linux ARM64 | CPU, conformance program (50 hashes) | the same hashes on each push |
+
+The macOS ARM64 and Windows x86-64 jobs of CI run each week; they did not run yet.
+
+### Not tested yet
+
+- Intel GPUs (integrated or Arc).
+- AMD GPUs on Linux (the RADV or AMDGPU driver), and AMD discrete GPUs.
+- NVIDIA GPUs older than compute capability 8.0 (before the RTX 30 series and A100). The CUDA
+  backend needs 8.0 or more; older NVIDIA GPUs use the portable wgpu backend.
+- macOS on Intel, big-endian CPUs, 32-bit systems, phones and browsers.
+
+They are expected to work, because the code has no part that is specific to one vendor. We do
+not call them supported before a test passes.
+
+### Known limits
+
+- **AMD and Intel GPUs need no special code.** They use the portable backend (wgpu with Vulkan,
+  DX12 or Metal) and the normal GPU driver. Nothing else must be installed.
+- **Windows DX12 with the old FXC compiler does not work.** FXC (`d3dcompiler_47.dll`, shader
+  model 5.1) cannot compile 7 of the 14 GPU kernels: it cannot write to a vector element at a
+  run-time index, it stops on long loops that it tries to unroll, and it crashes on the large
+  `switch` of the self-test. The kernels that it can compile take 43 to 97 s each. Vulkan,
+  Metal and DX12 with DXC (`dxcompiler.dll`) compile all kernels and give the CPU bits. On
+  Windows, use Vulkan (`docs/research/2026-10-19-windows.md` §8.2).
+- **Inside WSL2, the AMD iGPU crashes** in the Mesa OpenGL-on-D3D12 driver at the first compute
+  dispatch. On native Windows the same GPU works. The Microsoft software renderer (WARP) also
+  crashes.
+- **The GPU speed differs by vendor.** CUDA uses the int8 tensor cores of NVIDIA. The portable
+  backend uses 32-bit integers and is slower. The speed on AMD and Intel GPUs is not measured.
+- **The CPU alone is very slow** (about 0.3 to 2 KB/s). A GPU is strongly recommended.
+- **Small files decompress slowly.** One block decodes one token after the other, so a file
+  cannot decompress faster than its largest block: about 10 to 13 s for a 16 KiB block on the
+  RTX 3060 (est. from the measured `cp.html` and `textwrap.py` times). Speculative decoding is
+  in progress.
+- **English only.** GPT-2 is an English model. On German and French, Taco is larger than PPMd;
+  on Chinese it is larger than gzip (measured). Binary data is stored with zstd or raw.
+- **Logs:** the profile `logs` is smaller than xz, but paq8px is still smaller (measured).
+- **Memory:** `taco` reads the whole file into memory today. Streaming is in progress.
+- **Untrusted input:** fuzzing and limits are in progress. Do not unfold `.taco` files from
+  sources that you do not trust yet.
+- **The file format is not frozen.** A later version can need a new `.taco` reader.
+- **The model file** (`gpt2.hsm`, 127 MB) is not distributed yet. Make it with the steps in
+  [Local setup](#5-local-setup).
+
+---
+
+## 3. How it works
 
 ### Prediction is compression
 
@@ -148,15 +247,18 @@ flowchart LR
 - The container stores the **SHA-256 of the model file** and of the original data. A wrong model
   or a damaged file gives an error, never a silent wrong output.
 
-### The `.taco` file (version 1)
+### The `.taco` file (version 2)
 
 ```
 "TACO" | version | flags | model hash (32 B) | original length | SHA-256 of original (32 B)
-       | block size | block count | block table (kind + length per block) | block payloads
+       | block size | block count | profile | coding parts | coding parameters (104 B header)
+       | block table (kind + length per block) | block payloads
 ```
 
-A coded block holds the token count (LEB128) and the range-coder bytes (ADR 0007). The full
-layout is in ADR 0006.
+A block is raw, zstd, coded (GPT-2) or mixed (GPT-2, the match model and the mixer). A coded
+block holds the token count (LEB128) and the range-coder bytes (ADR 0007). The coding parts
+name the mixer and the context overlap `K` (ADR 0011, 0015). Version 1 files still unfold. The
+full layout is in ADR 0006 and ADR 0011.
 
 ### The `.hsm` model file (version 1)
 
@@ -166,7 +268,7 @@ the SHA-256 of the whole file. Details: ADR 0004.
 
 ---
 
-## 3. Architecture
+## 4. Architecture
 
 ### Crates
 
@@ -229,7 +331,7 @@ taco/
 
 ---
 
-## 4. Local setup
+## 5. Local setup
 
 ### What you need
 
@@ -303,7 +405,7 @@ cargo install --path crates/taco-cli
 
 ---
 
-## 5. Usage
+## 6. Usage
 
 ```
 taco fold <input> [-o <output>] [--model <path.hsm>] [--block-size <bytes>] [--threads <n>] [-f]
@@ -325,7 +427,7 @@ video, music or files that are already compressed: Taco stores them raw.
 
 ---
 
-## 6. Development
+## 7. Development
 
 Read `CLAUDE.md` before you change code. It has the rules that keep Taco bit-exact. The most
 important rule: **no floating-point arithmetic in the prediction path.**
@@ -371,7 +473,7 @@ vectors, and an ADR. See `CLAUDE.md` §1 and §8.
 
 ---
 
-## 7. Roadmap
+## 8. Roadmap
 
 | Phase | Work | State |
 |---|---|---|
@@ -385,7 +487,7 @@ vectors, and an ADR. See `CLAUDE.md` §1 and §8.
 
 ---
 
-## 8. Documents
+## 9. Documents
 
 | Document | Contents |
 |---|---|
@@ -400,7 +502,7 @@ vectors, and an ADR. See `CLAUDE.md` §1 and §8.
 
 ---
 
-## 9. Licence
+## 10. Licence
 
 Apache-2.0. See `LICENSE`.
 
