@@ -5,11 +5,12 @@
 //! same rules as the reader, so every container that it writes parses again. The writer
 //! writes version 2 only (ADR 0011 §3).
 
+use crate::coding::CodingParts;
 use crate::error::{FormatError, Result};
 use crate::header::{Header, check_profile};
 use crate::layout::{HEADER_LEN_U64, OriginalLens, block_count, header_and_table_len};
 use crate::reader::Container;
-use crate::types::{BlockKind, BlockSize, Checksum, CodingParts, ModelHash, Profile};
+use crate::types::{BlockKind, BlockSize, Checksum, ModelHash, Profile};
 use crate::zstd_block::{check_frame, compress_zstd};
 
 /// The parts of the header that the caller selects. The writer calculates the other fields.
@@ -23,7 +24,8 @@ pub struct ContainerParams {
     /// The profile of the container (ADR 0012). The default is [`Profile::Text`].
     pub profile: Profile,
     /// The coding parts of the container (ADR 0010 §5). The default is [`CodingParts::NONE`].
-    /// A mixed block needs [`CodingParts::mixer`]. The profile `text` permits no coding part.
+    /// A mixed block needs [`CodingParts::mixer`]. The profile `text` permits the context
+    /// overlap only.
     pub coding: CodingParts,
 }
 

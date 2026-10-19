@@ -1,9 +1,9 @@
 //! `fold`: input bytes to a `.taco` container (plan §4).
 
-use hardshell::gpt2::{Model, Session, SessionConfig};
+use hardshell::gpt2::{Model, Overlap, Session, SessionConfig};
 use taco_format::{
-    Block, BlockSize, CodingParts, Container, ContainerParams, HEADER_LEN, MixerRule, Profile,
-    TABLE_ENTRY_LEN, compress_zstd,
+    Block, BlockSize, CodingParts, Container, ContainerParams, ContextOverlap, HEADER_LEN,
+    MixerRule, Profile, TABLE_ENTRY_LEN, compress_zstd,
 };
 
 use hardshell::TokenId;
@@ -15,7 +15,7 @@ use crate::gpu_fold::{BlockWork, code_blocks};
 use crate::mix::MixState;
 use crate::parallel::{Threads, map_blocks};
 use crate::tokenizer::Tokenizer;
-use crate::{DEFAULT_BLOCK_SIZE, container_hash};
+use crate::{DEFAULT_BLOCK_SIZE, LOGS_BLOCK_SIZE, container_hash};
 
 /// The number of tokens that the encoder gives to HardShell in one call (the prefill path).
 // NOTE: measured on the M2 with gpt2.hsm (1,024 tokens, one thread): 8 tokens 329, 32 tokens
@@ -47,21 +47,61 @@ pub enum FoldProfile {
     Auto,
 }
 
+impl FoldProfile {
+    /// The block size of this profile when the caller does not give one:
+    /// [`DEFAULT_BLOCK_SIZE`] for `text`, [`LOGS_BLOCK_SIZE`] for `logs` and `auto` (`auto`
+    /// codes as `logs`).
+    #[must_use]
+    pub const fn default_block_size(self) -> BlockSize {
+        match self {
+            Self::Text => DEFAULT_BLOCK_SIZE,
+            Self::Logs | Self::Auto => LOGS_BLOCK_SIZE,
+        }
+    }
+
+    /// The context overlap of this profile for `model` when the caller does not give one
+    /// (ADR 0015 §5): [`Overlap::NONE`] for `text` (the decoder is faster), and half of the
+    /// context of the model for `logs` and `auto` (`auto` codes as `logs`): `K = 512` for
+    /// GPT-2.
+    ///
+    /// NOTE: `K = 512` gave −20.6 % table bits on 1 MiB of an Apache log against `K = 0`, and
+    /// 0.4 % to 1.2 % less than `K = 384` (measured, RTX 3060,
+    /// `docs/research/2026-10-19-long-context.md` section 7). The logs measurement of this
+    /// default is `docs/research/2026-10-19-overlap-cli.md`. The value is half of the context,
+    /// so a model with a short context (the test models) gets a valid overlap too.
+    #[must_use]
+    pub fn default_overlap(self, model: &Model) -> Overlap {
+        match self {
+            Self::Text => Overlap::NONE,
+            Self::Logs | Self::Auto => {
+                let n_ctx = model.n_ctx();
+                let half = (n_ctx / 2).min(n_ctx.saturating_sub(2));
+                Overlap::new(u16::try_from(half).unwrap_or(u16::MAX))
+            }
+        }
+    }
+}
+
 /// The options of [`fold`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FoldOptions {
-    /// The number of input bytes in each block (the last block can be shorter).
-    pub block_size: BlockSize,
+    /// The number of input bytes in each block (the last block can be shorter), or `None`
+    /// for the default of the profile ([`FoldProfile::default_block_size`]).
+    pub block_size: Option<BlockSize>,
     /// The number of worker threads. The container does not depend on it.
     pub threads: Threads,
     /// The profile. The default is [`FoldProfile::Text`].
     pub profile: FoldProfile,
+    /// The context overlap `K` of every block (ADR 0015), or `None` for the default of the
+    /// profile ([`FoldProfile::default_overlap`]). The container stores it, so the decoder
+    /// needs no option.
+    pub overlap: Option<Overlap>,
 }
 
 impl FoldOptions {
-    /// The default options: blocks of [`DEFAULT_BLOCK_SIZE`] bytes, one thread, the profile
-    /// `text`.
+    /// The default options: one thread, the profile `text`, and the block size and the
+    /// context overlap of the profile (16 KiB blocks and no overlap for `text`).
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -70,8 +110,37 @@ impl FoldOptions {
     /// The same options with another block size.
     #[must_use]
     pub const fn with_block_size(mut self, block_size: BlockSize) -> Self {
-        self.block_size = block_size;
+        self.block_size = Some(block_size);
         self
+    }
+
+    /// The same options with the context overlap `overlap` (ADR 0015). [`fold`] refuses an
+    /// overlap that is not valid for the model (`K > n_ctx - 2`).
+    #[must_use]
+    pub const fn with_overlap(mut self, overlap: Overlap) -> Self {
+        self.overlap = Some(overlap);
+        self
+    }
+
+    /// The block size that [`fold`] uses: the block size of the options, else the default of
+    /// the profile.
+    #[must_use]
+    pub const fn effective_block_size(&self) -> BlockSize {
+        match self.block_size {
+            Some(b) => b,
+            None => self.profile.default_block_size(),
+        }
+    }
+
+    /// The context overlap that [`fold`] uses with `model`: the overlap of the options, else
+    /// the default of the profile.
+    ///
+    /// # Errors
+    /// [`TacoError::Model`] with `InvalidOverlap` if it is more than `n_ctx - 2`.
+    pub fn effective_overlap(&self, model: &Model) -> Result<Overlap> {
+        let overlap = self.overlap.unwrap_or_else(|| self.profile.default_overlap(model));
+        model.check_overlap(overlap)?;
+        Ok(overlap)
     }
 
     /// The same options with another number of threads.
@@ -99,7 +168,7 @@ impl FoldOptions {
 
 impl Default for FoldOptions {
     fn default() -> Self {
-        Self { block_size: DEFAULT_BLOCK_SIZE, threads: Threads::ONE, profile: FoldProfile::Text }
+        Self { block_size: None, threads: Threads::ONE, profile: FoldProfile::Text, overlap: None }
     }
 }
 
@@ -131,6 +200,8 @@ pub struct FoldStats {
     pub text_container_len: u64,
     /// The backend that ran HardShell (ADR 0016). The container does not depend on it.
     pub backend: Backend,
+    /// The context overlap of the container (ADR 0015).
+    pub overlap: Overlap,
 }
 
 /// The result of [`fold`]: the container and numbers about it.
@@ -145,8 +216,10 @@ pub struct Folded {
 
 /// Compresses `input` into a `.taco` container (plan §4, §9).
 ///
-/// The input is divided into blocks of `options.block_size` bytes. Each block is tokenized,
-/// and coded with a new HardShell session and the range coder. Each block is also compressed
+/// The input is divided into blocks of `options.effective_block_size()` bytes. Each block is
+/// tokenized, and coded with a new HardShell session and the range coder. When the context is
+/// full, the session starts again with the last `K` tokens (the context overlap of ADR 0015,
+/// `options.effective_overlap(model)`); the container stores `K`. Each block is also compressed
 /// into one zstd frame (ADR 0011). The smallest of raw, zstd and coded is stored, with the tie
 /// order of `Block::choose_smallest` (plan §3 rule 6, ADR 0011 §4). The model stops when the
 /// payload reaches the smaller of the block length and the zstd length; this does not change
@@ -177,6 +250,7 @@ pub struct Folded {
 /// # Errors
 ///
 /// - [`TacoError::TokenizerMismatch`] if the tokenizer has a different vocabulary size.
+/// - [`TacoError::Model`] with `InvalidOverlap` if the overlap is more than `n_ctx - 2`.
 /// - [`TacoError::TokenizerRoundTrip`] if the tokens of a block do not give its bytes.
 /// - [`TacoError::Model`], [`TacoError::Coder`] or [`TacoError::Format`] on an internal fault.
 /// - [`TacoError::WorkerFailed`] if a worker thread stopped without a result.
@@ -220,7 +294,9 @@ pub fn fold_with(
             model: model.vocab_size(),
         });
     }
-    let chunks: Vec<&[u8]> = options.block_size.split(input).collect();
+    let block_size = options.effective_block_size();
+    let overlap = options.effective_overlap(model)?;
+    let chunks: Vec<&[u8]> = block_size.split(input).collect();
     let rule = match options.profile {
         FoldProfile::Text => None,
         FoldProfile::Logs | FoldProfile::Auto => Some(MixerRule::V1),
@@ -247,11 +323,12 @@ pub fn fold_with(
     // 128 KiB of `apache_access.log` took 162.8 s with CUDA and 141.4 s on 6 CPU threads
     // (measured, devbox, ADR 0016 section 5).
     let on_gpu = engine.backend() != Backend::Cpu && options.uses_gpu();
+    let config = SessionConfig::new().with_chunk(FOLD_CHUNK).with_overlap(overlap);
     let coded = if !on_gpu {
         map_blocks(
             chunks.len(),
             options.threads,
-            || Session::with_config(model, SessionConfig::new().with_chunk(FOLD_CHUNK)),
+            || Session::with_config(model, config),
             |session, i| {
                 let (tokens, zstd) = prepare(i)?;
                 let stop = chunks.get(i).map_or(0, |d| d.len()).min(zstd.len());
@@ -268,7 +345,7 @@ pub fn fold_with(
             work.push(BlockWork::new(tokens, stop)?);
             frames.push(zstd);
         }
-        let coded = code_blocks(engine, model, work)?;
+        let coded = code_blocks(engine, model, work, overlap)?;
         coded.into_iter().zip(frames).enumerate().map(|(i, (c, z))| choose(i, c, z)).collect()
     };
     let to_u64 =
@@ -294,7 +371,9 @@ pub fn fold_with(
         (FoldProfile::Text, _) | (FoldProfile::Auto, 0) => (Profile::Text, CodingParts::NONE),
         _ => (Profile::Logs, CodingParts::with_mixer(MixerRule::V1)),
     };
-    let params = ContainerParams::new(container_hash(model), options.block_size)
+    // ADR 0015 §4: the container stores K for all blocks, in both profiles.
+    let coding = coding.with_overlap(ContextOverlap::new(overlap.get()));
+    let params = ContainerParams::new(container_hash(model), block_size)
         .with_profile(profile)
         .with_coding(coding);
     let container = Container::build(&params, input, &blocks)?;
@@ -303,5 +382,6 @@ pub fn fold_with(
     stats.profile = profile;
     stats.text_container_len = text_len;
     stats.backend = if on_gpu { engine.backend() } else { Backend::Cpu };
+    stats.overlap = overlap;
     Ok(Folded { container, stats })
 }

@@ -7,7 +7,9 @@
 #
 # Inputs are made from the corpus in tools/data/corpus (tools/baseline fetches it), the logs in
 # tools/data/logs (python -m logs.corpus fetch) and a fixed random seed. An input with ".logs."
-# in its name is folded with --profile logs (ADR 0010), every other input with --profile text.
+# in its name is folded with --profile logs (ADR 0010; its default context overlap is 512, ADR
+# 0015), every other input with --profile text. An input with ".k512." in its name also gets
+# --overlap 512 (the context overlap in the profile text).
 # Each machine uses its own tools/data/out/gpt2.hsm; the check refuses to run if the two model
 # hashes differ. Results: tools/data/xcheck/ (ignored by git).
 set -euo pipefail
@@ -37,6 +39,7 @@ printf 'dasdasdasdada' > "$X/in/dasdas.txt"
 L=tools/data/logs
 head -c 65536 "$L/Linux_2k.log" > "$X/in/loghub_linux_64k.logs.log"
 head -c 32768 "$L/nginx_json.log" > "$X/in/nginx_32k.logs.jsonl"
+head -c 32768 "$L/Apache_2k.log" > "$X/in/apache_32k.k512.log"
 
 echo "== build and fold on the Mac"
 scripts/mx cargo build --release -q -p taco-cli
@@ -44,13 +47,14 @@ TACO=$HOME/.cache/taco-mac/target/release/taco
 for f in "$X"/in/*; do
   n=$(basename "$f")
   case $n in *.logs.*) p=logs ;; *) p=text ;; esac
-  "$TACO" fold "$f" -o "$X/mac/$n.taco" --model "$MODEL" --profile $p --threads 6 -f 2>/dev/null
+  case $n in *.k512.*) k="--overlap 512" ;; *) k= ;; esac
+  "$TACO" fold "$f" -o "$X/mac/$n.taco" --model "$MODEL" --profile $p $k --threads 6 -f 2>/dev/null
 done
 
 echo "== on devbox: unfold the Mac files, fold the same inputs"
 scripts/dx main "set -e; cargo build --release -q -p taco-cli; T=\$CARGO_TARGET_DIR/release/taco; rm -rf $X/linux $X/back_on_linux; mkdir -p $X/linux $X/back_on_linux; \
   for f in $X/mac/*.taco; do n=\$(basename \$f .taco); \$T unfold \$f -o $X/back_on_linux/\$n --model $MODEL --threads 6 -f 2>/dev/null; cmp -s $X/in/\$n $X/back_on_linux/\$n && echo \"restored-on-linux ok   \$n\" || echo \"restored-on-linux FAIL \$n\"; done; \
-  for f in $X/in/*; do n=\$(basename \$f); case \$n in *.logs.*) p=logs ;; *) p=text ;; esac; \$T fold \$f -o $X/linux/\$n.taco --model $MODEL --profile \$p --threads 6 -f 2>/dev/null; done; \
+  for f in $X/in/*; do n=\$(basename \$f); case \$n in *.logs.*) p=logs ;; *) p=text ;; esac; case \$n in *.k512.*) k='--overlap 512' ;; *) k= ;; esac; \$T fold \$f -o $X/linux/\$n.taco --model $MODEL --profile \$p \$k --threads 6 -f 2>/dev/null; done; \
   (cd $X/linux && sha256sum *.taco) > $X/linux/SHA256SUMS" | grep -E "restored-on-linux" | tee "$X/linux_restore.txt"
 
 echo "== copy the devbox files back"
@@ -71,6 +75,12 @@ echo "== the logs inputs have the profile logs (header byte 88) and mixed blocks
 for f in "$X"/mac/*.logs.*.taco; do
   mixed=$(python3 -c 'import sys; b=open(sys.argv[1],"rb").read(); n=int.from_bytes(b[84:88],"little"); print(sum(b[104+5*i]==3 for i in range(n)) if b[88]==1 else -1)' "$f")
   if [ "$mixed" -gt 0 ]; then echo "profile logs ok        $(basename "$f") ($mixed mixed blocks)"; else echo "profile logs FAIL      $(basename "$f")"; fail=1; fi
+done
+
+echo "== the logs and .k512. inputs have the context overlap K = 512 (bit 1 at byte 90, K at 94)"
+for f in "$X"/mac/*.logs.*.taco "$X"/mac/*.k512.*.taco; do
+  k=$(python3 -c 'import sys; b=open(sys.argv[1],"rb").read(); print(int.from_bytes(b[94:96],"little") if b[90]&2 else 0)' "$f")
+  if [ "$k" -eq 512 ]; then echo "overlap 512 ok          $(basename "$f")"; else echo "overlap FAIL           $(basename "$f") (K = $k)"; fail=1; fi
 done
 
 echo "== compare the .taco files of both machines"

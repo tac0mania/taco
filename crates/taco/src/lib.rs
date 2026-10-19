@@ -43,8 +43,9 @@
 //!
 //! # Block size
 //!
-//! The default block size is [`DEFAULT_BLOCK_SIZE`], 16 KiB. The reasons (est.; plan §13
-//! question 3 asks for the measurement):
+//! The default block size of the profile `text` is [`DEFAULT_BLOCK_SIZE`], 16 KiB. The
+//! profiles `logs` and `auto` use [`LOGS_BLOCK_SIZE`], 64 KiB (measured, see its note). The
+//! reasons for 16 KiB (est.; plan §13 question 3 asks for the measurement):
 //!
 //! - The context of GPT-2 starts again after 1,024 tokens in any case (§7.7). A block of
 //!   16 KiB of English has about 5,000 tokens (phase 0: 3.1 bytes for each token on English,
@@ -80,18 +81,34 @@ pub use codec::FREQ_BITS;
 pub use error::{Result, TacoError};
 pub use fold::{FoldOptions, FoldProfile, FoldStats, Folded, fold, fold_with};
 pub use hardshell::TokenId;
-pub use hardshell::gpt2::Model;
+pub use hardshell::gpt2::{Model, Overlap};
 pub use parallel::Threads;
 pub use taco_format::{BlockSize, Checksum, ModelHash, Profile};
 pub use tokenizer::{MergeFault, Tokenizer};
-pub use unfold::{UnfoldOptions, unfold, unfold_with};
+pub use unfold::{UnfoldOptions, container_overlap, unfold, unfold_with};
 
-/// The default number of input bytes in each block: 16 KiB. See the crate documentation.
+/// The default number of input bytes in each block of the profile `text`: 16 KiB. See the
+/// crate documentation.
 // NOTE: the compiler evaluates this constant. A panic here is a build error, not a run-time
 // panic, and 16 KiB is not 0.
 #[allow(clippy::panic)]
 pub const DEFAULT_BLOCK_SIZE: BlockSize = {
     let Ok(b) = BlockSize::new(16 * 1024) else { panic!("the block size is not 0") };
+    b
+};
+
+/// The default number of input bytes in each block of the profiles `logs` and `auto`: 64 KiB.
+///
+/// NOTE: with the overlap `K = 512` on the 18 logs of `tools/data/logs`, blocks of 64 KiB gave
+/// 363,234 bytes against 444,436 bytes with blocks of 16 KiB (-18.3 %, measured,
+/// `docs/research/2026-10-19-overlap-cli.md`): the match model sees more of each log. The cost:
+/// 23 % more CPU time for each byte in fold, and fewer blocks for the threads and the lanes of a
+/// small file (ADR 0012, addendum).
+// NOTE: the compiler evaluates this constant. A panic here is a build error, not a run-time
+// panic, and 64 KiB is not 0.
+#[allow(clippy::panic)]
+pub const LOGS_BLOCK_SIZE: BlockSize = {
+    let Ok(b) = BlockSize::new(64 * 1024) else { panic!("the block size is not 0") };
     b
 };
 

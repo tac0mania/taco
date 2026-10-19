@@ -1,7 +1,9 @@
 # ADR 0015: the context restart keeps the last K tokens (context overlap)
 
-Date: 2026-10-19. Status: proposed (by the context agent). Plan: §7.7, §9, §11. Changes: ADR
-0004 section 9 (the restart rule), ADR 0007 section 3.3. Research note:
+Date: 2026-10-19. Status: accepted (proposed by the context agent; the container field and the
+defaults decided by the lead, integrated by the overlap agent on 2026-10-19). Plan: §7.7, §9,
+§11. Changes: ADR 0004 section 9 (the restart rule), ADR 0007 section 3.3, ADR 0011 §2 (bit 1
+of the coding parts), ADR 0012 (addendum). Research note:
 `docs/research/2026-10-19-long-context.md`. Integration: `crates/hardshell/CONTEXT-INTEGRATION.md`.
 
 ## Context
@@ -46,8 +48,10 @@ windows of one block in parallel slots, and the encoder (which knows all tokens)
 1. `hardshell::gpt2::Overlap` (a `u16` newtype) holds `K`. `Model::check_overlap` refuses
    `K > n_ctx - 2` with `Error::InvalidOverlap`.
 2. Every path has the rule: `ReferenceSession::with_overlap` (the oracle, ADR 0013),
-   `SessionConfig::with_overlap` (step and prefill), `Batch::with_overlap` (lanes), and in
-   `hardshell-cuda` `CudaSession::with_overlap` and `CudaBatch::set_overlap`.
+   `SessionConfig::with_overlap` (step and prefill), `Batch::with_overlap` (lanes), in
+   `hardshell-cuda` `CudaSession::with_overlap` and `CudaBatch::set_overlap`, and in
+   `hardshell-gpu` (wgpu, commit `993c03b`) `GpuSession::with_overlap` and
+   `GpuBatch::with_overlap`.
 3. The restart rows are normal forward rows. The CPU paths do not compute the logits of a
    restart row, and they run the restart rows in groups of at least 32 rows (also a session
    with a chunk of 1). The CUDA path computes the logits and does not use them. These are
@@ -55,16 +59,52 @@ windows of one block in parallel slots, and the encoder (which knows all tokens)
 4. The default is `Overlap::NONE`. Thus every caller that does not set an overlap gives the
    same bits as before, and the golden hashes do not change.
 
-### 4. The container
+### 4. The container (decided)
 
-The container stores `K` for each container (not for each block). The decoder uses the stored
-`K`. A decoder that does not know the field refuses the container. The integration note gives
-the proposed field: a coding part bit of the version 2 header with `K` as a `u16` in the coding
-parameters. The lead decides the field and the version (plan §3 rule 8).
+The container stores one `K` for all its blocks. The decoder uses the stored `K`. The field is
+in the version 2 header (ADR 0011 §2); the version stays 2, because version 2 is not frozen
+(the lead's decision):
 
-### 5. The default values
+1. Bit 1 of the coding parts (offset 90): the context overlap.
+2. Bytes 2 and 3 of the coding parameters (offsets 94 and 95): `K`, a little-endian `u16`.
+   Byte 0 stays the mixer rule; byte 1 stays reserved (0).
+3. Bit 1 clear: `K = 0`, and bytes 2 and 3 are 0 (else `ReservedNotZero`). Bit 1 set: `K >= 1`
+   (else `ZeroContextOverlap`). Thus each `K` has exactly one encoding.
+4. A reader that does not know bit 1 refuses the container (`UnknownCodingParts`; the reader
+   of commit `2bdeac5` and older). Thus no reader decodes it with the wrong rule.
+5. Both profiles permit bit 1 (ADR 0012, addendum). The profile `text` still refuses bit 0.
+6. The container does not know `n_ctx`. The decoder calls `Model::check_overlap` with the
+   stored `K` before the first block and refuses `K > n_ctx - 2` (`InvalidOverlap`).
 
-The research note (section 7) recommends the defaults of the encoder:
+The crates: `taco_format::ContextOverlap` and `CodingParts::with_overlap` / `overlap`;
+`taco::FoldOptions::with_overlap`, `taco::container_overlap`; `taco
+fold --overlap K`.
+
+### 5. The default values (decided)
+
+The lead's decision (2026-10-19), with the measurements of
+`docs/research/2026-10-19-overlap-cli.md`:
+
+1. The profile `text`: `K = 0` by default (the decoder is faster), blocks of 16 KiB.
+2. The profiles `logs` and `auto` (`auto` codes as `logs`): `K` = half of the model context by
+   default, thus `K = 512` for GPT-2, and blocks of 64 KiB (`taco::LOGS_BLOCK_SIZE`). On the
+   18 logs of `tools/data/logs` (measured): 363,234 bytes, against 489,113 bytes with the old
+   defaults (16 KiB, `K = 0`, −25.7 %) and 444,436 bytes with 16 KiB and `K = 512` (−18.3 %).
+   The speed cost is in ADR 0012, addendum.
+3. `taco fold --overlap K` selects any `K` with `0 <= K <= n_ctx - 2` for every profile.
+
+### 5b. The backends
+
+1. Every backend has the overlap. The CPU: fold `SessionConfig::with_overlap`, unfold
+   `Batch::with_overlap`. CUDA and wgpu: fold runs the windows of section 2 in parallel slots
+   (no window is longer than the context, so the slots never restart in fold); unfold uses
+   `CudaBatch::set_overlap` and `GpuBatch::with_overlap`.
+2. All backends give the same container bytes for every `K`: `crates/taco/tests/backends.rs`
+   (`K` = 0, 1, 12, 22 on the tiny model; CUDA and wgpu on GL/D3D12 on devbox, wgpu on Metal
+   on the Mac), and the xcheck inputs with GPT-2 and `K = 512` (research note section 6).
+   Backend selection (`--backend`, ADR 0016 §1) does not depend on `K`.
+
+The recommendation of the research note (section 7), for reference:
 
 1. `K = 512` (half of the GPT-2 context). It gives the largest gain on English text (with
    `K = 384`) and 0.4 % to 1.2 % more than `K = 384` on Chinese text and on a log. It costs
@@ -77,9 +117,24 @@ The decoder does not depend on these defaults: it reads `K` and the block size f
 container. The lead decides the defaults (they change the compressed bytes and the
 conformance vectors).
 
-### 6. Conformance vector
+### 6. Conformance vectors
 
-The golden tiny model of `crates/hardshell/tests/gpt2.rs`, 300 tokens, `K = 32` (half of the
+The container vectors (`crates/taco-format/tests/golden.rs`): vector E (vector B with `K =
+512`, profile text) `d29fb5c2f32daf836657bb73a9f48d4b9eca966f08aec8c9571eacafdcf80408`, and
+vector F (vector D with `K = 512`, profile logs) `9555a3e603c93f6f27943855b3faa47d1679200060fd07756ce29441ee75c6b6`.
+
+The `taco` vectors (the tiny model of `crates/taco/tests/common`, `n_ctx = 24`, measured on
+the Mac and devbox, and on CUDA):
+
+| Vector | SHA-256 |
+|---|---|
+| Text golden input, blocks of 512, `--overlap 12` (`tests/container.rs`) | `d705d4b6971fe351f29d14cd5723d3b2a79ced03facae32910bc13d09f3ce340` |
+| Logs golden input, blocks of 512, the default overlap 12 (`tests/logs_profile.rs`) | `584b60fbd89d3f689cdd75161d43be973ef3c87294680fae1bd0d6f3f7066835` |
+| All defaults of `logs` (64 KiB, `K = 12`), 69,632 bytes (`tests/logs_profile.rs`) | `6cdc1edc5b963b5cebb224d93e824841013b6e668d2e6f3dd3b424d16a5ced77` |
+| Text golden with `--overlap 0` (unchanged) | `0b0ba3f1bc8579247476163489ed3155a7828916d27e92f3435e9a8e74157c07` |
+| Logs golden with `--overlap 0` (unchanged) | `7262257e6d2875ae393dd2474acc8a00dd1b8adf829eeef75b0ca719f73b55ec` |
+
+The HardShell vector: the golden tiny model of `crates/hardshell/tests/gpt2.rs`, 300 tokens, `K = 32` (half of the
 context of 64 tokens, 8 restarts): SHA-256 of all weights
 `5a79928200ad35bb7e7a1be2a0a35e05dcecc001a89cf3cf0765dfc7e5304a83` (measured: Mac NEON,
 devbox AVX2, RTX 3060).

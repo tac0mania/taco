@@ -4,6 +4,9 @@
 //! a backend that it does not have. They use the tiny model of `tests/common` (a context of 24
 //! tokens, so every block of more than 23 tokens has several context windows) and the golden
 //! vectors of `tests/container.rs` and `tests/logs_profile.rs`.
+//!
+//! The context overlap (ADR 0015): CUDA and wgpu give the CPU container for every `K` of
+//! the tests (0, 1, 12, 22), and unfold every container.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // Tests fail loudly.
 #![allow(clippy::print_stderr, clippy::cast_possible_truncation)] // Messages, test data.
@@ -13,20 +16,26 @@ mod common;
 use common::{CHINESE, ENGLISH, JSON, LOGS, Rng, mixed, model_file, tiny};
 use sha2::{Digest, Sha256};
 use taco::{
-    Backend, BackendChoice, BlockSize, Engine, FoldOptions, FoldProfile, TacoError, Threads,
-    UnfoldOptions, fold, fold_with, unfold, unfold_with, with_engine,
+    Backend, BackendChoice, BlockSize, Engine, FoldOptions, FoldProfile, Overlap, TacoError,
+    Threads, UnfoldOptions, fold, fold_with, unfold, unfold_with, with_engine,
 };
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The options with no context overlap (the goldens of ADR 0010 and ADR 0016).
 fn options(block_size: u32, profile: FoldProfile, threads: usize) -> FoldOptions {
     FoldOptions::new()
         .with_block_size(BlockSize::new(block_size).unwrap())
         .with_profile(profile)
         .with_threads(Threads::new(threads).unwrap())
+        .with_overlap(Overlap::NONE)
 }
+
+/// The overlaps of the tests: none, the smallest, half of the context of 24 (the default of
+/// the profile logs) and the largest (`n_ctx - 2`).
+const OVERLAPS: [u16; 4] = [0, 1, 12, 22];
 
 /// The input of the golden vector of `tests/container.rs` (profile text, blocks of 512).
 fn text_golden_input() -> Vec<u8> {
@@ -103,23 +112,23 @@ fn every_gpu_backend_gives_the_cpu_containers_and_restores_them() {
     let t = tiny();
     let ran = on_each_gpu(|engine| {
         for (name, data, bs, profile) in cases() {
-            for threads in [1, 4] {
-                let opts = options(bs, profile, threads);
+            for (threads, k) in [1, 4].into_iter().flat_map(|n| OVERLAPS.map(|k| (n, k))) {
+                let opts = options(bs, profile, threads).with_overlap(Overlap::new(k));
                 let cpu = fold(&t.model, &t.tokenizer, &data, &opts).unwrap();
+                let uopts = UnfoldOptions::new().with_threads(Threads::new(threads).unwrap());
                 let gpu = fold_with(engine, &t.model, &t.tokenizer, &data, &opts).unwrap();
                 assert_eq!(
                     hex(&Sha256::digest(&gpu.container)),
                     hex(&Sha256::digest(&cpu.container)),
-                    "{name}: {} fold, {threads} threads",
+                    "{name}: {} fold, {threads} threads, K = {k}",
                     engine.backend()
                 );
                 // The profiles logs and auto fold on the CPU on every engine (ADR 0016 §5).
                 let folded_on =
                     if profile == FoldProfile::Text { engine.backend() } else { Backend::Cpu };
                 assert_eq!(gpu.stats.backend, folded_on, "{name}");
-                let uopts = UnfoldOptions::new().with_threads(Threads::new(threads).unwrap());
                 let back = unfold_with(engine, Some(&t.model), &cpu.container, &uopts).unwrap();
-                assert_eq!(back, data, "{name}: {} unfold", engine.backend());
+                assert_eq!(back, data, "{name}: {} unfold, K = {k}", engine.backend());
                 assert_eq!(unfold(Some(&t.model), &gpu.container, &uopts).unwrap(), data);
             }
         }
@@ -152,8 +161,32 @@ fn every_gpu_backend_gives_the_golden_containers() {
             "7262257e6d2875ae393dd2474acc8a00dd1b8adf829eeef75b0ca719f73b55ec"
         );
         assert_eq!(unfold_with(engine, Some(&t.model), &f.container, &uopts).unwrap(), data);
+        // The goldens with an overlap (ADR 0015): text with K = 12, and the defaults of the
+        // profile logs (K = 12 for the tiny model), on every GPU backend.
+        let goldens = [
+            (text_golden_input(), FoldProfile::Text, Some(Overlap::new(12)), GOLDEN_TEXT_K12),
+            (logs_golden_input(), FoldProfile::Logs, None, GOLDEN_LOGS_DEFAULT),
+        ];
+        for (data, profile, k, want) in goldens {
+            let mut opts = options(512, profile, 2);
+            opts.overlap = k;
+            let cpu = fold(&t.model, &t.tokenizer, &data, &opts).unwrap();
+            assert_eq!(hex(&Sha256::digest(&cpu.container)), want);
+            assert_eq!(unfold_with(engine, Some(&t.model), &cpu.container, &uopts).unwrap(), data);
+            let f = fold_with(engine, &t.model, &t.tokenizer, &data, &opts).unwrap();
+            assert_eq!(hex(&Sha256::digest(&f.container)), want);
+            assert_eq!(unfold_with(engine, Some(&t.model), &f.container, &uopts).unwrap(), data);
+        }
+        // NOTE: a line for each backend, so a crash of a driver at exit does not hide the result.
+        eprintln!("goldens equal on {}", engine.backend());
     });
 }
+
+/// CONFORMANCE: the text golden with K = 12 (`tests/container.rs`).
+const GOLDEN_TEXT_K12: &str = "d705d4b6971fe351f29d14cd5723d3b2a79ced03facae32910bc13d09f3ce340";
+/// CONFORMANCE: the logs golden with the defaults of the profile (`tests/logs_profile.rs`).
+const GOLDEN_LOGS_DEFAULT: &str =
+    "584b60fbd89d3f689cdd75161d43be973ef3c87294680fae1bd0d6f3f7066835";
 
 #[test]
 fn a_gpu_refuses_a_model_file_that_is_not_the_loaded_model() {

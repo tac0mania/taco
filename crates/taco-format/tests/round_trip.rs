@@ -16,8 +16,8 @@ mod common;
 use common::{MODEL, bs, fold, phrases, splitmix64, unfold};
 use proptest::prelude::*;
 use taco_format::{
-    Block, BlockKind, BlockSize, Checksum, Container, ContainerParams, HEADER_LEN, ModelHash,
-    Profile, TABLE_ENTRY_LEN, VERSION, compress_zstd, worst_case_len,
+    Block, BlockKind, BlockSize, Checksum, CodingParts, Container, ContainerParams, ContextOverlap,
+    HEADER_LEN, ModelHash, Profile, TABLE_ENTRY_LEN, VERSION, compress_zstd, worst_case_len,
 };
 
 /// Runs, phrases and random bytes, so that the container has raw, coded and zstd blocks.
@@ -42,6 +42,7 @@ fn check_layout(bytes: &[u8], data: &[u8], params: &ContainerParams, blocks: &[B
     let h = c.header();
     assert_eq!(h.version(), VERSION);
     assert_eq!(h.profile(), params.profile);
+    assert_eq!(h.coding_parts(), params.coding);
     assert_eq!(h.model_hash(), params.model_hash);
     assert_eq!(h.block_size(), params.block_size);
     assert_eq!(h.original_len(), data.len() as u64);
@@ -82,6 +83,7 @@ proptest! {
         block_size in 1u32..300,
         raw_only in any::<bool>(),
         logs in any::<bool>(),
+        overlap in prop_oneof![Just(0u16), any::<u16>()],
         seed in any::<u64>(),
     ) {
         let block_size = BlockSize::new(block_size).unwrap();
@@ -103,9 +105,14 @@ proptest! {
             })
             .collect();
         let profile = if logs { Profile::Logs } else { Profile::Text };
-        let params = ContainerParams::new(model, block_size).with_profile(profile);
+        // ADR 0015 §4: both profiles permit the context overlap; K = 0 clears the bit.
+        let coding = CodingParts::NONE.with_overlap(ContextOverlap::new(overlap));
+        let params =
+            ContainerParams::new(model, block_size).with_profile(profile).with_coding(coding);
         let bytes = Container::build(&params, &data, &blocks).unwrap();
         check_layout(&bytes, &data, &params, &blocks);
+        prop_assert_eq!(u16::from_le_bytes([bytes[94], bytes[95]]), overlap);
+        prop_assert_eq!(bytes[90] & 2 != 0, overlap != 0);
     }
 
     /// The toy fold and unfold restore any data, with and without a model.

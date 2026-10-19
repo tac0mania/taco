@@ -7,7 +7,8 @@ use std::path::PathBuf;
 pub(crate) const USAGE: &str = "\
 usage:
   taco fold <input> [-o <output>] [--model <path.hsm>] [--profile text|logs|auto]
-            [--block-size <bytes>] [--backend auto|cuda|gpu|cpu] [--threads <n>] [-f]
+            [--block-size <bytes>] [--overlap <tokens>] [--backend auto|cuda|gpu|cpu]
+            [--threads <n>] [-f]
   taco unfold <input.taco> [-o <output>] [--model <path.hsm>] [--backend auto|cuda|gpu|cpu]
               [--threads <n>] [-f]
 
@@ -20,7 +21,12 @@ options:
   --profile <name>        fold only: text (GPT-2 alone), logs (GPT-2, the match model and
                           the mixer) or auto (default: logs if a block gets smaller with
                           it, else text). unfold reads the profile from the file.
-  --block-size <bytes>    the bytes in each block (fold only, default 16384)
+  --block-size <bytes>    the bytes in each block (fold only; default 16384 for text,
+                          65536 for logs and auto)
+  --overlap <tokens>      fold only: when the model context is full, start it again with
+                          the last <tokens> tokens (0 to the context length - 2). Default:
+                          0 for text, half of the context for logs and auto (512 for
+                          GPT-2). unfold reads it from the file.
   --backend <name>        where the model runs: cuda (NVIDIA), gpu (wgpu: Metal, Vulkan,
                           DX12, GL), cpu, or auto (default: the first of cuda, gpu, cpu that
                           passes a self-test). The output is the same on every backend.
@@ -76,6 +82,8 @@ pub(crate) struct Job {
     /// `--model`, if given. The caller uses `TACO_MODEL` else.
     pub(crate) model: Option<PathBuf>,
     pub(crate) block_size: Option<u32>,
+    /// `--overlap`, fold only. `None`: the default of the profile.
+    pub(crate) overlap: Option<u16>,
     pub(crate) threads: Option<usize>,
     pub(crate) force: bool,
     /// Fold only. The default is [`ProfileArg::Auto`].
@@ -118,6 +126,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
     };
     let (mut input, mut output, mut model) = (None, None, None);
     let (mut block_size, mut threads, mut force) = (None, None, false);
+    let mut overlap = None;
     let mut profile = ProfileArg::default();
     let mut backend = BackendArg::default();
     while let Some(a) = args.next() {
@@ -127,6 +136,9 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
             Some("-m" | "--model") => model = Some(args.next().ok_or("--model needs a path")?),
             Some("--block-size") if mode == Mode::Fold => {
                 block_size = Some(number("--block-size", args.next())?);
+            }
+            Some("--overlap") if mode == Mode::Fold => {
+                overlap = Some(number("--overlap", args.next())?);
             }
             Some("--profile") if mode == Mode::Fold => {
                 profile = match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
@@ -171,6 +183,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
         output,
         model: model.map(PathBuf::from),
         block_size,
+        overlap,
         threads,
         force,
         profile,
@@ -247,6 +260,18 @@ mod tests {
         assert_eq!(job(&["fold", "a", "--backend", "auto"]).backend, BackendArg::Auto);
         assert!(run(&["fold", "a", "--backend", "tpu"]).is_err());
         assert!(run(&["fold", "a", "--backend"]).is_err());
+    }
+
+    #[test]
+    fn overlap_parses_for_fold_only() {
+        assert_eq!(job(&["fold", "a"]).overlap, None);
+        assert_eq!(job(&["fold", "a", "--overlap", "0"]).overlap, Some(0));
+        assert_eq!(job(&["fold", "a", "--overlap", "512"]).overlap, Some(512));
+        assert_eq!(job(&["fold", "a", "--overlap", "65535"]).overlap, Some(65_535));
+        assert!(run(&["fold", "a", "--overlap", "65536"]).is_err());
+        assert!(run(&["fold", "a", "--overlap", "-1"]).is_err());
+        assert!(run(&["fold", "a", "--overlap"]).is_err());
+        assert!(run(&["unfold", "a.taco", "--overlap", "512"]).is_err());
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! loaded model before it uses a device.
 
 use hardshell::TokenId;
+use hardshell::gpt2::Overlap;
 use hardshell_cuda::{CudaBatch, CudaModel};
 use hardshell_gpu::{GpuBatch, GpuModel};
 use taco_coder::{CodeInterval, FreqBits};
@@ -48,7 +49,7 @@ pub(crate) trait Lanes {
 
     /// Runs the inputs (slot, token) and gives the answer of the coder op to `queries[i]`
     /// for each input `i`. The inputs of one slot run at consecutive positions; a full context
-    /// starts again as on the CPU (plan §7.7).
+    /// starts again as on the CPU (plan §7.7), with the overlap of the slots (ADR 0015).
     fn coded(&mut self, inputs: &[(usize, TokenId)], queries: &[Query]) -> Result<Vec<Answer>>;
 
     /// Runs the inputs and gives the weights of each input, `vocab` values each, in input
@@ -77,9 +78,16 @@ pub(crate) struct CudaLanes<'m> {
 }
 
 impl<'m> CudaLanes<'m> {
-    /// A batch of `slots` slots and passes of up to `rows` rows.
-    pub(crate) fn new(model: &'m CudaModel<'m>, slots: usize, rows: usize) -> Result<Self> {
-        let batch = CudaBatch::new(model, slots, rows).map_err(|e| Backend::Cuda.fault(e))?;
+    /// A batch of `slots` slots, passes of up to `rows` rows, and the context overlap
+    /// `overlap` (ADR 0015).
+    pub(crate) fn new(
+        model: &'m CudaModel<'m>,
+        slots: usize,
+        rows: usize,
+        overlap: Overlap,
+    ) -> Result<Self> {
+        let mut batch = CudaBatch::new(model, slots, rows).map_err(|e| Backend::Cuda.fault(e))?;
+        batch.set_overlap(overlap).map_err(|e| Backend::Cuda.fault(e))?;
         Ok(Self { batch })
     }
 }
@@ -120,16 +128,18 @@ impl Lanes for CudaLanes<'_> {
     }
 }
 
-/// The portable backend: [`GpuBatch`], one input for each slot in a call.
+/// The portable backend: [`GpuBatch`], one input for each slot in a call. A slot whose context
+/// is full starts again with the overlap of the batch (ADR 0015), inside the backend.
 pub(crate) struct GpuLanes<'m> {
     batch: GpuBatch<'m>,
     vocab: usize,
 }
 
 impl<'m> GpuLanes<'m> {
-    /// A batch of `slots` slots.
-    pub(crate) fn new(model: &'m GpuModel, slots: usize) -> Result<Self> {
-        let batch = GpuBatch::new(model, slots).map_err(|e| Backend::Gpu.fault(e))?;
+    /// A batch of `slots` slots with the context overlap `overlap` (ADR 0015).
+    pub(crate) fn new(model: &'m GpuModel, slots: usize, overlap: Overlap) -> Result<Self> {
+        let batch =
+            GpuBatch::with_overlap(model, slots, overlap).map_err(|e| Backend::Gpu.fault(e))?;
         Ok(Self { batch, vocab: model.vocab_size() })
     }
 }

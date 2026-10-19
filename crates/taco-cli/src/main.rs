@@ -16,8 +16,8 @@ use std::time::Instant;
 
 use args::{BackendArg, Command, Job, Mode, ProfileArg, USAGE};
 use taco::{
-    BackendChoice, BlockSize, Engine, FoldOptions, FoldProfile, Model, Profile, Threads, TokenId,
-    Tokenizer, UnfoldOptions,
+    BackendChoice, BlockSize, Engine, FoldOptions, FoldProfile, Model, Overlap, Profile, Threads,
+    TokenId, Tokenizer, UnfoldOptions,
 };
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -129,6 +129,11 @@ fn run(job: &Job) -> CliResult<()> {
             if let Some(bs) = job.block_size {
                 options = options.with_block_size(BlockSize::new(bs)?);
             }
+            if let Some(k) = job.overlap {
+                options = options.with_overlap(Overlap::new(k));
+            }
+            // NOTE: a K that the model refuses is an error before a GPU opens.
+            options.effective_overlap(model)?;
             // NOTE: the profiles logs and auto fold on the CPU on every engine (ADR 0016), so
             // they do not open a GPU.
             let choice =
@@ -142,8 +147,8 @@ fn run(job: &Job) -> CliResult<()> {
             let s = folded.stats;
             eprintln!(
                 "taco: fold {} -> {}: {} -> {} bytes, ratio {}, {} bits per byte, profile {}, \
-                 {} of {} blocks coded and {} mixed (profile text: {} bytes), {} tokens, \
-                 backend {}, {:.1?} (model load {:.1?})",
+                 blocks of {} bytes, overlap {}, {} of {} blocks coded and {} mixed (profile \
+                 text: {} bytes), {} tokens, backend {}, {:.1?} (model load {:.1?})",
                 job.input.display(),
                 job.output.display(),
                 s.original_len,
@@ -151,6 +156,8 @@ fn run(job: &Job) -> CliResult<()> {
                 ratio(s.original_len, s.container_len),
                 ratio(s.container_len * 8, s.original_len),
                 profile_name(s.profile),
+                options.effective_block_size().get(),
+                s.overlap.get(),
                 s.coded_blocks,
                 s.blocks,
                 s.mixed_blocks,

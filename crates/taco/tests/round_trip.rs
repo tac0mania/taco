@@ -8,7 +8,7 @@ mod common;
 
 use common::{ARABIC, CHINESE, CODE, ENGLISH, HINDI, JSON, LOGS, Rng, mixed, random_letters, tiny};
 use proptest::prelude::*;
-use taco::{BlockSize, FoldOptions, Folded, Threads, UnfoldOptions, fold, unfold};
+use taco::{BlockSize, FoldOptions, Folded, Overlap, Threads, UnfoldOptions, fold, unfold};
 use taco_format::{HEADER_LEN, TABLE_ENTRY_LEN, worst_case_len};
 
 fn options(block_size: u32) -> FoldOptions {
@@ -190,6 +190,31 @@ fn large_mixed_file_round_trips() {
 }
 
 #[test]
+fn every_input_class_round_trips_with_an_overlap() {
+    // ADR 0015: the profile text with K > 0. The tiny model has a context of 24, so each block
+    // of more than 23 tokens restarts, and K = 22 is the largest valid overlap.
+    let t = tiny();
+    let classes: [&[u8]; 6] = [
+        ENGLISH.as_bytes(),
+        CHINESE.as_bytes(),
+        CODE.as_bytes(),
+        LOGS.as_bytes(),
+        &Rng::new(8).bytes(500),
+        &random_letters(9, 700),
+    ];
+    for data in classes {
+        for k in [1, 5, 12, 22] {
+            for bs in [16 * 1024, 300, 7] {
+                let opts = options(bs).with_overlap(Overlap::new(k));
+                let f = fold(&t.model, &t.tokenizer, data, &opts).unwrap();
+                let back = unfold(Some(&t.model), &f.container, &UnfoldOptions::new()).unwrap();
+                assert_eq!(back, data, "K = {k}, blocks of {bs}");
+            }
+        }
+    }
+}
+
+#[test]
 fn output_is_the_same_for_one_and_many_threads() {
     let t = tiny();
     let data = mixed(12 * 1024);
@@ -199,6 +224,15 @@ fn output_is_the_same_for_one_and_many_threads() {
         let opts = options(1024).with_threads(Threads::new(n).unwrap());
         let many = fold(&t.model, &t.tokenizer, &data, &opts).unwrap();
         assert_eq!(many, one, "{n} threads");
+        let uopts = UnfoldOptions::new().with_threads(Threads::new(n).unwrap());
+        assert_eq!(unfold(Some(&t.model), &one.container, &uopts).unwrap(), data);
+    }
+    // The same with an overlap (ADR 0015): the batch lanes of unfold restart independently.
+    let k = Overlap::new(12);
+    let one = fold(&t.model, &t.tokenizer, &data, &options(1024).with_overlap(k)).unwrap();
+    for n in [2, 8] {
+        let opts = options(1024).with_threads(Threads::new(n).unwrap()).with_overlap(k);
+        assert_eq!(fold(&t.model, &t.tokenizer, &data, &opts).unwrap(), one, "{n} threads, K");
         let uopts = UnfoldOptions::new().with_threads(Threads::new(n).unwrap());
         assert_eq!(unfold(Some(&t.model), &one.container, &uopts).unwrap(), data);
     }

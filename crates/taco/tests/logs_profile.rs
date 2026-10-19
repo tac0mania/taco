@@ -10,19 +10,28 @@ use common::{ARABIC, CHINESE, CODE, ENGLISH, HINDI, JSON, LOGS, Rng, mixed, rand
 use proptest::prelude::*;
 use sha2::{Digest, Sha256};
 use taco::{
-    BlockSize, FoldOptions, FoldProfile, Folded, Profile, TacoError, Threads, UnfoldOptions, fold,
-    unfold,
+    BlockSize, FoldOptions, FoldProfile, Folded, Overlap, Profile, TacoError, Threads,
+    UnfoldOptions, fold, unfold,
 };
 use taco_format::{
-    BlockKind, CodingParts, Container, HEADER_LEN, MixerRule, TABLE_ENTRY_LEN, worst_case_len,
+    BlockKind, CodingParts, Container, ContextOverlap, HEADER_LEN, MixerRule, TABLE_ENTRY_LEN,
+    worst_case_len,
 };
+
+/// The default overlap of the profile logs for the tiny model: half of its context of 24.
+const K: u16 = 12;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The options of the tests: the overlap [`K`] for every profile, so the containers of the
+/// three profiles have the same blocks where they agree (the default of `text` is 0).
 fn options(block_size: u32, profile: FoldProfile) -> FoldOptions {
-    FoldOptions::new().with_block_size(BlockSize::new(block_size).unwrap()).with_profile(profile)
+    FoldOptions::new()
+        .with_block_size(BlockSize::new(block_size).unwrap())
+        .with_profile(profile)
+        .with_overlap(Overlap::new(K))
 }
 
 fn fold_with(data: &[u8], block_size: u32, profile: FoldProfile) -> Folded {
@@ -54,7 +63,8 @@ fn round_trip(data: &[u8], block_size: u32) -> Folded {
     assert!(logs.container.len() <= text.container.len());
     let header = *Container::parse(&logs.container).unwrap().header();
     assert_eq!(header.profile(), Profile::Logs);
-    assert_eq!(header.coding_parts(), CodingParts::with_mixer(MixerRule::V1));
+    let coding = CodingParts::with_mixer(MixerRule::V1).with_overlap(ContextOverlap::new(K));
+    assert_eq!(header.coding_parts(), coding);
     assert_eq!(logs.stats.profile, Profile::Logs);
     // Auto: the text container if no block is mixed, else the logs container.
     if logs.stats.mixed_blocks == 0 {
@@ -220,7 +230,9 @@ fn golden_input() -> Vec<u8> {
 fn golden_logs_container_hash() {
     let t = tiny();
     let data = golden_input();
-    let f = fold(&t.model, &t.tokenizer, &data, &options(512, FoldProfile::Logs)).unwrap();
+    // The golden vector of ADR 0010 has no context overlap: `--overlap 0`.
+    let opts = options(512, FoldProfile::Logs).with_overlap(Overlap::NONE);
+    let f = fold(&t.model, &t.tokenizer, &data, &opts).unwrap();
     let k = kinds(&f.container);
     eprintln!(
         "logs golden: input {} bytes, container {} bytes, kinds {k:?}, sha256 {}",
@@ -245,6 +257,79 @@ fn golden_logs_container_hash() {
         let opts = UnfoldOptions::new().with_threads(Threads::new(threads).unwrap());
         assert_eq!(unfold(Some(&t.model), &f.container, &opts).unwrap(), data);
     }
+}
+
+#[test]
+fn golden_logs_container_with_the_default_overlap() {
+    // The defaults of the profile logs: K = half of the context (12 for the tiny model).
+    let t = tiny();
+    let data = golden_input();
+    let opts = FoldOptions::new()
+        .with_block_size(BlockSize::new(512).unwrap())
+        .with_profile(FoldProfile::Logs);
+    assert_eq!(opts.effective_overlap(&t.model).unwrap(), Overlap::new(K));
+    let f = fold(&t.model, &t.tokenizer, &data, &opts).unwrap();
+    assert_eq!(f, fold(&t.model, &t.tokenizer, &data, &options(512, FoldProfile::Logs)).unwrap());
+    let k = kinds(&f.container);
+    eprintln!(
+        "logs golden, overlap {K}: input {} bytes, container {} bytes, kinds {k:?}, sha256 {}",
+        data.len(),
+        f.container.len(),
+        hex(&Sha256::digest(&f.container))
+    );
+    assert_eq!(&f.container[90..96], &[3, 0, 1, 0, 12, 0]);
+    assert_eq!(f.stats.overlap, Overlap::new(K));
+    // CONFORMANCE: a change to these values changes the format, the model file, the coder,
+    // the mixer rule or the context rule (ADR 0015).
+    assert_eq!(f.container.len(), 1329, "container length");
+    assert_eq!(
+        hex(&Sha256::digest(&f.container)),
+        "584b60fbd89d3f689cdd75161d43be973ef3c87294680fae1bd0d6f3f7066835"
+    );
+    for threads in [1, 3] {
+        let opts = UnfoldOptions::new().with_threads(Threads::new(threads).unwrap());
+        assert_eq!(unfold(Some(&t.model), &f.container, &opts).unwrap(), data);
+    }
+}
+
+#[test]
+fn golden_logs_container_with_all_defaults() {
+    // `taco fold --profile logs` with no other option: blocks of 64 KiB (LOGS_BLOCK_SIZE) and
+    // K = half of the context (12 for the tiny model). The input has two blocks.
+    let t = tiny();
+    let opts = FoldOptions::new().with_profile(FoldProfile::Logs);
+    assert_eq!(opts.effective_block_size(), taco::LOGS_BLOCK_SIZE);
+    assert_eq!(taco::LOGS_BLOCK_SIZE.get(), 65_536);
+    assert_eq!(FoldProfile::Auto.default_block_size(), taco::LOGS_BLOCK_SIZE);
+    assert_eq!(FoldProfile::Text.default_block_size(), taco::DEFAULT_BLOCK_SIZE);
+    assert_eq!(FoldProfile::Text.default_overlap(&t.model), Overlap::NONE);
+    // NOTE: with blocks of 64 KiB, zstd wins over the tiny model on every input of these tests
+    // (measured), so both blocks are zstd. This vector pins the header of the defaults (block
+    // size, K, coding parts); `golden_logs_container_with_the_default_overlap` pins mixed and
+    // coded bytes with K = 12.
+    let mut data = random_letters(21, 64 * 1024);
+    data.extend(log_lines(22, 4096));
+    let opts = opts.with_threads(Threads::available());
+    let f = fold(&t.model, &t.tokenizer, &data, &opts).unwrap();
+    let k = kinds(&f.container);
+    eprintln!(
+        "logs golden, all defaults: input {} bytes, container {} bytes, kinds {k:?}, sha256 {}",
+        data.len(),
+        f.container.len(),
+        hex(&Sha256::digest(&f.container))
+    );
+    assert_eq!(k, [BlockKind::Zstd, BlockKind::Zstd]);
+    assert_eq!(&f.container[80..84], &65_536u32.to_le_bytes());
+    assert_eq!(&f.container[90..96], &[3, 0, 1, 0, 12, 0]);
+    // CONFORMANCE: a change to these values changes the format, the model file, the coder,
+    // the mixer rule, the context rule or a default of the profile logs.
+    assert_eq!(f.container.len(), 40_241, "container length");
+    assert_eq!(
+        hex(&Sha256::digest(&f.container)),
+        "6cdc1edc5b963b5cebb224d93e824841013b6e668d2e6f3dd3b424d16a5ced77"
+    );
+    let uopts = UnfoldOptions::new().with_threads(Threads::available());
+    assert_eq!(unfold(Some(&t.model), &f.container, &uopts).unwrap(), data);
 }
 
 #[test]
@@ -305,7 +390,8 @@ fn damaged_mixed_blocks_and_header_fields_are_errors() {
         "{r:?}"
     );
     // Without the coding part, the mixed block is refused; with an unknown rule, the header.
-    for (pos, value) in [(90, 0), (92, 2), (92, 0), (88, 0), (90, 3)] {
+    // With the overlap: byte 90 is 3, and K is in bytes 94 and 95 (ADR 0015 §4).
+    for (pos, value) in [(90, 0), (90, 1), (92, 2), (92, 0), (88, 0), (90, 7), (94, 0)] {
         let mut bad = f.container.clone();
         bad[pos] = value;
         let r = unfold(Some(&t.model), &bad, &UnfoldOptions::new());
@@ -325,7 +411,7 @@ fn a_text_container_of_a_coded_block_read_as_mixed_is_an_error() {
     assert_eq!(kinds(&f.container), [BlockKind::Coded]);
     let mut bad = f.container.clone();
     bad[88] = 1; // profile logs
-    bad[90] = 1; // the match model and the mixer
+    bad[90] |= 1; // the match model and the mixer
     bad[92] = 1; // rule version 1
     bad[HEADER_LEN] = 3; // mixed
     assert!(unfold(Some(&t.model), &bad, &UnfoldOptions::new()).is_err());

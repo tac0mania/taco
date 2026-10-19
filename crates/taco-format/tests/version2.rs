@@ -12,8 +12,8 @@ mod common;
 
 use common::{Craft, MODEL, bs, fold, unfold};
 use taco_format::{
-    Block, BlockKind, Checksum, CodingParts, Container, ContainerParams, FormatError, HEADER_LEN,
-    MixerRule, ModelHash, Profile, VERSION, compress_zstd,
+    Block, BlockKind, Checksum, CodingParts, Container, ContainerParams, ContextOverlap,
+    FormatError, HEADER_LEN, MixerRule, ModelHash, Profile, VERSION, compress_zstd,
 };
 
 /// 40 bytes in blocks of 20: block 0 is zstd, block 1 is raw.
@@ -101,8 +101,9 @@ fn reserved_byte_coding_parts_and_coding_parameters_must_be_zero() {
     let mut c = sample(0);
     c.section[1] = 1;
     assert_eq!(parse_err(&c), FormatError::ReservedNotZero { field: "reserved byte 89" });
-    // Bit 0 is the match model and the mixer (ADR 0010); the other bits are unknown.
-    for (lo, hi, parts) in [(2, 0, 2), (0, 0x80, 0x8000), (0xFF, 0xFF, u16::MAX)] {
+    // Bit 0 is the match model and the mixer (ADR 0010), bit 1 the context overlap (ADR
+    // 0015); the other bits are unknown.
+    for (lo, hi, parts) in [(4, 0, 4), (6, 0, 6), (0, 0x80, 0x8000), (0xFF, 0xFF, u16::MAX)] {
         let mut c = sample(1);
         c.section[2] = lo;
         c.section[3] = hi;
@@ -325,4 +326,86 @@ fn writer_writes_version_2_also_without_a_zstd_block() {
     let c = Container::parse(&bytes).unwrap();
     assert_eq!(c.header().version(), VERSION);
     assert!(c.blocks().iter().all(|b| b.kind() == BlockKind::Coded));
+}
+
+/// [`sample`] with the context overlap `k` (bit 1, `K` in the coding parameter bytes 2 and 3,
+/// offsets 94 and 95).
+fn overlap_sample(profile: u8, k: u16) -> Craft {
+    let mut c = sample(profile);
+    c.section[2] = 2;
+    c.section[6..8].copy_from_slice(&k.to_le_bytes());
+    c
+}
+
+#[test]
+fn overlap_parses_in_both_profiles_and_the_writer_gives_the_same_bytes() {
+    for (byte, profile) in [(0, Profile::Text), (1, Profile::Logs)] {
+        for k in [1u16, 12, 512, 1022, u16::MAX] {
+            let bytes = overlap_sample(byte, k).bytes();
+            let c = Container::parse(&bytes).unwrap();
+            let coding = c.header().coding_parts();
+            assert_eq!(coding.overlap(), ContextOverlap::new(k));
+            assert_eq!(coding.mixer(), None);
+            assert_eq!(c.header().profile(), profile);
+            assert_eq!(unfold(&bytes, MODEL).unwrap(), data());
+            let params = ContainerParams::new(MODEL, bs(20))
+                .with_profile(profile)
+                .with_coding(CodingParts::NONE.with_overlap(ContextOverlap::new(k)));
+            let built =
+                Container::build(&params, &data(), &[Block::Zstd(frame()), Block::Raw]).unwrap();
+            assert_eq!(built, bytes);
+            assert_eq!(&built[90..96], &[2, 0, 0, 0, k.to_le_bytes()[0], k.to_le_bytes()[1]]);
+        }
+    }
+}
+
+#[test]
+fn overlap_with_the_mixer_parses_in_the_logs_profile_only() {
+    let mut c = mixed_sample();
+    c.section[2] = 3;
+    c.section[6..8].copy_from_slice(&512u16.to_le_bytes());
+    let bytes = c.bytes();
+    let parsed = Container::parse(&bytes).unwrap();
+    let want = CodingParts::with_mixer(MixerRule::V1).with_overlap(ContextOverlap::new(512));
+    assert_eq!(parsed.header().coding_parts(), want);
+    let params = ContainerParams::new(MODEL, bs(20)).with_profile(Profile::Logs).with_coding(want);
+    let built =
+        Container::build(&params, &data(), &[Block::Zstd(frame()), Block::Mixed(vec![7, 8, 9])])
+            .unwrap();
+    assert_eq!(built, bytes);
+    assert_eq!(&built[90..96], &[3, 0, 1, 0, 0x00, 0x02]);
+    // The profile text refuses the mixer, also with the overlap.
+    c.section[0] = 0;
+    assert_eq!(parse_err(&c), FormatError::CodingPartsNotInProfile { profile: 0, parts: 3 });
+    let params = ContainerParams::new(MODEL, bs(20)).with_coding(want);
+    assert_eq!(
+        Container::build(&params, &data(), &[Block::Zstd(frame()), Block::Raw]),
+        Err(FormatError::CodingPartsNotInProfile { profile: 0, parts: 3 })
+    );
+}
+
+#[test]
+fn overlap_bit_needs_k_and_k_needs_the_bit() {
+    for profile in [0, 1] {
+        assert_eq!(parse_err(&overlap_sample(profile, 0)), FormatError::ZeroContextOverlap);
+        let mut c = sample(profile);
+        for (lo, hi) in [(1, 0), (0, 2), (0xFF, 0xFF)] {
+            c.section[6] = lo;
+            c.section[7] = hi;
+            assert_eq!(parse_err(&c), FormatError::ReservedNotZero { field: "coding parameters" });
+        }
+        // Byte 1 of the coding parameters (offset 93) stays reserved with the overlap.
+        let mut c = overlap_sample(profile, 512);
+        c.section[5] = 1;
+        assert_eq!(parse_err(&c), FormatError::ReservedNotZero { field: "coding parameters" });
+    }
+}
+
+#[test]
+fn a_reader_without_bit_1_refuses_an_overlap_container() {
+    // NOTE: the reader of commit 2bdeac5 (before ADR 0015 §4) checked `bits & !1 != 0` and gave
+    // `UnknownCodingParts`. This test keeps the rule for the next bit: bit 2 is refused.
+    let mut c = overlap_sample(1, 512);
+    c.section[2] = 6;
+    assert_eq!(parse_err(&c), FormatError::UnknownCodingParts { parts: 6 });
 }

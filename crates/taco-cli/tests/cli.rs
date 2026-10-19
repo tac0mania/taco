@@ -80,9 +80,14 @@ fn every_profile_round_trips_and_unfold_needs_no_profile() {
             profile.as_ref(),
             "--block-size".as_ref(),
             "512".as_ref(),
+            // NOTE: the default overlap of logs and auto is half of the context (12 for the
+            // tiny model); text gets the same K, so the three containers are comparable.
+            "--overlap".as_ref(),
+            "12".as_ref(),
         ]);
         let summary = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{summary}");
+        assert!(summary.contains("overlap 12"), "{summary}");
         if profile != "auto" {
             assert!(summary.contains(&format!("profile {profile}")), "{summary}");
         }
@@ -108,4 +113,71 @@ fn bad_arguments_exit_with_code_2() {
     let out = taco(&["fold".as_ref(), "x".as_ref()]);
     // A missing model or file is an error of the run (code 1), not of the arguments.
     assert_eq!(out.status.code(), Some(1));
+}
+
+/// The context overlap `K` of a container: bit 1 of the coding parts (offset 90) and bytes
+/// 94 and 95 (ADR 0015 §4).
+fn overlap_of(container: &[u8]) -> Option<u16> {
+    (container[90] & 2 != 0).then(|| u16::from_le_bytes([container[94], container[95]]))
+}
+
+#[test]
+fn overlap_defaults_by_profile_and_round_trips() {
+    let d = dir("cli_overlap");
+    let model = d.join("tiny.hsm");
+    std::fs::write(&model, common::model_file(1)).unwrap();
+    let input = d.join("text.txt");
+    let data = common::ENGLISH.repeat(3);
+    std::fs::write(&input, &data).unwrap();
+    // (profile, --overlap, the K of the container). The tiny model has a context of 24.
+    let cases: [(&str, Option<&str>, Option<u16>); 6] = [
+        ("text", None, None),
+        ("logs", None, Some(12)),
+        ("auto", None, Some(12)),
+        ("logs", Some("0"), None),
+        ("text", Some("22"), Some(22)),
+        ("logs", Some("1"), Some(1)),
+    ];
+    for (i, (profile, k, want)) in cases.into_iter().enumerate() {
+        let folded = d.join(format!("{i}.taco"));
+        let mut args: Vec<&Path> = vec![
+            "fold".as_ref(),
+            &input,
+            "-o".as_ref(),
+            &folded,
+            "--model".as_ref(),
+            &model,
+            "--profile".as_ref(),
+            profile.as_ref(),
+            "--block-size".as_ref(),
+            "700".as_ref(),
+        ];
+        if let Some(k) = k {
+            args.extend::<[&Path; 2]>(["--overlap".as_ref(), k.as_ref()]);
+        }
+        let out = taco(&args);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let bytes = std::fs::read(&folded).unwrap();
+        assert_eq!(overlap_of(&bytes), want, "case {i}");
+        let back = d.join(format!("{i}.out"));
+        let out =
+            taco(&["unfold".as_ref(), &folded, "-o".as_ref(), &back, "--model".as_ref(), &model]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(std::fs::read(&back).unwrap(), data.as_bytes());
+    }
+    // K > n_ctx - 2 is refused before a byte is written.
+    let bad = d.join("bad.taco");
+    let out = taco(&[
+        "fold".as_ref(),
+        &input,
+        "-o".as_ref(),
+        &bad,
+        "--model".as_ref(),
+        &model,
+        "--overlap".as_ref(),
+        "23".as_ref(),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("overlap 23"));
+    assert!(!bad.exists());
 }

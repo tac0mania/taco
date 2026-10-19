@@ -3,7 +3,9 @@
 Date: 2026-10-18. Status: accepted (proposed by the zstdblock agent). Plan: §3, §9, §11. Shared with
 ADR 0010 (match model and mixer, accepted 2026-10-19) and ADR 0012 (two profiles). Updated on
 2026-10-19 by the profile agent: ADR 0010 §5 gives the coding parts, the coding parameters and
-block kind 3 their meaning (§2 and §3 below).
+block kind 3 their meaning (§2 and §3 below). Updated on 2026-10-19 by the overlap agent (the
+lead's decision): ADR 0015 §4 adds bit 1 of the coding parts, the context overlap, with `K` in
+the coding parameter bytes 2 and 3 (§2 below). The version stays 2.
 
 ## Context
 
@@ -36,11 +38,19 @@ The first 88 bytes have the layout of version 1. Version 2 adds 16 bytes, so the
 | 0 to 87 | 88 | as version 1 | The version field is 2. The flags field is 0. |
 | 88 | 1 | profile | 0 = `text`, 1 = `logs` (ADR 0012). A reader refuses another value. |
 | 89 | 1 | reserved | 0. A reader refuses another value. |
-| 90 | 2 | coding parts | `u16` bit set. Bit 0: the match model and the mixer (ADR 0010 §5). Bits 1 to 15 are reserved and must be 0 (`UnknownCodingParts`). |
-| 92 | 12 | coding parameters | Byte 0: the mixer rule version if bit 0 is set (only version 1 is known; `UnknownMixerRule`), else 0. Bytes 1 to 11: 0 (`ReservedNotZero`). |
+| 90 | 2 | coding parts | `u16` bit set. Bit 0: the match model and the mixer (ADR 0010 §5). Bit 1: the context overlap (ADR 0015 §4). Bits 2 to 15 are reserved and must be 0 (`UnknownCodingParts`). |
+| 92 | 12 | coding parameters | Byte 0: the mixer rule version if bit 0 is set (only version 1 is known; `UnknownMixerRule`), else 0. Byte 1: 0. Bytes 2 and 3 (offsets 94 and 95): the overlap `K`, a little-endian `u16`, if bit 1 is set; `K` must be 1 or more (`ZeroContextOverlap`). Else both bytes are 0. Bytes 4 to 11: 0 (`ReservedNotZero`). |
 
-The profile `text` has no coding part. A reader refuses bit 0 with the profile `text`
-(`CodingPartsNotInProfile`). ADR 0010 §5 has the full rules.
+The profile `text` has no match model and mixer. A reader refuses bit 0 with the profile
+`text` (`CodingPartsNotInProfile`). Both profiles permit bit 1 (ADR 0012, addendum). ADR 0010
+§5 has the full rules of bit 0, ADR 0015 §4 of bit 1.
+
+Each set of coding parts has exactly one encoding: a part that is not set has 0 in its
+parameter bytes, and the overlap part is set only for `K >= 1`. A reader that does not know a
+bit refuses the container (`UnknownCodingParts`). Thus the reader of commit `2bdeac5` and older
+refuses a container with an overlap, and never decodes it with the restart rule of `K = 0`.
+The container does not know the context of the model, so it does not check `K <= n_ctx - 2`.
+The decoder checks it with the model before the first block (`InvalidOverlap`).
 
 The proposed mapping of the first version of this ADR is now the rule (ADR 0010 §5):
 
@@ -158,6 +168,8 @@ All on the Mac (Apple Silicon), zstd 1.5.7, unless stated.
 | Zstd frame of block 2 of vector B | 76 bytes, SHA-256 `4a62d79659c63a4dbc2ea9236d5001543baea7f608f045b4563b8262b11fe83d` (measured) |
 | Golden vector C (version 2): raw-only mode, profile `logs`, 1,000 bytes of phrases, blocks of 256, all zstd | 570 bytes, SHA-256 `72dcd44f9b87a9e0fd7f4be6b6e8de252597ec98eac4b5e0bc5215b06ccb7a59` (measured) |
 | Golden vector: empty data, version 2, raw-only mode, block size 65,536 | 104 bytes, SHA-256 `03de05c54a2e192c7dd046526ef8a3c9882b16465b9ab577b42c3477e130c390` (measured) |
+| Golden vector E (version 2, ADR 0015 §4): vector B with the overlap `K = 512` (profile text) | 329 bytes, SHA-256 `d29fb5c2f32daf836657bb73a9f48d4b9eca966f08aec8c9571eacafdcf80408` (measured); equal to vector B except bytes 90, 94 and 95 |
+| Golden vector F (version 2, ADR 0015 §4): vector D with the overlap `K = 512` (profile logs, the mixer) | 312 bytes, SHA-256 `9555a3e603c93f6f27943855b3faa47d1679200060fd07756ce29441ee75c6b6` (measured); equal to vector D except bytes 90, 94 and 95 |
 | Version 1 vectors A and empty (ADR 0006), hand-made | the hashes of ADR 0006; both parse as version 1 (measured) |
 | A separate Python copy of the version 2 layout, with the zstd frames of the Rust encoder | the same bytes for vectors B, C and empty (measured) |
 | The zstd 1.5.7 CLI decodes the zstd frames of vectors B and C | the original bytes (measured) |
@@ -184,3 +196,5 @@ of 20,230 bytes on both machines, and the flip test gave the same counts (measur
 - An update of the zstd crates needs new conformance vectors and a new cross-machine check.
 - ADR 0010 §5 fills the coding parts, the coding parameters and kind 3 (2026-10-19). Vectors
   A, B, C and both empty vectors do not change. Vector D (ADR 0010 §5.10) is new.
+- ADR 0015 §4 fills bit 1 and the coding parameter bytes 2 and 3 (2026-10-19). Vectors A to D
+  and both empty vectors do not change. Vectors E and F are new.

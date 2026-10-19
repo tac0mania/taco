@@ -25,8 +25,9 @@ mod common;
 use common::{Craft, bs, phrases, splitmix64, unfold};
 use sha2::{Digest, Sha256};
 use taco_format::{
-    Block, BlockKind, Checksum, CodingParts, Container, ContainerParams, MixerRule, ModelHash,
-    Profile, VERSION, VERSION_1, ZSTD_LIBRARY_VERSION, compress_zstd, zstd_library_version,
+    Block, BlockKind, Checksum, CodingParts, Container, ContainerParams, ContextOverlap, MixerRule,
+    ModelHash, Profile, VERSION, VERSION_1, ZSTD_LIBRARY_VERSION, compress_zstd,
+    zstd_library_version,
 };
 
 /// SHA-256 of version 1 vector A (ADR 0006).
@@ -46,6 +47,11 @@ const VECTOR_B_FRAME_SHA256: &str =
 const VECTOR_C_SHA256: &str = "72dcd44f9b87a9e0fd7f4be6b6e8de252597ec98eac4b5e0bc5215b06ccb7a59";
 /// SHA-256 of version 2 vector D (ADR 0010 §5: the coding part and the mixed block kind).
 const VECTOR_D_SHA256: &str = "69578bfc50bee4fa9f8a0eb6f09421ce4a64b1c48ec01e811cad3622eee95af0";
+/// SHA-256 of version 2 vector E (ADR 0015 §4: the context overlap, profile text, K = 512).
+const VECTOR_E_SHA256: &str = "d29fb5c2f32daf836657bb73a9f48d4b9eca966f08aec8c9571eacafdcf80408";
+/// SHA-256 of version 2 vector F (ADR 0015 §4: the overlap and the mixer, profile logs, K =
+/// 512).
+const VECTOR_F_SHA256: &str = "9555a3e603c93f6f27943855b3faa47d1679200060fd07756ce29441ee75c6b6";
 /// SHA-256 of the version 2 container of empty data in the raw-only mode, block size 65,536.
 const VECTOR_EMPTY_V2_SHA256: &str =
     "03de05c54a2e192c7dd046526ef8a3c9882b16465b9ab577b42c3477e130c390";
@@ -141,6 +147,41 @@ fn vector_d() -> Vec<u8> {
     let params = ContainerParams::new(model(), bs(100))
         .with_profile(Profile::Logs)
         .with_coding(CodingParts::with_mixer(MixerRule::V1));
+    Container::build(&params, &data, &blocks).unwrap()
+}
+
+/// The context overlap of vectors E and F: `K = 512`, half of the GPT-2 context.
+const OVERLAP_512: ContextOverlap = ContextOverlap::new(512);
+
+/// Version 2 vector E: vector B with the context overlap `K = 512` (profile text).
+fn vector_e() -> Vec<u8> {
+    let data = vector_b_data();
+    let blocks = [
+        Block::Raw,
+        Block::Coded(b"coded-1".to_vec()),
+        Block::Zstd(vector_b_frame()),
+        Block::Coded(Vec::new()),
+        Block::Zstd(compress_zstd(&data[400..]).unwrap()),
+    ];
+    let params = ContainerParams::new(model(), bs(100))
+        .with_coding(CodingParts::NONE.with_overlap(OVERLAP_512));
+    Container::build(&params, &data, &blocks).unwrap()
+}
+
+/// Version 2 vector F: vector D with the context overlap `K = 512` (profile logs, the match
+/// model and the mixer).
+fn vector_f() -> Vec<u8> {
+    let data = vector_b_data();
+    let blocks = [
+        Block::Raw,
+        Block::Mixed(b"mixed-1".to_vec()),
+        Block::Zstd(vector_b_frame()),
+        Block::Coded(Vec::new()),
+        Block::Mixed(Vec::new()),
+    ];
+    let params = ContainerParams::new(model(), bs(100))
+        .with_profile(Profile::Logs)
+        .with_coding(CodingParts::with_mixer(MixerRule::V1).with_overlap(OVERLAP_512));
     Container::build(&params, &data, &blocks).unwrap()
 }
 
@@ -281,4 +322,27 @@ fn vector_d_has_its_hash_and_the_hand_made_layout() {
         kinds,
         [BlockKind::Raw, BlockKind::Mixed, BlockKind::Zstd, BlockKind::Coded, BlockKind::Mixed]
     );
+}
+
+#[test]
+fn vectors_e_and_f_are_b_and_d_with_bit_1_and_k_at_offsets_94_and_95() {
+    let (b, d, e, f) = (vector_b(), vector_d(), vector_e(), vector_f());
+    println!("vector E: {} bytes, sha256 {}", e.len(), hex(&e));
+    println!("vector F: {} bytes, sha256 {}", f.len(), hex(&f));
+    // Only the coding parts (offset 90) and the parameter bytes 2 and 3 (94, 95) differ.
+    let mut want_e = b.clone();
+    want_e[90] = 2;
+    want_e[94..96].copy_from_slice(&[0x00, 0x02]);
+    assert_eq!(e, want_e);
+    let mut want_f = d.clone();
+    want_f[90] = 3;
+    want_f[94..96].copy_from_slice(&[0x00, 0x02]);
+    assert_eq!(f, want_f);
+    assert_eq!(hex(&e), VECTOR_E_SHA256);
+    assert_eq!(hex(&f), VECTOR_F_SHA256);
+    for (bytes, profile) in [(&e, Profile::Text), (&f, Profile::Logs)] {
+        let c = Container::parse(bytes).unwrap();
+        assert_eq!(c.header().profile(), profile);
+        assert_eq!(c.header().coding_parts().overlap(), OVERLAP_512);
+    }
 }

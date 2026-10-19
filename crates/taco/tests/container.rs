@@ -8,8 +8,8 @@ mod common;
 use common::{CHINESE, ENGLISH, Rng, merge_ids, model_file, tiny};
 use sha2::{Digest, Sha256};
 use taco::{
-    BlockSize, FoldOptions, Model, TacoError, TokenId, Tokenizer, UnfoldOptions, container_hash,
-    fold, unfold,
+    BlockSize, FoldOptions, FoldProfile, Model, Overlap, TacoError, TokenId, Tokenizer,
+    UnfoldOptions, container_hash, container_overlap, fold, unfold,
 };
 use taco_format::{BlockKind, Container, HEADER_LEN, HEADER_LEN_V1, Profile, VERSION, VERSION_1};
 
@@ -66,6 +66,137 @@ fn golden_container_hash() {
         "0b0ba3f1bc8579247476163489ed3155a7828916d27e92f3435e9a8e74157c07"
     );
     assert_eq!(unfold(Some(&t.model), &f.container, &UnfoldOptions::new()).unwrap(), data);
+}
+
+#[test]
+fn golden_container_is_the_same_with_an_explicit_overlap_of_0() {
+    // `--overlap 0` is the rule of ADR 0004 section 9: the golden vector of the profile text
+    // does not change, and the container has no overlap bit.
+    let t = tiny();
+    let data = golden_input();
+    let opts = options(512).with_overlap(Overlap::NONE);
+    let f = fold(&t.model, &t.tokenizer, &data, &opts).unwrap();
+    assert_eq!(f, fold(&t.model, &t.tokenizer, &data, &options(512)).unwrap());
+    assert_eq!(
+        hex(&Sha256::digest(&f.container)),
+        "0b0ba3f1bc8579247476163489ed3155a7828916d27e92f3435e9a8e74157c07"
+    );
+    assert_eq!(&f.container[90..96], &[0; 6]);
+    assert_eq!(container_overlap(&f.container).unwrap(), Overlap::NONE);
+}
+
+/// The overlap of the text golden vector with an overlap: half of the context of 24.
+const GOLDEN_K: Overlap = Overlap::new(12);
+
+#[test]
+fn golden_overlap_container_hash() {
+    // ADR 0015: the input of the golden vector, the profile text, `--overlap 12`.
+    let t = tiny();
+    let data = golden_input();
+    let f = fold(&t.model, &t.tokenizer, &data, &options(512).with_overlap(GOLDEN_K)).unwrap();
+    let parsed = Container::parse(&f.container).unwrap();
+    let kinds: Vec<BlockKind> = parsed.blocks().iter().map(|b| b.kind()).collect();
+    eprintln!(
+        "golden, overlap 12: input {} bytes, container {} bytes, kinds {kinds:?}, sha256 {}",
+        data.len(),
+        f.container.len(),
+        hex(&Sha256::digest(&f.container))
+    );
+    assert_eq!(parsed.header().profile(), Profile::Text);
+    assert_eq!(&f.container[90..96], &[2, 0, 0, 0, 12, 0]);
+    assert_eq!(container_overlap(&f.container).unwrap(), GOLDEN_K);
+    assert_eq!(f.stats.overlap, GOLDEN_K);
+    assert!(f.stats.coded_blocks > 0, "{kinds:?}");
+    // CONFORMANCE: a change to these values changes the format, the model file, the coder or
+    // the context rule (ADR 0015).
+    assert_eq!(f.container.len(), 1660, "container length");
+    assert_eq!(
+        hex(&Sha256::digest(&f.container)),
+        "d705d4b6971fe351f29d14cd5723d3b2a79ced03facae32910bc13d09f3ce340"
+    );
+    for threads in [1, 3] {
+        let opts = UnfoldOptions::new().with_threads(taco::Threads::new(threads).unwrap());
+        assert_eq!(unfold(Some(&t.model), &f.container, &opts).unwrap(), data);
+    }
+}
+
+#[test]
+fn the_overlap_changes_the_coded_bytes_after_the_first_restart_only() {
+    // A block of fewer than n_ctx = 24 tokens never restarts, so K does not change it.
+    let t = tiny();
+    let short = &ENGLISH.as_bytes()[..20];
+    let a = fold(&t.model, &t.tokenizer, short, &options(4096)).unwrap();
+    let b = fold(&t.model, &t.tokenizer, short, &options(4096).with_overlap(GOLDEN_K)).unwrap();
+    assert_eq!(a.container[104..], b.container[104..]);
+    // A long block restarts, and the stored bytes differ.
+    let long = ENGLISH.as_bytes();
+    let a = fold(&t.model, &t.tokenizer, long, &options(4096)).unwrap();
+    let b = fold(&t.model, &t.tokenizer, long, &options(4096).with_overlap(GOLDEN_K)).unwrap();
+    assert_eq!(a.stats.coded_blocks, 1);
+    assert_ne!(a.container[104..], b.container[104..]);
+    eprintln!(
+        "ENGLISH, one block: K = 0 {} bytes, K = 12 {} bytes",
+        a.container.len(),
+        b.container.len()
+    );
+}
+
+#[test]
+fn every_valid_overlap_round_trips_and_a_larger_one_is_refused() {
+    let t = tiny();
+    let data = [ENGLISH.as_bytes(), CHINESE.as_bytes()].concat();
+    let n_ctx = u16::try_from(t.model.n_ctx()).unwrap();
+    for k in 0..=n_ctx - 2 {
+        for profile in [FoldProfile::Text, FoldProfile::Logs] {
+            let opts = options(700).with_overlap(Overlap::new(k)).with_profile(profile);
+            let f = fold(&t.model, &t.tokenizer, &data, &opts).unwrap();
+            assert_eq!(container_overlap(&f.container).unwrap(), Overlap::new(k));
+            let back = unfold(Some(&t.model), &f.container, &UnfoldOptions::new()).unwrap();
+            assert_eq!(back, data, "K = {k}, {profile:?}");
+        }
+    }
+    // Fold refuses K > n_ctx - 2 (ADR 0015 §1).
+    let opts = options(700).with_overlap(Overlap::new(n_ctx - 1));
+    assert_eq!(
+        fold(&t.model, &t.tokenizer, &data, &opts).unwrap_err(),
+        TacoError::Model(hardshell::Error::InvalidOverlap { overlap: n_ctx - 1, n_ctx: 24 })
+    );
+    // Unfold refuses it before a block decodes, also for a container that only claims it.
+    let f = fold(&t.model, &t.tokenizer, &data, &options(700).with_overlap(GOLDEN_K)).unwrap();
+    for bad_k in [n_ctx - 1, n_ctx, u16::MAX] {
+        let mut bad = f.container.clone();
+        bad[94..96].copy_from_slice(&bad_k.to_le_bytes());
+        assert_eq!(
+            unfold(Some(&t.model), &bad, &UnfoldOptions::new()).unwrap_err(),
+            TacoError::Model(hardshell::Error::InvalidOverlap { overlap: bad_k, n_ctx: 24 })
+        );
+    }
+}
+
+#[test]
+fn a_wrong_overlap_in_the_header_is_an_error_never_wrong_output() {
+    // The checksum does not cover the header. A K that is valid but wrong gives other tokens,
+    // and the checksum or the block length refuses them (ADR 0015, consequences).
+    let t = tiny();
+    let data = ENGLISH.as_bytes();
+    let f = fold(&t.model, &t.tokenizer, data, &options(4096).with_overlap(GOLDEN_K)).unwrap();
+    assert_eq!(f.stats.coded_blocks, 1);
+    for k in [1u16, 2, 11, 13, 22] {
+        let mut bad = f.container.clone();
+        bad[94..96].copy_from_slice(&k.to_le_bytes());
+        let r = unfold(Some(&t.model), &bad, &UnfoldOptions::new());
+        assert!(
+            matches!(r, Err(TacoError::CorruptBlock { .. } | TacoError::ChecksumMismatch { .. })),
+            "K = {k}: {r:?}"
+        );
+    }
+    // The bit cleared (K = 0) with the K bytes in place is refused by the parser.
+    let mut bad = f.container.clone();
+    bad[90] = 0;
+    assert!(matches!(
+        unfold(Some(&t.model), &bad, &UnfoldOptions::new()),
+        Err(TacoError::Format(_))
+    ));
 }
 
 /// The golden container of `golden_input` as the version 1 code wrote it (commit `dc621ce`,

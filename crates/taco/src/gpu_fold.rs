@@ -7,10 +7,12 @@
 //! The GPU coder op gives the interval of each token in the table of
 //! `FreqTable::from_weights(weights, 32)`, so only 24 bytes for each token come back. The
 //! encoder codes the interval ([`BlockEncoder::push_interval`]). A block is divided into its
-//! context windows (ADR 0015 section 2 with `K = 0`): window 0 holds the first `n_ctx` tokens;
-//! each later window holds `n_ctx - 1` tokens and starts with a new context that holds
-//! `<|endoftext|>` only. The windows are independent, so they run in parallel slots; the
-//! encoder of a block takes their intervals in token order.
+//! context windows (ADR 0015 section 2, overlap `K`): window 0 codes the first `n_ctx` tokens;
+//! each later window codes `n_ctx - 1 - K` tokens and starts with a new context that holds
+//! `<|endoftext|>` and the `K` tokens before the window (rows whose weights are not used).
+//! The windows are independent, so they run in parallel slots; the encoder of a block takes
+//! their intervals in token order. No window is longer than the context, so the backend never
+//! restarts a slot itself.
 //!
 //! This path is for the profile `text` only. The mixer of the profile `logs` changes the
 //! weights before the table, so it needs all weights of each token. On devbox the read back of
@@ -24,7 +26,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use hardshell::TokenId;
-use hardshell::gpt2::Model;
+use hardshell::gpt2::{Model, Overlap};
 
 use crate::backend::{Backend, Engine};
 use crate::codec::{BlockEncoder, CodedBlock};
@@ -61,8 +63,10 @@ const TEXT_ROWS: usize = 512;
 /// cache (18.9 MB for GPT-2 small).
 const TEXT_SLOTS: usize = 64;
 
-/// Codes `blocks` (profile `text`) on the GPU of `engine`. Each result is the result of
-/// [`crate::codec::encode_block`] for the same tokens and stop length, with no mixer.
+/// Codes `blocks` (profile `text`) on the GPU of `engine`, with the context overlap
+/// `overlap` (ADR 0015). Each result is the result of [`crate::codec::encode_block`] for the
+/// same tokens, stop length and overlap, with no mixer. The caller checked `overlap` against
+/// the model.
 ///
 /// # Errors
 /// [`TacoError::Backend`] on a GPU fault; the errors of the encoders.
@@ -70,10 +74,14 @@ pub(crate) fn code_blocks(
     engine: &Engine<'_>,
     model: &Model,
     mut blocks: Vec<BlockWork>,
+    overlap: Overlap,
 ) -> Result<Vec<CodedBlock>> {
-    let windows = windows_of(&blocks, model.n_ctx());
-    if let Some(mut lanes) = engine.lanes(windows.len().min(TEXT_SLOTS), TEXT_ROWS)? {
-        code_with_intervals(lanes.as_mut(), model, &mut blocks, windows)?;
+    let k = overlap.tokens();
+    let windows = windows_of(&blocks, model.n_ctx(), k);
+    // NOTE: the windows hold their restart rows and are never longer than the context, so the
+    // overlap of the slots (CUDA and wgpu) never acts in fold.
+    if let Some(mut lanes) = engine.lanes(windows.len().min(TEXT_SLOTS), TEXT_ROWS, overlap)? {
+        code_with_intervals(lanes.as_mut(), model, &mut blocks, windows, k)?;
     }
     Ok(blocks.into_iter().map(|b| b.enc.finish()).collect())
 }
@@ -89,15 +97,21 @@ struct Window {
 impl Window {
     /// The rows of the window: the input token of each row, and the token that its weights
     /// code. Window 0 starts with the block start (`<|endoftext|>` codes `t[0]`). A later
-    /// window starts with a new context: `<|endoftext|>` (its weights are not used), then
-    /// `t[first - 1]`, whose weights code `t[first]`, as the restart rule of ADR 0004 section 9.
-    fn rows(self, tokens: &[TokenId], eot: TokenId) -> Vec<(TokenId, Option<TokenId>)> {
+    /// window starts with a new context, as the restart rule of ADR 0015 section 1 with the
+    /// overlap `k`: `<|endoftext|>` and the `k` kept tokens `t[first - 1 - k .. first - 1]`
+    /// (their weights are not used), then `t[first - 1]`, whose weights code `t[first]`.
+    ///
+    /// INVARIANT: a later window has `first >= n_ctx >= k + 2` (`windows_of`), so
+    /// `first - 1 - k >= 1`.
+    fn rows(self, tokens: &[TokenId], eot: TokenId, k: usize) -> Vec<(TokenId, Option<TokenId>)> {
         let t = |i: usize| tokens.get(i).copied().unwrap_or(eot);
-        let mut rows = Vec::with_capacity(self.len + 1);
+        let mut rows = Vec::with_capacity(self.len + k + 1);
         if self.first == 0 {
             rows.push((eot, Some(t(0))));
         } else {
             rows.push((eot, None));
+            let kept = self.first.saturating_sub(1 + k)..self.first - 1;
+            rows.extend(kept.map(|i| (t(i), None)));
             rows.push((t(self.first - 1), Some(t(self.first))));
         }
         for i in self.first + 1..self.first + self.len {
@@ -107,10 +121,11 @@ impl Window {
     }
 }
 
-/// The windows of every block that the encoder does not skip, in block order. Window 0 has
-/// `n_ctx` tokens (positions 0 to `n_ctx - 1`); each later window has `n_ctx - 1` tokens
-/// (positions 1 to `n_ctx - 1`, after `<|endoftext|>`).
-fn windows_of(blocks: &[BlockWork], n_ctx: usize) -> Vec<Window> {
+/// The windows of every block that the encoder does not skip, in block order. Window 0 codes
+/// `n_ctx` tokens (positions 0 to `n_ctx - 1`); each later window codes `n_ctx - 1 - k` tokens
+/// (positions `k + 1` to `n_ctx - 1`, after `<|endoftext|>` and the `k` kept tokens). The
+/// caller checked `k <= n_ctx - 2`.
+fn windows_of(blocks: &[BlockWork], n_ctx: usize, k: usize) -> Vec<Window> {
     let mut out = Vec::new();
     for (block, b) in blocks.iter().enumerate() {
         if !b.needs_model() {
@@ -118,14 +133,14 @@ fn windows_of(blocks: &[BlockWork], n_ctx: usize) -> Vec<Window> {
         }
         let n = b.tokens.len();
         let mut first = 0;
-        // INVARIANT: a model has n_ctx >= 2 (a restart needs two positions), so each window
-        // has at least one token and the loop ends.
+        // INVARIANT: a model has n_ctx >= 2 (a restart needs two positions) and the caller
+        // checked k <= n_ctx - 2, so each window has at least one token and the loop ends.
         let mut size = n_ctx.max(2);
         while first < n {
             let len = size.min(n - first);
             out.push(Window { block, first, len });
             first += len;
-            size = n_ctx.max(2) - 1;
+            size = n_ctx.max(2).saturating_sub(1 + k).max(1);
         }
     }
     out
@@ -152,6 +167,7 @@ fn code_with_intervals(
     model: &Model,
     blocks: &mut [BlockWork],
     windows: Vec<Window>,
+    k: usize,
 ) -> Result<()> {
     let eot = model.eot_token();
     let backend = lanes.backend();
@@ -172,7 +188,7 @@ fn code_with_intervals(
                     && !b.enc.stopped()
                 {
                     lanes.reset(slot);
-                    let rows = w.rows(&b.tokens, eot);
+                    let rows = w.rows(&b.tokens, eot, k);
                     *s = Some(Running { window: w, rows, done: 0, answers: Vec::new(), coded: 0 });
                     break;
                 }
@@ -268,4 +284,71 @@ fn code_answers(
         block.enc.push_interval(a.interval);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use hardshell::TokenId;
+    use hardshell::gpt2::{Model, Overlap, Session, SessionConfig};
+
+    use super::{BlockWork, windows_of};
+
+    /// The committed tiny model of the conformance vectors.
+    const TINY: &[u8] =
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../conformance/tiny.hsm"));
+
+    /// The windows of a block, each run in a fresh session as a GPU slot runs it, give the
+    /// weights of one CPU session with the overlap `k` (ADR 0015 section 2), for every token
+    /// of the block. Thus the GPU fold codes the bytes of the CPU fold.
+    #[test]
+    fn windows_in_fresh_sessions_give_the_weights_of_the_overlap_session() {
+        let model = Model::load(TINY).unwrap();
+        let n_ctx = model.n_ctx();
+        let vocab = u32::try_from(model.vocab_size()).unwrap();
+        let eot = model.eot_token();
+        // About 3.5 contexts of tokens, so a block has several restarts.
+        let n = n_ctx * 7 / 2;
+        let tokens: Vec<TokenId> = (0..n)
+            .map(|i| {
+                let t = TokenId::new(u32::try_from(i * 7919 + 13).unwrap() % vocab);
+                if t == eot { TokenId::new(0) } else { t }
+            })
+            .collect();
+        for k in [0, 1, 2, n_ctx / 4, n_ctx / 2, n_ctx - 3, n_ctx - 2] {
+            let overlap = Overlap::new(u16::try_from(k).unwrap());
+            // The reference: one session with the overlap, the weights before each token.
+            let mut s = Session::with_config(&model, SessionConfig::new().with_overlap(overlap));
+            let mut want = vec![s.start_block().unwrap().to_vec()];
+            for &t in &tokens[..n - 1] {
+                want.push(s.step(t).unwrap().to_vec());
+            }
+            // The windows, each in a fresh session.
+            let work = vec![BlockWork::new(tokens.clone(), 1 << 20).unwrap()];
+            let windows = windows_of(&work, n_ctx, k);
+            assert_eq!(windows.iter().map(|w| w.len).sum::<usize>(), n, "K = {k}");
+            let mut got = Vec::new();
+            let mut fresh = Session::new(&model);
+            for w in windows {
+                let rows = w.rows(&tokens, eot, k);
+                assert!(rows.len() <= n_ctx, "K = {k}: a window is longer than the context");
+                assert_eq!(rows.iter().filter(|r| r.1.is_some()).count(), w.len);
+                for (j, &(input, codes)) in rows.iter().enumerate() {
+                    let weights = if j == 0 {
+                        assert_eq!(input, eot);
+                        fresh.start_block().unwrap()
+                    } else {
+                        fresh.step(input).unwrap()
+                    };
+                    if let Some(t) = codes {
+                        assert_eq!(t, tokens[got.len()], "K = {k}: tokens out of order");
+                        got.push(weights.to_vec());
+                    }
+                }
+            }
+            assert_eq!(got.len(), want.len(), "K = {k}");
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(g == w, "K = {k}: the weights for token {i} differ");
+            }
+        }
+    }
 }

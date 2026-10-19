@@ -146,6 +146,62 @@ proptest! {
         }
     }
 
+    /// Any coding parts field and coding parameters (ADR 0010 §5, ADR 0015 §4) in a valid
+    /// container either are refused, or parse to coding parts that the writer writes back as
+    /// the same 14 bytes. Thus each value has exactly one encoding.
+    #[test]
+    fn coding_fields_parse_to_one_encoding_or_are_refused(
+        logs in any::<bool>(),
+        parts in prop_oneof![0u16..4, any::<u16>()],
+        params in prop_oneof![
+            2 => Just(vec![0u8; 12]),
+            1 => prop::collection::vec(prop_oneof![7 => Just(0u8), 1 => any::<u8>()], 12),
+        ],
+        rule in 0u8..3,
+        k in prop_oneof![Just(0u16), 1u16..2048, any::<u16>()],
+    ) {
+        let mut params = params;
+        params[0] = params[0].wrapping_add(rule);
+        let data = b"0123456789".repeat(3);
+        let mut bytes = fold(&data, bs(16), MODEL);
+        bytes[PROFILE_OFFSET] = u8::from(logs);
+        bytes[90..92].copy_from_slice(&parts.to_le_bytes());
+        bytes[92..104].copy_from_slice(&params);
+        if params[2] == 0 && params[3] == 0 {
+            bytes[94..96].copy_from_slice(&k.to_le_bytes());
+        }
+        match Container::parse(&bytes) {
+            Ok(c) => {
+                let h = c.header();
+                let params = taco_format::ContainerParams::new(MODEL, bs(16))
+                    .with_profile(h.profile())
+                    .with_coding(h.coding_parts());
+                let blocks: Vec<taco_format::Block> = c
+                    .blocks()
+                    .iter()
+                    .map(|b| match b.kind() {
+                        BlockKind::Raw => taco_format::Block::Raw,
+                        BlockKind::Zstd => taco_format::Block::Zstd(b.stored().to_vec()),
+                        _ => taco_format::Block::Coded(b.stored().to_vec()),
+                    })
+                    .collect();
+                let again = Container::build(&params, &data, &blocks).unwrap();
+                prop_assert_eq!(again, bytes);
+            }
+            Err(e) => prop_assert!(
+                matches!(
+                    e,
+                    FormatError::UnknownCodingParts { .. }
+                        | FormatError::UnknownMixerRule { .. }
+                        | FormatError::ReservedNotZero { .. }
+                        | FormatError::ZeroContextOverlap
+                        | FormatError::CodingPartsNotInProfile { .. }
+                ),
+                "{e:?}"
+            ),
+        }
+    }
+
     /// Random bytes, with or without a valid start, never panic the parser.
     #[test]
     fn random_bytes_never_panic(

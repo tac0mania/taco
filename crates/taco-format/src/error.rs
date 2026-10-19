@@ -144,8 +144,8 @@ pub enum FormatError {
         profile: u8,
     },
     /// The coding parts field of a version 2 header has a bit that this reader does not
-    /// define. ADR 0010 defines bit 0 (the match model and the mixer). The other bits are
-    /// reserved.
+    /// define. ADR 0010 defines bit 0 (the match model and the mixer) and ADR 0015 defines bit
+    /// 1 (the context overlap). The other bits are reserved.
     #[error("unknown .taco coding parts {parts:#06x}")]
     UnknownCodingParts {
         /// The coding parts field.
@@ -159,7 +159,7 @@ pub enum FormatError {
         rule: u8,
     },
     /// The coding parts of the header are not permitted with its profile. The profile `text`
-    /// has no coding parts (ADR 0012).
+    /// has no match model and mixer (ADR 0012).
     #[error("the profile {profile} does not permit the coding parts {parts:#06x}")]
     CodingPartsNotInProfile {
         /// The profile byte.
@@ -167,6 +167,10 @@ pub enum FormatError {
         /// The coding parts field.
         parts: u16,
     },
+    /// The coding parts have the context overlap (bit 1), and `K` in bytes 2 and 3 of the
+    /// coding parameters is 0. A container without an overlap clears bit 1 (ADR 0015 §4).
+    #[error("the coding parts have the context overlap, and its K is 0")]
+    ZeroContextOverlap,
     /// A mixed block (kind 3) is in a container whose coding parts do not have the match model
     /// and the mixer, or the writer received a mixed block for such a container.
     #[error("block {block} is mixed, but the container has no match model and mixer")]

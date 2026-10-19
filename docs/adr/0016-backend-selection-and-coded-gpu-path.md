@@ -79,9 +79,11 @@ The golden coder vector `91676cdc…798f` does not change.
 5. The stop rule of ADR 0007 §5.2 applies as on the CPU. When both candidates of a block
    stopped, the windows of the block that did not start are skipped.
 
-When ADR 0015 adds `K > 0`, the windows change to `<|endoftext|>`, the `K` kept tokens, and
-`n_ctx - 1 - K` new tokens. The window function in `crates/taco/src/gpu_fold.rs` is the only
-place to change.
+Update of 2026-10-19 (the overlap agent, ADR 0015): the windows have the overlap `K` of the
+container: `<|endoftext|>`, the `K` kept tokens, and `n_ctx - 1 - K` new tokens
+(`crates/taco/src/gpu_fold.rs`). CUDA and wgpu both support every `K`; unfold uses the overlap
+of the backend batch (`CudaBatch::set_overlap`, `GpuBatch::with_overlap`), and the backend
+starts a full context again with the last `K` tokens.
 
 ### 4. The coded GPU path of unfold
 

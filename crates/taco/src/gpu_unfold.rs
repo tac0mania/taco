@@ -19,7 +19,7 @@
 use std::collections::VecDeque;
 
 use hardshell::TokenId;
-use hardshell::gpt2::Model;
+use hardshell::gpt2::{Model, Overlap};
 
 use crate::backend::Engine;
 use crate::codec::BlockDecoder;
@@ -43,7 +43,8 @@ struct Lane<'a> {
 /// The decoded bytes and the faults of the jobs: `(part, bytes)` and `(block index, error)`.
 pub(crate) type Decoded = (Vec<(usize, Vec<u8>)>, Vec<(u32, TacoError)>);
 
-/// Decodes `jobs` on the GPU of `engine`.
+/// Decodes `jobs` on the GPU of `engine`. Each slot starts its context again with the last
+/// `overlap` tokens when it is full (ADR 0015), inside the backend.
 ///
 /// # Errors
 /// [`TacoError::Backend`] on a fault of the GPU. A damaged block is not an error of this
@@ -53,12 +54,15 @@ pub(crate) fn decode_jobs<'a>(
     model: &Model,
     jobs: Vec<Job<'a>>,
     threads: Threads,
+    overlap: Overlap,
 ) -> Result<Decoded> {
     let mut done = Vec::new();
     let mut errors = Vec::new();
-    // NOTE: one row for each slot in a step; a restart adds one row for its slot.
-    let rows = jobs.len().clamp(2, MAX_ROWS);
-    let Some(mut lanes) = engine.lanes(jobs.len(), rows)? else {
+    // NOTE: one row for each slot in a step; a restart adds `K + 1` rows for its slot. With an
+    // overlap the passes have room for MAX_ROWS rows, so a restart of K = 512 takes 3 passes
+    // and not 257 passes of 2 rows.
+    let rows = if overlap.is_none() { jobs.len().clamp(2, MAX_ROWS) } else { MAX_ROWS };
+    let Some(mut lanes) = engine.lanes(jobs.len(), rows, overlap)? else {
         return Err(TacoError::WorkerFailed);
     };
     let lanes = lanes.as_mut();

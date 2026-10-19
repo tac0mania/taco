@@ -10,7 +10,7 @@
 use core::fmt;
 
 use hardshell::TokenId;
-use hardshell::gpt2::{Model, Session};
+use hardshell::gpt2::{Model, Overlap, Session};
 use hardshell_cuda::{CudaDevice, CudaModel};
 use hardshell_gpu::{AdapterChoice, GpuDevice, GpuModel};
 use taco_coder::{FreqBits, FreqTable, Symbol};
@@ -142,20 +142,30 @@ impl Engine<'_> {
     }
 
     /// Makes the GPU slots for a job of `jobs` independent sequences. `rows` is the most rows
-    /// of one pass on CUDA. `None` for the CPU engine.
-    pub(crate) fn lanes(&self, jobs: usize, rows: usize) -> Result<Option<Box<dyn Lanes + '_>>> {
+    /// of one pass on CUDA. A slot whose context is full starts again with the last `overlap`
+    /// tokens (ADR 0015). `None` for the CPU engine.
+    ///
+    /// # Errors
+    /// [`TacoError::Backend`] if the device refuses the slots or the overlap. `rows` has no
+    /// effect on the wgpu backend.
+    pub(crate) fn lanes(
+        &self,
+        jobs: usize,
+        rows: usize,
+        overlap: Overlap,
+    ) -> Result<Option<Box<dyn Lanes + '_>>> {
         match self.kind {
             Kind::Cpu => Ok(None),
             Kind::Cuda(m) => {
                 let slots = cuda_slots(m, jobs, rows)?;
-                Ok(Some(Box::new(CudaLanes::new(m, slots, rows)?)))
+                Ok(Some(Box::new(CudaLanes::new(m, slots, rows, overlap)?)))
             }
             Kind::Gpu(m) => {
                 // NOTE: halve the slots until the device accepts the buffers (the largest
                 // binding of a device limits them).
                 let mut slots = jobs.clamp(1, MAX_GPU_SLOTS);
                 loop {
-                    match GpuLanes::new(m, slots) {
+                    match GpuLanes::new(m, slots, overlap) {
                         Ok(l) => return Ok(Some(Box::new(l))),
                         Err(e) if slots == 1 => return Err(e),
                         Err(_) => slots /= 2,
@@ -175,15 +185,24 @@ const MAX_GPU_SLOTS: usize = 32;
 /// research note section 4.1).
 const MAX_CUDA_SLOTS: usize = 224;
 
+/// The bytes of the CUDA work buffers for each row of a pass, for each token of the
+/// vocabulary: the larger of the two model-file versions.
+///
+/// NOTE: est. about `20 * vocab` bytes for a model of version 1 and about `24 * vocab` for a
+/// wide model of version 2 (`CudaBatch::new`, the cudawide agent). The larger value serves
+/// both, so the slot count does not overflow the GPU memory for either version.
+const CUDA_ROW_BYTES_PER_VOCAB: u64 = 24;
+
 /// The slots that fit in the free memory of the device: three quarters of the free memory,
-/// less the work buffers of `rows` rows (about `20 * vocab` bytes each, est., `CudaBatch::new`),
-/// divided by the KV cache of one slot.
+/// less the work buffers of `rows` rows ([`CUDA_ROW_BYTES_PER_VOCAB`] times the vocabulary
+/// each), divided by the KV cache of one slot.
 fn cuda_slots(model: &CudaModel<'_>, jobs: usize, rows: usize) -> Result<usize> {
     let (free, _) = model.device().memory().map_err(|e| Backend::Cuda.fault(e))?;
     let free = u64::try_from(free).unwrap_or(u64::MAX);
     let vocab = u64::try_from(model.vocab_size()).unwrap_or(u64::MAX);
     let rows = u64::try_from(rows).unwrap_or(u64::MAX);
-    let budget = (free / 4 * 3).saturating_sub(rows.saturating_mul(24).saturating_mul(vocab));
+    let budget = (free / 4 * 3)
+        .saturating_sub(rows.saturating_mul(CUDA_ROW_BYTES_PER_VOCAB).saturating_mul(vocab));
     let per_slot = model.cache_bytes_per_slot().max(1);
     let fit = usize::try_from(budget / per_slot).unwrap_or(usize::MAX);
     if fit == 0 {
@@ -194,7 +213,7 @@ fn cuda_slots(model: &CudaModel<'_>, jobs: usize, rows: usize) -> Result<usize> 
 
 /// Opens the backend that `choice` selects, loads `model` on it, checks it, and calls `f`
 /// with the engine. `model_file` is the model file that `model` was loaded from; a GPU
-/// backend loads it again into GPU memory.
+/// backend loads it again into GPU memory. Every backend has the context overlap (ADR 0015).
 ///
 /// With [`BackendChoice::Auto`], a backend that is missing or that fails its self-test is
 /// skipped, and [`Engine::notes`] says why. With an explicit choice, that failure is the
@@ -317,7 +336,7 @@ const SELF_TEST_STEPS: u32 = 6;
 /// the GPU does not give the bits of the reference path (CLAUDE.md §1 rule 10).
 fn self_test(engine: &Engine<'_>, model: &Model) -> Result<()> {
     let backend = engine.backend();
-    let Some(mut lanes) = engine.lanes(1, 16)? else { return Ok(()) };
+    let Some(mut lanes) = engine.lanes(1, 16, Overlap::NONE)? else { return Ok(()) };
     let bits = FreqBits::new(FREQ_BITS)?;
     let tokens = test_tokens(model);
     let mut session = Session::new(model);

@@ -1,6 +1,6 @@
 //! `unfold`: a `.taco` container back to the original bytes (plan §4).
 
-use hardshell::gpt2::{Batch, BatchInput, Model};
+use hardshell::gpt2::{Batch, BatchInput, Model, Overlap};
 use taco_format::{BlockKind, BlockRef, Container, FormatError, MixerRule};
 
 use crate::backend::{Backend, Engine};
@@ -44,6 +44,16 @@ impl UnfoldOptions {
     }
 }
 
+/// The context overlap `K` of a container (ADR 0015 §4): [`Overlap::NONE`] for a container
+/// without the coding part. Cost: one parse of the header and the block table, no copy.
+///
+/// # Errors
+/// [`TacoError::Format`] if the container is not valid.
+pub fn container_overlap(container: &[u8]) -> Result<Overlap> {
+    let parsed = Container::parse(container)?;
+    Ok(Overlap::new(parsed.header().coding_parts().overlap().get()))
+}
+
 /// Restores the original bytes from a `.taco` container (plan §4).
 ///
 /// The steps:
@@ -51,9 +61,12 @@ impl UnfoldOptions {
 /// 1. Parse and check the container (ADR 0006). The parser does not copy block data.
 /// 2. Refuse the container if it needs a model and `model` is `None`, or if its model hash is
 ///    not the hash of `model` (plan §3 rule 3). A container in the raw-only mode needs no
-///    model.
+///    model. Refuse a context overlap that is not valid for the model (`K > n_ctx - 2`,
+///    ADR 0015).
 /// 3. Decode each coded block with a new HardShell context: the range decoder gives token
-///    ids, and the vocabulary gives their bytes. The decoder never tokenizes. Decode each mixed
+///    ids, and the vocabulary gives their bytes. When the context is full, it starts again
+///    with the last `K` tokens of the block (the overlap of the header, ADR 0015). The
+///    decoder never tokenizes. Decode each mixed
 ///    block in the same way, with a new match model and mixer of the rule version of the
 ///    header between HardShell and the table (ADR 0010 section 4). Copy each raw block.
 ///    Decode each zstd block (ADR 0011 §5) without the model. Each thread decodes groups of up
@@ -79,6 +92,7 @@ impl UnfoldOptions {
 /// - [`TacoError::Format`] if the container is not valid, or a zstd block does not decode to
 ///   its length (`FormatError::CorruptZstdBlock`).
 /// - [`TacoError::ModelRequired`] or [`TacoError::ModelHashMismatch`] for a wrong model.
+/// - [`TacoError::Model`] with `InvalidOverlap` if the overlap is not valid for the model.
 /// - [`TacoError::OutputTooLarge`] if the original length is more than the limit.
 /// - [`TacoError::CorruptBlock`] if a coded block does not decode to its length.
 /// - [`TacoError::ChecksumMismatch`] if the restored bytes have a different SHA-256.
@@ -129,9 +143,13 @@ pub fn unfold_with(
     }
     let blocks = parsed.blocks();
     let rule = header.coding_parts().mixer();
+    let overlap = Overlap::new(header.coding_parts().overlap().get());
+    if let Some(m) = model {
+        m.check_overlap(overlap)?;
+    }
     let parts: Vec<Vec<u8>> = match model {
         Some(m) if engine.backend() != Backend::Cpu => {
-            decode_on_gpu(engine, m, rule, blocks, options.threads)?
+            decode_on_gpu(engine, m, (rule, overlap), blocks, options.threads)?
         }
         _ => {
             // Groups of up to MAX_LANES blocks decode in lockstep on one thread (the batch path of
@@ -149,7 +167,7 @@ pub fn unfold_with(
                 |batch: &mut Option<Batch<'_>>, g| {
                     let end = ((g + 1) * group_size).min(blocks.len());
                     let group = blocks.get(g * group_size..end).unwrap_or(&[]);
-                    decode_group(model, rule, batch, group_size, group)
+                    decode_group(model, (rule, overlap), batch, group_size, group)
                 },
             )?;
             group_parts.into_iter().flatten().collect()
@@ -182,13 +200,13 @@ const MAX_LANES: usize = 8;
 /// Decodes one group of blocks: raw blocks are copied, zstd blocks are decoded, and the coded
 /// and mixed blocks run in lockstep in the lanes of `batch` (made on the first use, with
 /// `lanes` lanes). `rule` is the mixer rule version of the header, if the container has the
-/// match model and the mixer.
+/// match model and the mixer, and `overlap` the context overlap of the header.
 ///
 /// If several blocks of the group fail, the result is the error of the block with the lowest
 /// index, so the error does not depend on the grouping.
 fn decode_group<'m>(
     model: Option<&'m Model>,
-    rule: Option<MixerRule>,
+    (rule, overlap): (Option<MixerRule>, Overlap),
     batch: &mut Option<Batch<'m>>,
     lanes: usize,
     group: &[BlockRef<'_>],
@@ -233,7 +251,7 @@ fn decode_group<'m>(
         }
     }
     if let (Some(m), false) = (model, lane_of.is_empty()) {
-        let batch = batch.get_or_insert_with(|| Batch::new(m, lanes));
+        let batch = batch.get_or_insert_with(|| Batch::new(m, lanes).with_overlap(overlap));
         let mut inputs: Vec<Option<BatchInput>> = vec![None; batch.lanes()];
         for (input, lane) in inputs.iter_mut().zip(&lane_of) {
             *input = lane.as_ref().map(|_| BatchInput::Start);
@@ -280,7 +298,7 @@ fn decode_group<'m>(
 fn decode_on_gpu(
     engine: &Engine<'_>,
     model: &Model,
-    rule: Option<MixerRule>,
+    (rule, overlap): (Option<MixerRule>, Overlap),
     blocks: &[BlockRef<'_>],
     threads: Threads,
 ) -> Result<Vec<Vec<u8>>> {
@@ -332,7 +350,7 @@ fn decode_on_gpu(
         }
     }
     if !jobs.is_empty() {
-        let (done, failed) = decode_jobs(engine, model, jobs, threads)?;
+        let (done, failed) = decode_jobs(engine, model, jobs, threads, overlap)?;
         for (part, bytes) in done {
             if let Some(p) = parts.get_mut(part) {
                 *p = Some(bytes);

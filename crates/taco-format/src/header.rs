@@ -4,14 +4,12 @@
 //! The first 88 bytes have the same layout in both versions. Version 2 adds 16 bytes (ADR
 //! 0011 §2): the profile (ADR 0012) and the coding parts of the `logs` profile (ADR 0010 §5).
 
+use crate::coding::{CODING_PARAMS_LEN, CodingParts};
 use crate::error::{FormatError, Result};
 use crate::layout::{HEADER_LEN_V1_U64, expected_block_count, header_len};
-use crate::types::{BlockSize, Checksum, CodingParts, ModelHash, Profile};
+use crate::types::{BlockSize, Checksum, ModelHash, Profile};
 use crate::writer::ContainerParams;
 use crate::{HEADER_LEN, HEADER_LEN_V1, MAGIC, VERSION, VERSION_1};
-
-/// The length of the coding parameters field of the version 2 header, in bytes.
-const CODING_PARAMS_LEN: usize = 12;
 
 /// The fields of a valid header of version 1 or version 2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,7 +17,7 @@ pub struct Header {
     /// INVARIANT: [`VERSION_1`] or [`VERSION`].
     version: u16,
     profile: Profile,
-    /// INVARIANT: [`CodingParts::NONE`] for version 1 and for the profile `text`.
+    /// INVARIANT: [`CodingParts::NONE`] for version 1. No mixer for the profile `text`.
     coding: CodingParts,
     model_hash: ModelHash,
     original_len: u64,
@@ -71,8 +69,10 @@ impl Header {
         self.profile
     }
 
-    /// The coding parts of the container (ADR 0010 §5): [`CodingParts::NONE`] for version 1
-    /// and for the profile `text`. A mixed block needs [`CodingParts::mixer`].
+    /// The coding parts of the container (ADR 0010 §5, ADR 0015 §4): [`CodingParts::NONE`]
+    /// for version 1. The profile `text` has no mixer. A mixed block needs
+    /// [`CodingParts::mixer`]. [`CodingParts::overlap`] is the context overlap of every coded
+    /// and mixed block.
     #[must_use]
     pub const fn coding_parts(&self) -> CodingParts {
         self.coding
@@ -256,16 +256,17 @@ fn read_common(version: u16, bytes: &[u8; HEADER_LEN_V1]) -> Result<Header> {
     })
 }
 
-/// Refuses coding parts that the profile does not permit: the profile `text` has no coding
-/// parts (ADR 0012). The profile `logs` permits every defined part, and also none (for
-/// example a container in the raw-only mode).
+/// Refuses coding parts that the profile does not permit: the profile `text` has no match
+/// model and mixer (ADR 0012). Both profiles permit the context overlap (ADR 0015). The
+/// profile `logs` permits every defined part, and also none (for example a container in the
+/// raw-only mode).
 ///
 /// # Errors
 ///
 /// [`FormatError::CodingPartsNotInProfile`].
 pub(crate) fn check_profile(profile: Profile, coding: CodingParts) -> Result<()> {
     match profile {
-        Profile::Text if !coding.is_none() => Err(FormatError::CodingPartsNotInProfile {
+        Profile::Text if coding.mixer().is_some() => Err(FormatError::CodingPartsNotInProfile {
             profile: profile.as_u8(),
             parts: coding.bits(),
         }),
@@ -285,7 +286,8 @@ fn read_v2_section(bytes: &[u8]) -> Result<(Profile, CodingParts)> {
         return Err(FormatError::ReservedNotZero { field: "reserved byte 89" });
     }
     // ADR 0010 §5: bit 0 is the match model and the mixer, with the rule version in byte 0 of
-    // the coding parameters. Every other bit and byte is reserved and must be 0.
+    // the coding parameters. ADR 0015 §4: bit 1 is the context overlap, with K in bytes 2 and
+    // 3. Every other bit and byte is reserved and must be 0.
     let parts = u16::from_le_bytes(take(&mut rest)?);
     let params: [u8; CODING_PARAMS_LEN] = take(&mut rest)?;
     let coding = CodingParts::read(parts, &params)?;
