@@ -213,10 +213,31 @@ impl Mixer {
                 top_w = w;
             }
         }
-        let q = self.probability(u128::from(wp), total, pred.length, top == p);
-        self.pending = Some(Pending { token: pred.token, ..q });
-        apply(weights, p, total, top_w, q.q);
+        let q = self.mix_stats(total, wp, top == p, Some(pred)).unwrap_or(1);
+        apply(weights, p, total, top_w, q);
         Ok(())
+    }
+
+    /// Rules 1 to 4 and the pending state of [`Mixer::mix`] from the statistics of the weights:
+    /// `total = sum(w)`, `predicted = w[p]`, and `agree` (`p` is the token with the largest
+    /// weight, the lowest id on a tie). Gives `q`, or `None` without a prediction. A later
+    /// [`Mixer::update`] gives the state that `mix` and `update` give.
+    ///
+    /// This is the host step of the mixed coder op of a GPU (`hardshell-cuda`,
+    /// `MIXED-INTEGRATION.md` section 3): the GPU gives the statistics, and the mixer state
+    /// stays on the host. [`Mixer::mix`] uses it, so one code path sets the state. Cost: O(1).
+    pub fn mix_stats(
+        &mut self,
+        total: u128,
+        predicted: u64,
+        agree: bool,
+        prediction: Option<Prediction>,
+    ) -> Option<u32> {
+        self.pending = None;
+        let pred = prediction?;
+        let q = self.probability(u128::from(predicted), total, pred.length, agree);
+        self.pending = Some(Pending { token: pred.token, ..q });
+        Some(q.q)
     }
 
     /// Updates the state with the actual token (rule 7). It does nothing if the last call
