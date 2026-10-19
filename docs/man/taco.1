@@ -1,0 +1,420 @@
+.\" The manual page of taco(1). Source: the usage text in crates/taco-cli/src/args.rs and the
+.\" planned model commands of docs/design/model-distribution.md. Keep the two in agreement.
+.\" Sections marked PLANNED describe commands and options that this version does not have.
+.\" Check the page with: mandoc -T lint docs/man/taco.1
+.TH TACO 1 2026-10-19 "taco 0.1.0" "User Commands"
+.SH NAME
+taco \- lossless compression with an integer language model
+.SH SYNOPSIS
+.B taco fold
+.I input
+.RB [ \-o
+.IR output ]
+.RB [ \-\-model
+.IR path.hsm ]
+.RB [ \-\-profile
+.BR text | logs | auto ]
+.RB [ \-\-block\-size
+.IR bytes ]
+.RB [ \-\-backend
+.BR auto | cuda | gpu | cpu ]
+.RB [ \-\-threads
+.IR n ]
+.RB [ \-f ]
+.PP
+.B taco unfold
+.I input.taco
+.RB [ \-o
+.IR output ]
+.RB [ \-\-model
+.IR path.hsm ]
+.RB [ \-\-backend
+.BR auto | cuda | gpu | cpu ]
+.RB [ \-\-threads
+.IR n ]
+.RB [ \-f ]
+.PP
+.B taco
+.BR \-h | \-\-help
+.PP
+PLANNED:
+.B taco model
+.BR list | fetch | verify | import | path
+.RI [ arguments ]
+.br
+PLANNED:
+.B taco
+.BR \-V | \-\-version
+.SH DESCRIPTION
+.B taco
+is a lossless compressor.
+A language model (GPT\-2 small) predicts the next token of the data, and a range coder keeps
+only the part that the model did not predict.
+The engine, HardShell, uses only integer arithmetic.
+Thus every machine calculates the same predictions, bit for bit, and a file that one machine
+folds unfolds on every other machine.
+.PP
+.B taco fold
+compresses
+.I input
+into
+.IR input .taco.
+.B taco unfold
+restores
+.I input.taco
+into the input name without
+.BR .taco .
+The container stores the SHA\-256 of the original data.
+.B taco unfold
+verifies it, and a mismatch is an error, never a wrong output.
+.PP
+The container also stores the SHA\-256 of the model file.
+.B taco unfold
+refuses a model file with a different hash.
+A block that does not become smaller is stored raw, so the output grows by the header and a
+small amount for each block only.
+.SH COMMANDS
+.TP
+.B fold
+Compress
+.I input
+into
+.IR input .taco,
+or into the file of
+.BR \-o .
+.TP
+.B unfold
+Restore
+.I input.taco
+into the input name without
+.BR .taco ,
+or into the file of
+.BR \-o .
+The input name must end with
+.B .taco
+when
+.B \-o
+is not given.
+.TP
+.B help
+Show the usage text.
+The same as
+.BR \-\-help .
+.SH OPTIONS
+.TP
+.BR \-o ", " \-\-output " \fIpath\fR"
+The output file.
+.TP
+.BR \-m ", " \-\-model " \fIpath.hsm\fR"
+The model file.
+The default is the file in the environment variable
+.BR TACO_MODEL .
+.B fold
+needs a model.
+.B unfold
+needs the model whose hash is in the container, except for a container that holds only raw
+blocks.
+PLANNED: the value can also be a model name (for example
+.BR gpt2 )
+or a hash, and
+.B taco
+then finds the file in the model directories (see MODEL FILES).
+.TP
+.BI \-\-profile " name"
+.B fold
+only.
+.B text
+uses GPT\-2 alone.
+.B logs
+uses GPT\-2, the match model and the mixer.
+.B auto
+(the default) uses
+.B logs
+for a block that gets smaller with it, else
+.BR text .
+.B unfold
+reads the profile from the file.
+.TP
+.BI \-\-block\-size " bytes"
+.B fold
+only.
+The number of input bytes in each block.
+The default is 16384.
+The minimum is 1.
+.TP
+.BI \-\-backend " name"
+Where the model runs.
+.B cuda
+uses an NVIDIA GPU through the CUDA driver.
+.B gpu
+uses wgpu (Metal, Vulkan, DX12 or OpenGL).
+.B cpu
+uses the processor.
+.B auto
+(the default) uses the first of
+.BR cuda ,
+.B gpu
+and
+.B cpu
+that passes a self\-test.
+The output is the same on every backend.
+.B fold
+with the profile
+.B logs
+or
+.B auto
+runs on the CPU.
+An explicit
+.B cuda
+or
+.B gpu
+that does not work is an error.
+.TP
+.BI \-\-threads " n"
+The number of worker threads.
+The default is all CPUs.
+The output does not change with the number of threads.
+.TP
+.BR \-f ", " \-\-force
+Replace an output file that exists.
+.TP
+.BR \-h ", " \-\-help
+Show the usage text.
+.TP
+.BR \-V ", " \-\-version
+PLANNED.
+Show the version of
+.BR taco ,
+the container versions that it reads and writes, and the hashes of the models that it knows.
+.TP
+.B \-\-offline
+PLANNED.
+.BR fold ,
+.B unfold
+and
+.B model fetch
+do not download a model.
+The same as
+.BR TACO_OFFLINE=1 .
+.SH MODEL COMMANDS (PLANNED)
+These commands are not in this version.
+.I docs/design/model\-distribution.md
+specifies them.
+A model is named by its name (for example
+.BR gpt2 )
+or by its SHA\-256 (64 hexadecimal digits, or a unique prefix of 8 or more digits).
+.TP
+.BR "taco model list" " [\-\-all]"
+Show each model that
+.B taco
+knows, its SHA\-256, its size, and the path of the file if the file is in a model directory.
+With
+.BR \-\-all ,
+also show the other model files in the model directories.
+.TP
+.BR "taco model fetch" " [\fIname\fR|\fIhash\fR ...] [\-\-all] [\-\-offline]"
+Download each named model (the default is the models of the profiles
+.B text
+and
+.BR logs ),
+verify its SHA\-256, and put it in the user model directory.
+A model that is already there is not downloaded again.
+.TP
+.BR "taco model verify" " [\fIname\fR|\fIhash\fR|\fIpath\fR ...]"
+Calculate the SHA\-256 of each model file and compare it with the published hash.
+With no argument, verify every file in the model directories.
+.TP
+.BR "taco model import" " \fIpath\fR [\-\-expect \fIhash\fR]"
+Verify the file at
+.I path
+and copy it into the user model directory.
+Use this command on a machine without network access.
+.TP
+.BR "taco model path" " \fIname\fR|\fIhash\fR"
+Show the path of the model file.
+The exit status is 1 if no model directory has the file.
+.SH MODEL FILES
+A model file
+.RB ( .hsm )
+holds the integer weights, the tables and the vocabulary.
+A model file never changes after its release.
+Its SHA\-256 identifies it.
+.PP
+This version uses the file of
+.B \-\-model
+or
+.BR TACO_MODEL .
+PLANNED: when neither is given,
+.B taco
+looks for the file
+.IB hash .hsm
+in these directories, in this sequence, and uses the first file that it finds:
+.IP 1. 4
+The directories in
+.B TACO_MODEL_PATH
+(separated by
+.B :
+or, on Windows,
+.BR ; ).
+.PD 0
+.IP 2. 4
+The user model directory:
+.B TACO_MODEL_DIR
+if it is set, else
+.I ~/.local/share/taco/models
+on Linux
+.RB ( $XDG_DATA_HOME/taco/models
+if
+.B XDG_DATA_HOME
+is set),
+.I ~/Library/Application Support/taco/models
+on macOS, and
+.I %LOCALAPPDATA%\etaco\emodels
+on Windows.
+.IP 3. 4
+The directory
+.I models
+next to the
+.B taco
+program.
+.IP 4. 4
+The system model directory:
+.I /usr/local/share/taco/models
+and
+.I /usr/share/taco/models
+on Linux,
+.I /Library/Application Support/taco/models
+on macOS, and
+.I %PROGRAMDATA%\etaco\emodels
+on Windows.
+.PD
+.PP
+PLANNED: if no directory has the file,
+.B taco
+downloads it one time into the user model directory and verifies its SHA\-256 before use.
+.B \-\-offline
+or
+.B TACO_OFFLINE=1
+prevents the download.
+.SH ENVIRONMENT
+.TP
+.B TACO_MODEL
+The model file, if
+.B \-\-model
+is not given.
+.TP
+.B TACO_MODEL_DIR
+PLANNED.
+The user model directory.
+.TP
+.B TACO_MODEL_PATH
+PLANNED.
+More directories to search for model files, before the user model directory.
+.TP
+.B TACO_OFFLINE
+PLANNED.
+If the value is
+.BR 1 ,
+.B taco
+does not download a model.
+.TP
+.B TACO_MODEL_URL
+PLANNED.
+A base URL that replaces the built\-in download locations, for example a mirror on a private
+network.
+.B taco
+downloads
+.IB TACO_MODEL_URL / hash .hsm
+and verifies its SHA\-256.
+.TP
+.B WGPU_BACKEND
+Limits the wgpu backend to one of
+.BR vulkan ,
+.BR metal ,
+.B dx12
+or
+.BR gl .
+.TP
+.B WGPU_DX12_COMPILER
+On Windows, the DX12 shader compiler of wgpu:
+.B dxc
+needs
+.I dxcompiler.dll
+on the search path.
+See NOTES.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+An error: a file that cannot be read or written, a model with the wrong hash, a damaged
+container, a checksum mismatch, or a backend that does not work.
+.TP
+.B 2
+The arguments are not valid.
+.SH FILES
+.TP
+.IB name .taco
+A container: the header, the block table, the blocks, the model hash and the checksum.
+.TP
+.IB hash .hsm
+A model file in a model directory (PLANNED).
+.SH EXAMPLES
+Compress a file, then restore it:
+.PP
+.RS 4
+.EX
+taco fold notes.txt \-\-model gpt2.hsm
+taco unfold notes.txt.taco \-\-model gpt2.hsm
+.EE
+.RE
+.PP
+Compress a log file with the profile logs into a given output, on the CPU:
+.PP
+.RS 4
+.EX
+export TACO_MODEL=$HOME/models/gpt2.hsm
+taco fold app.log \-\-profile logs \-\-backend cpu \-o app.log.taco
+.EE
+.RE
+.PP
+PLANNED: download the models one time, then work without a network:
+.PP
+.RS 4
+.EX
+taco model fetch
+taco model verify
+TACO_OFFLINE=1 taco unfold notes.txt.taco
+.EE
+.RE
+.SH NOTES
+The speed depends on the backend.
+.B fold
+is faster than
+.BR unfold ,
+because
+.B unfold
+decodes one token after the other in each block.
+.PP
+The CUDA backend needs an NVIDIA driver and a GPU with compute capability 8.0 or more.
+It needs no CUDA toolkit: the kernels are in the program, and the driver compiles them at run
+time.
+.PP
+On Windows, the DX12 backend of wgpu needs the DXC shader compiler
+.RI ( dxcompiler.dll ).
+Without it, wgpu uses the old FXC compiler, which cannot compile all kernels of
+.BR taco .
+.SH SEE ALSO
+.BR xz (1),
+.BR zstd (1)
+.PP
+The design:
+.IR docs/design/plan.md .
+The model files:
+.IR docs/design/model\-distribution.md .
+.SH LICENSE
+Apache\-2.0.
+The model file
+.I gpt2.hsm
+comes from the GPT\-2 weights of OpenAI under the Modified MIT License.

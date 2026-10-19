@@ -1,0 +1,26 @@
+taco @VERSION@: install
+=====================
+
+1. Put the program @EXE@ in a directory that is on your PATH.
+2. Optional (Linux and macOS): put taco.1 in a man directory, for example
+   /usr/local/share/man/man1/. Then "man taco" shows the manual.
+3. Get the model file gpt2.hsm (127,237,568 bytes). Its SHA-256 must be
+   aaa03eb96e9ad7957432168c8ac6b4a99ed55d57e637e4786a664b51001ba5c2
+   This archive does not contain it. The model archive of the release
+   (taco-model-gpt2-aaa03eb9.tar) contains it.
+4. Tell taco where the model is: give --model <path> or set TACO_MODEL.
+
+Use:
+
+    taco fold notes.txt --model gpt2.hsm          (makes notes.txt.taco)
+    taco unfold notes.txt.taco --model gpt2.hsm   (restores notes.txt)
+
+GPU: taco uses an NVIDIA GPU through the CUDA driver, or another GPU through
+wgpu (Metal, Vulkan, DX12). It needs no CUDA toolkit. Without a GPU, taco uses
+the CPU. The output is the same on every machine and every backend.
+
+Check the files of this archive: "sha256sum -c SHA256SUMS" (Linux) or
+"shasum -a 256 -c SHA256SUMS" (macOS).
+
+THIRD-PARTY-LICENSES.txt lists the licences of the libraries in the program.
+BUILDINFO records the commit and the toolchain of this build.
