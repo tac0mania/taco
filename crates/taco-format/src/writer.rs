@@ -167,15 +167,15 @@ fn to_u64(x: usize, part: &'static str) -> Result<u64> {
 }
 
 /// The stored bytes of one block, after the checks.
-struct Stored<'a> {
-    kind: BlockKind,
-    bytes: &'a [u8],
+pub(crate) struct Stored<'a> {
+    pub(crate) kind: BlockKind,
+    pub(crate) bytes: &'a [u8],
     /// INVARIANT: `bytes.len()`, at most the block size, so it fits in `u32`.
-    len: u32,
+    pub(crate) len: u32,
 }
 
 /// Checks one block against its original bytes and gives the bytes to store.
-fn stored<'a>(
+pub(crate) fn stored<'a>(
     index: u32,
     block: &'a Block,
     original: &'a [u8],
@@ -256,6 +256,7 @@ impl Container<'_> {
         }
 
         check_profile(params.profile, params.coding)?;
+        params.block_size.check_max()?;
         let mut parts = Vec::with_capacity(blocks.len());
         let mut total = header_and_table_len(HEADER_LEN_U64, u64::from(count))?;
         let lens = OriginalLens::new(original_len, params.block_size);

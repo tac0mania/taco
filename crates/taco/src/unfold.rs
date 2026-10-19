@@ -1,7 +1,7 @@
 //! `unfold`: a `.taco` container back to the original bytes (plan §4).
 
 use hardshell::gpt2::{Batch, BatchInput, Model, Overlap};
-use taco_format::{BlockKind, BlockRef, Container, FormatError, MixerRule};
+use taco_format::{BlockKind, BlockRef, Container, FormatError, Header, MixerRule};
 
 use crate::backend::{Backend, Engine};
 use crate::codec::BlockDecoder;
@@ -122,6 +122,41 @@ pub fn unfold_with(
 ) -> Result<Vec<u8>> {
     let parsed = Container::parse(container)?;
     let header = parsed.header();
+    let model = checked_model(header, model, options)?;
+    let parts = decode_blocks(engine, model, header, parsed.blocks(), options.threads)?;
+    let total: usize = parts.iter().map(Vec::len).sum();
+    let mut out = Vec::with_capacity(total);
+    for p in &parts {
+        out.extend_from_slice(p);
+    }
+    drop(parts);
+    header.verify_checksum(&out).map_err(checksum_error)?;
+    Ok(out)
+}
+
+/// The error of a failed checksum check, as [`TacoError::ChecksumMismatch`].
+pub(crate) fn checksum_error(e: FormatError) -> TacoError {
+    match e {
+        FormatError::ChecksumMismatch { expected, found } => {
+            TacoError::ChecksumMismatch { expected, found }
+        }
+        other => TacoError::Format(other),
+    }
+}
+
+/// Checks the model and the limits of `options` against `header`, before any block decodes
+/// (steps 2 and the limit of [`unfold`]). Gives the model that the blocks use: `None` for a
+/// container in the raw-only mode without a model.
+///
+/// # Errors
+///
+/// [`TacoError::ModelRequired`], [`TacoError::ModelHashMismatch`],
+/// [`TacoError::OutputTooLarge`], or [`TacoError::Model`] with `InvalidOverlap`.
+pub(crate) fn checked_model<'m>(
+    header: &Header,
+    model: Option<&'m Model>,
+    options: &UnfoldOptions,
+) -> Result<Option<&'m Model>> {
     let model = match (header.needs_model(), model) {
         (false, m) => m,
         (true, None) => return Err(TacoError::ModelRequired { container: header.model_hash() }),
@@ -141,15 +176,40 @@ pub fn unfold_with(
     {
         return Err(TacoError::OutputTooLarge { original_len: header.original_len(), limit });
     }
-    let blocks = parsed.blocks();
+    if let Some(m) = model {
+        m.check_overlap(Overlap::new(header.coding_parts().overlap().get()))?;
+    }
+    // TODO(phase-3): decode mixer rule version 2 (the skip rule, ADR 0017 §4) in `mix.rs` and
+    // `codec.rs`. Until then this decoder refuses it, so it never decodes a rule 2 block with
+    // the rules of version 1.
+    if let Some(rule) = header.coding_parts().mixer()
+        && rule != MixerRule::V1
+    {
+        return Err(TacoError::Format(FormatError::UnknownMixerRule { rule: rule.as_u8() }));
+    }
+    Ok(model)
+}
+
+/// Decodes `blocks` of a container with `header` (step 3 of [`unfold`]) and gives the original
+/// bytes of each block, in order. `model` is the result of [`checked_model`]. The result of
+/// each block does not depend on the other blocks, so a caller can decode a large container in
+/// parts (`crate::stream`).
+///
+/// # Errors
+///
+/// The block errors of [`unfold`], and [`TacoError::Backend`] on a fault of the GPU.
+pub(crate) fn decode_blocks(
+    engine: &Engine<'_>,
+    model: Option<&Model>,
+    header: &Header,
+    blocks: &[BlockRef<'_>],
+    threads: Threads,
+) -> Result<Vec<Vec<u8>>> {
     let rule = header.coding_parts().mixer();
     let overlap = Overlap::new(header.coding_parts().overlap().get());
-    if let Some(m) = model {
-        m.check_overlap(overlap)?;
-    }
-    let parts: Vec<Vec<u8>> = match model {
+    match model {
         Some(m) if engine.backend() != Backend::Cpu => {
-            decode_on_gpu(engine, m, (rule, overlap), blocks, options.threads)?
+            decode_on_gpu(engine, m, (rule, overlap), blocks, threads)
         }
         _ => {
             // Groups of up to MAX_LANES blocks decode in lockstep on one thread (the batch path of
@@ -158,11 +218,10 @@ pub fn unfold_with(
             // NOTE: lanes come before threads. On the M2, 2 blocks of alice29 (32 KiB) unfold in 48.9 s
             // on 1 thread with 2 lanes, and in 86.5 s on 2 threads with 1 lane each (measured).
             let fill = blocks.len().min(MIN_LANES);
-            let group_size =
-                blocks.len().div_ceil(options.threads.get()).max(fill).clamp(1, MAX_LANES);
+            let group_size = blocks.len().div_ceil(threads.get()).max(fill).clamp(1, MAX_LANES);
             let group_parts = map_blocks(
                 blocks.len().div_ceil(group_size),
-                options.threads,
+                threads,
                 || None,
                 |batch: &mut Option<Batch<'_>>, g| {
                     let end = ((g + 1) * group_size).min(blocks.len());
@@ -170,22 +229,9 @@ pub fn unfold_with(
                     decode_group(model, (rule, overlap), batch, group_size, group)
                 },
             )?;
-            group_parts.into_iter().flatten().collect()
+            Ok(group_parts.into_iter().flatten().collect())
         }
-    };
-    let total: usize = parts.iter().map(Vec::len).sum();
-    let mut out = Vec::with_capacity(total);
-    for p in &parts {
-        out.extend_from_slice(p);
     }
-    drop(parts);
-    header.verify_checksum(&out).map_err(|e| match e {
-        FormatError::ChecksumMismatch { expected, found } => {
-            TacoError::ChecksumMismatch { expected, found }
-        }
-        other => TacoError::Format(other),
-    })?;
-    Ok(out)
 }
 
 /// The smallest number of lanes of a group when the container has that many blocks.

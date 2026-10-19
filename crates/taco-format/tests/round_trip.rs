@@ -184,7 +184,7 @@ fn one_byte_is_one_raw_block() {
 #[test]
 fn one_block_holds_data_smaller_than_the_block_size() {
     let data = vec![7u8; 1000];
-    let bytes = round_trip(&data, u32::MAX);
+    let bytes = round_trip(&data, taco_format::MAX_BLOCK_SIZE.get());
     let c = Container::parse(&bytes).unwrap();
     assert_eq!(c.blocks().len(), 1);
     assert_eq!(c.blocks()[0].kind(), BlockKind::Coded);

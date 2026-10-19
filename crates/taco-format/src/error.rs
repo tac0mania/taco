@@ -48,6 +48,15 @@ pub enum FormatError {
     /// The block size is 0.
     #[error("the block size is 0")]
     ZeroBlockSize,
+    /// The block size is more than [`crate::MAX_BLOCK_SIZE`] (64 MiB), the largest block size
+    /// of versions 1 and 2 (ADR 0011, addendum "Version 2 is frozen", §4).
+    #[error("the block size {block_size} is more than the maximum {max}")]
+    BlockSizeTooLarge {
+        /// The block size of the header or of the writer.
+        block_size: u32,
+        /// The maximum.
+        max: u32,
+    },
     /// The block count is not `ceil(original length / block size)`.
     #[error(
         "{found} blocks for {original_len} bytes in blocks of {block_size}: expected {expected}"
@@ -196,6 +205,36 @@ pub enum FormatError {
     LengthOverflow {
         /// The part whose length is too large.
         part: &'static str,
+    },
+    /// A stream gave a block with a wrong number of stored bytes.
+    #[error("block {block} has {found} stored bytes, the block table gives {expected}")]
+    StoredLengthMismatch {
+        /// The index of the block.
+        block: u32,
+        /// The stored length in the block table.
+        expected: u32,
+        /// The number of bytes that the caller gave.
+        found: u64,
+    },
+    /// The stream writer received a block of 0 bytes, a block longer than the block size, or a
+    /// block after a short block. Only the last block can be shorter than the block size.
+    #[error("block {block} has {found} bytes; the block size is {block_size}")]
+    BlockLengthMismatch {
+        /// The index of the block.
+        block: u32,
+        /// The block size.
+        block_size: u32,
+        /// The length of the block.
+        found: u64,
+    },
+    /// The stream writer received a different number of bytes than the caller stated before
+    /// the start. For example, the input file changed during the fold.
+    #[error("the input has {found} bytes, {expected} were expected")]
+    InputLengthMismatch {
+        /// The length that the caller stated.
+        expected: u64,
+        /// The length that the writer received.
+        found: u64,
     },
     /// The restored data has a different length than the header states.
     #[error("the restored data has {found} bytes, the header states {expected}")]

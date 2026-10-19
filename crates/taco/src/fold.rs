@@ -288,22 +288,178 @@ pub fn fold_with(
     input: &[u8],
     options: &FoldOptions,
 ) -> Result<Folded> {
-    if tokenizer.vocab_size() != model.vocab_size() {
-        return Err(TacoError::TokenizerMismatch {
-            tokenizer: tokenizer.vocab_size(),
-            model: model.vocab_size(),
-        });
+    let plan = FoldPlan::new(model, tokenizer, options)?;
+    let chunks: Vec<&[u8]> = plan.block_size.split(input).collect();
+    let coded = code_segment(engine, model, tokenizer, &plan, (0, &chunks), &|_| {})?;
+    let mut stats = FoldStats::default();
+    let mut blocks = Vec::with_capacity(coded.len());
+    for (block, text_stored, tokens) in coded {
+        stats.count_block(&block, text_stored, tokens)?;
+        blocks.push(block);
     }
-    let block_size = options.effective_block_size();
-    let overlap = options.effective_overlap(model)?;
-    let chunks: Vec<&[u8]> = block_size.split(input).collect();
-    let rule = match options.profile {
-        FoldProfile::Text => None,
-        FoldProfile::Logs | FoldProfile::Auto => Some(MixerRule::V1),
-    };
+    let (profile, coding) = plan.container_parts(stats.mixed_blocks);
+    let params = ContainerParams::new(container_hash(model), plan.block_size)
+        .with_profile(profile)
+        .with_coding(coding);
+    let container = Container::build(&params, input, &blocks)?;
+    stats.finish(&plan, engine, profile, to_u64(input.len())?, to_u64(container.len())?)?;
+    Ok(Folded { container, stats })
+}
+
+/// `n` as a `u64`, or [`TacoError::InputTooLarge`].
+fn to_u64(n: usize) -> Result<u64> {
+    u64::try_from(n).map_err(|_| TacoError::InputTooLarge { reason: "length" })
+}
+
+/// One coded block: the selected form, its stored length with the profile `text`, and the
+/// number of tokens.
+pub(crate) type CodedResult = (Block, usize, u64);
+
+/// The checked settings of one fold. [`fold_with`] and the stream fold (`crate::stream`) use
+/// the same plan, so they code each block in the same way.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FoldPlan {
+    /// The block size of the container.
+    pub(crate) block_size: BlockSize,
+    /// The context overlap `K`, checked against the model.
+    pub(crate) overlap: Overlap,
+    rule: Option<MixerRule>,
+    profile: FoldProfile,
+    threads: Threads,
+    /// [`FoldOptions::uses_gpu`].
+    uses_gpu: bool,
+}
+
+impl FoldPlan {
+    /// Checks `options` against `model` and `tokenizer`.
+    ///
+    /// # Errors
+    /// [`TacoError::TokenizerMismatch`], or [`TacoError::Model`] with `InvalidOverlap`.
+    pub(crate) fn new(model: &Model, tokenizer: &Tokenizer, options: &FoldOptions) -> Result<Self> {
+        if tokenizer.vocab_size() != model.vocab_size() {
+            return Err(TacoError::TokenizerMismatch {
+                tokenizer: tokenizer.vocab_size(),
+                model: model.vocab_size(),
+            });
+        }
+        let rule = match options.profile {
+            FoldProfile::Text => None,
+            FoldProfile::Logs | FoldProfile::Auto => Some(MixerRule::V1),
+        };
+        Ok(Self {
+            block_size: options.effective_block_size(),
+            overlap: options.effective_overlap(model)?,
+            rule,
+            profile: options.profile,
+            threads: options.threads,
+            uses_gpu: options.uses_gpu(),
+        })
+    }
+
+    /// `true` if HardShell runs on the GPU of `engine` (the profile `text` on a GPU engine).
+    pub(crate) fn on_gpu(&self, engine: &Engine<'_>) -> bool {
+        // NOTE: the profiles `logs` and `auto` run on the CPU on every engine. Their mixer needs
+        // all weights of each token, and the read back made the CUDA fold slower than the CPU
+        // fold: 128 KiB of `apache_access.log` took 162.8 s with CUDA and 141.4 s on 6 CPU
+        // threads (measured, devbox, ADR 0016 section 5).
+        engine.backend() != Backend::Cpu && self.uses_gpu
+    }
+
+    /// The profile and the coding parts while the blocks are coded: the parts of the profile
+    /// `logs` for `logs` and `auto`, so that a mixed block is permitted.
+    pub(crate) fn block_parts(&self) -> (Profile, CodingParts) {
+        let overlap = ContextOverlap::new(self.overlap.get());
+        match self.rule {
+            None => (Profile::Text, CodingParts::NONE.with_overlap(overlap)),
+            Some(rule) => (Profile::Logs, CodingParts::with_mixer(rule).with_overlap(overlap)),
+        }
+    }
+
+    /// The profile and the coding parts of the container after all blocks, with
+    /// `mixed_blocks` mixed blocks. [`FoldProfile::Auto`] gives the text container if no block
+    /// is mixed. Then the blocks are the blocks of the profile `text`, because a block is mixed
+    /// only if the mixed payload wins.
+    pub(crate) fn container_parts(&self, mixed_blocks: u64) -> (Profile, CodingParts) {
+        let overlap = ContextOverlap::new(self.overlap.get());
+        // ADR 0015 §4: the container stores K for all blocks, in both profiles.
+        match (self.profile, mixed_blocks, self.rule) {
+            (FoldProfile::Text, _, _) | (FoldProfile::Auto, 0, _) | (_, _, None) => {
+                (Profile::Text, CodingParts::NONE.with_overlap(overlap))
+            }
+            (_, _, Some(rule)) => {
+                (Profile::Logs, CodingParts::with_mixer(rule).with_overlap(overlap))
+            }
+        }
+    }
+}
+
+impl FoldStats {
+    /// Adds one coded block to the numbers.
+    pub(crate) fn count_block(
+        &mut self,
+        block: &Block,
+        text_stored: usize,
+        tokens: u64,
+    ) -> Result<()> {
+        if self.blocks == 0 {
+            self.text_container_len = to_u64(HEADER_LEN)?;
+        }
+        self.blocks += 1;
+        self.tokens += tokens;
+        self.text_container_len += to_u64(TABLE_ENTRY_LEN + text_stored)?;
+        match block {
+            Block::Coded(_) => self.coded_blocks += 1,
+            Block::Mixed(_) => self.mixed_blocks += 1,
+            Block::Zstd(_) => self.zstd_blocks += 1,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Sets the numbers that are known at the end.
+    pub(crate) fn finish(
+        &mut self,
+        plan: &FoldPlan,
+        engine: &Engine<'_>,
+        profile: Profile,
+        original_len: u64,
+        container_len: u64,
+    ) -> Result<()> {
+        if self.blocks == 0 {
+            self.text_container_len = to_u64(HEADER_LEN)?;
+        }
+        self.original_len = original_len;
+        self.container_len = container_len;
+        self.profile = profile;
+        self.backend = if plan.on_gpu(engine) { engine.backend() } else { Backend::Cpu };
+        self.overlap = plan.overlap;
+        Ok(())
+    }
+}
+
+/// Codes the blocks `chunks` (the blocks `first_block..` of the input) with `plan`, and gives
+/// each block in order. `on_block(len)` runs after each block with its input length, on the
+/// thread that coded it. The result of each block does not depend on the other blocks of the
+/// call, so a caller can code a large input in parts (`crate::stream`).
+///
+/// # Errors
+///
+/// The block errors of [`fold`], and [`TacoError::Backend`] on a fault of the GPU.
+pub(crate) fn code_segment(
+    engine: &Engine<'_>,
+    model: &Model,
+    tokenizer: &Tokenizer,
+    plan: &FoldPlan,
+    (first_block, chunks): (u64, &[&[u8]]),
+    on_block: &(dyn Fn(usize) + Sync),
+) -> Result<Vec<CodedResult>> {
+    let rule = plan.rule;
     let prepare = |i: usize| -> Result<(Vec<TokenId>, Vec<u8>)> {
-        let index = u32::try_from(i)
-            .map_err(|_| TacoError::InputTooLarge { reason: "more than u32::MAX blocks" })?;
+        let index = u64::try_from(i)
+            .ok()
+            .and_then(|i| i.checked_add(first_block))
+            .and_then(|i| u32::try_from(i).ok())
+            .ok_or(TacoError::InputTooLarge { reason: "more than u32::MAX blocks" })?;
         let data = chunks.get(i).copied().unwrap_or(&[]);
         let tokens = tokenizer.encode(data);
         if !tokens_restore(model, &tokens, data) {
@@ -318,70 +474,38 @@ pub fn fold_with(
         let text_len = text.stored_len(len);
         (text.or_mixed(len, coded.mixed), text_len, coded.tokens)
     };
-    // NOTE: the profiles `logs` and `auto` run on the CPU on every engine. Their mixer needs all
-    // weights of each token, and the read back made the CUDA fold slower than the CPU fold:
-    // 128 KiB of `apache_access.log` took 162.8 s with CUDA and 141.4 s on 6 CPU threads
-    // (measured, devbox, ADR 0016 section 5).
-    let on_gpu = engine.backend() != Backend::Cpu && options.uses_gpu();
-    let config = SessionConfig::new().with_chunk(FOLD_CHUNK).with_overlap(overlap);
-    let coded = if !on_gpu {
-        map_blocks(
+    let config = SessionConfig::new().with_chunk(FOLD_CHUNK).with_overlap(plan.overlap);
+    if !plan.on_gpu(engine) {
+        return map_blocks(
             chunks.len(),
-            options.threads,
+            plan.threads,
             || Session::with_config(model, config),
             |session, i| {
                 let (tokens, zstd) = prepare(i)?;
-                let stop = chunks.get(i).map_or(0, |d| d.len()).min(zstd.len());
-                let coded = encode_block(session, &tokens, stop, rule.map(MixState::new))?;
+                let len = chunks.get(i).map_or(0, |d| d.len());
+                let coded =
+                    encode_block(session, &tokens, len.min(zstd.len()), rule.map(MixState::new))?;
+                on_block(len);
                 Ok(choose(i, coded, zstd))
             },
-        )?
-    } else {
-        let prepared = map_blocks(chunks.len(), options.threads, || (), |(), i| prepare(i))?;
-        let mut work = Vec::with_capacity(prepared.len());
-        let mut frames = Vec::with_capacity(prepared.len());
-        for (i, (tokens, zstd)) in prepared.into_iter().enumerate() {
-            let stop = chunks.get(i).map_or(0, |d| d.len()).min(zstd.len());
-            work.push(BlockWork::new(tokens, stop)?);
-            frames.push(zstd);
-        }
-        let coded = code_blocks(engine, model, work, overlap)?;
-        coded.into_iter().zip(frames).enumerate().map(|(i, (c, z))| choose(i, c, z)).collect()
-    };
-    let to_u64 =
-        |n: usize| u64::try_from(n).map_err(|_| TacoError::InputTooLarge { reason: "length" });
-    let mut stats = FoldStats::default();
-    let mut blocks = Vec::with_capacity(coded.len());
-    let mut text_len = to_u64(HEADER_LEN)?;
-    for (block, text_stored, tokens) in coded {
-        stats.blocks += 1;
-        stats.tokens += tokens;
-        text_len += to_u64(TABLE_ENTRY_LEN + text_stored)?;
-        match block {
-            Block::Coded(_) => stats.coded_blocks += 1,
-            Block::Mixed(_) => stats.mixed_blocks += 1,
-            Block::Zstd(_) => stats.zstd_blocks += 1,
-            _ => {}
-        }
-        blocks.push(block);
+        );
     }
-    // FoldProfile::Auto: the text container if no block is mixed. Then the blocks are the
-    // blocks of the profile `text`, because a block is mixed only if the mixed payload wins.
-    let (profile, coding) = match (options.profile, stats.mixed_blocks) {
-        (FoldProfile::Text, _) | (FoldProfile::Auto, 0) => (Profile::Text, CodingParts::NONE),
-        _ => (Profile::Logs, CodingParts::with_mixer(MixerRule::V1)),
-    };
-    // ADR 0015 §4: the container stores K for all blocks, in both profiles.
-    let coding = coding.with_overlap(ContextOverlap::new(overlap.get()));
-    let params = ContainerParams::new(container_hash(model), block_size)
-        .with_profile(profile)
-        .with_coding(coding);
-    let container = Container::build(&params, input, &blocks)?;
-    stats.original_len = to_u64(input.len())?;
-    stats.container_len = to_u64(container.len())?;
-    stats.profile = profile;
-    stats.text_container_len = text_len;
-    stats.backend = if on_gpu { engine.backend() } else { Backend::Cpu };
-    stats.overlap = overlap;
-    Ok(Folded { container, stats })
+    let prepared = map_blocks(chunks.len(), plan.threads, || (), |(), i| prepare(i))?;
+    let mut work = Vec::with_capacity(prepared.len());
+    let mut frames = Vec::with_capacity(prepared.len());
+    for (i, (tokens, zstd)) in prepared.into_iter().enumerate() {
+        let stop = chunks.get(i).map_or(0, |d| d.len()).min(zstd.len());
+        work.push(BlockWork::new(tokens, stop)?);
+        frames.push(zstd);
+    }
+    let coded = code_blocks(engine, model, work, plan.overlap)?;
+    Ok(coded
+        .into_iter()
+        .zip(frames)
+        .enumerate()
+        .map(|(i, (c, z))| {
+            on_block(chunks.get(i).map_or(0, |d| d.len()));
+            choose(i, c, z)
+        })
+        .collect())
 }

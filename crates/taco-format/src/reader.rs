@@ -23,6 +23,17 @@ pub struct BlockRef<'a> {
 }
 
 impl<'a> BlockRef<'a> {
+    /// A block from its parts. The caller checked them (the table reader of the stream).
+    pub(crate) const fn from_parts(
+        index: u32,
+        kind: BlockKind,
+        original_offset: u64,
+        original_len: u32,
+        stored: &'a [u8],
+    ) -> Self {
+        Self { index, kind, original_offset, original_len, stored }
+    }
+
     /// The index of the block in the container, from 0.
     #[must_use]
     pub const fn index(&self) -> u32 {
@@ -96,7 +107,7 @@ fn to_usize(x: u64, part: &'static str) -> Result<usize> {
 }
 
 /// Decodes and checks one entry of the block table of a container of `header.version()`.
-fn entry(
+pub(crate) fn entry(
     index: u32,
     bytes: &[u8; TABLE_ENTRY_LEN],
     original_len: u32,

@@ -3,7 +3,7 @@
 //!
 //! | Bit of the coding parts (offset 90) | Part | Parameter bytes (offset 92 + i) |
 //! |---|---|---|
-//! | 0 | The match model and the mixer (ADR 0010 §5) | Byte 0: the mixer rule version (1). |
+//! | 0 | The match model and the mixer (ADR 0010 §5) | Byte 0: the mixer rule version (1 or 2, ADR 0017). |
 //! | 1 | The context overlap (ADR 0015) | Bytes 2 and 3: `K`, a little-endian `u16`, 1 or more. |
 //! | 2 to 15 | Reserved: a reader refuses them | |
 //!
@@ -28,12 +28,19 @@ impl MixerRule {
     /// Mixer rule version 1: ADR 0010 sections 2 and 3.
     pub const V1: Self = Self(1);
 
+    /// Mixer rule version 2: rule version 1 and the skip rule (ADR 0017 §4 and §5). A skipped
+    /// position codes the flag symbol with the table `[q_s, 2^16 - q_s]` and, after a miss, the
+    /// token with `taco_match::skip_miss_weights`. The format reads it (frozen version 2); the
+    /// writer of `taco` writes rule version 1 by default (an owner decision).
+    pub const V2: Self = Self(2);
+
     /// The rule version of a byte, or `None` if this reader does not know the version.
     #[must_use]
     #[inline]
     pub const fn from_u8(byte: u8) -> Option<Self> {
         match byte {
             1 => Some(Self::V1),
+            2 => Some(Self::V2),
             _ => None,
         }
     }
@@ -203,11 +210,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mixer_rule_1_is_the_only_rule() {
+    fn mixer_rules_1_and_2_are_the_only_rules() {
         for b in 0..=255u8 {
-            assert_eq!(MixerRule::from_u8(b), (b == 1).then_some(MixerRule::V1));
+            let expected = match b {
+                1 => Some(MixerRule::V1),
+                2 => Some(MixerRule::V2),
+                _ => None,
+            };
+            assert_eq!(MixerRule::from_u8(b), expected);
         }
-        assert_eq!(MixerRule::V1.as_u8(), 1);
+        assert_eq!((MixerRule::V1.as_u8(), MixerRule::V2.as_u8()), (1, 2));
     }
 
     #[test]
@@ -260,7 +272,9 @@ mod tests {
                 Err(FormatError::UnknownCodingParts { parts: bits })
             );
         }
-        for rule in [0, 2, 0xFF] {
+        p[0] = 2;
+        assert_eq!(CodingParts::read(1, &p).map(|c| c.mixer()), Ok(Some(MixerRule::V2)));
+        for rule in [0, 3, 0xFF] {
             p[0] = rule;
             assert_eq!(CodingParts::read(1, &p), Err(FormatError::UnknownMixerRule { rule }));
         }

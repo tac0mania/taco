@@ -110,3 +110,17 @@ A separate Python copy of the layout gave the same two hashes (measured).
 - A change to any rule above changes which files are valid. It needs a new container version
   and new conformance vectors (plan §3 rule 8, §11).
 - The block size is free in version 1. Plan §13 question 3 selects the default block size.
+
+## Addendum (2026-10-19): the freeze and the largest block size
+
+Status: proposed by the streamfreeze agent; the lead decided the rule (fuzz findings F1 and F5).
+
+1. Version 1 stays readable in every later reader (plan §3 rule 8). The writer does not write
+   it (ADR 0011 §1). The rules above stay, with one change.
+2. Change to §4.1: the block size is at least 1 and at most 67,108,864 bytes (64 MiB). A
+   reader refuses a larger block size with `BlockSizeTooLarge` before it reads the table. ADR
+   0011, addendum "Version 2 is frozen", §4 gives the reason. No version 1 file with a block
+   size above 64 KiB exists: version 1 was not released.
+3. The test that a version 1 file still unfolds: `golden_v1_container_still_unfolds`
+   (`crates/taco/tests/container.rs`), and `the_version_1_vector_still_unfolds`
+   (`crates/taco-cli/tests/conformance.rs`, also with the stream reader of ADR 0018).

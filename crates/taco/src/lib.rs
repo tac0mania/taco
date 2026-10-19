@@ -73,7 +73,12 @@ mod lanes;
 mod mix;
 mod parallel;
 mod payload;
+pub mod stream;
 pub mod tokenizer;
+
+/// The container crate (`taco-format`), for callers that read or check `.taco` files
+/// directly (for example the conformance tests of `taco-cli`).
+pub use taco_format as format;
 mod unfold;
 
 pub use backend::{Backend, BackendChoice, BackendNote, Engine, with_engine};
@@ -83,7 +88,7 @@ pub use fold::{FoldOptions, FoldProfile, FoldStats, Folded, fold, fold_with};
 pub use hardshell::TokenId;
 pub use hardshell::gpt2::{Model, Overlap};
 pub use parallel::Threads;
-pub use taco_format::{BlockSize, Checksum, ModelHash, Profile};
+pub use taco_format::{BlockSize, Checksum, FormatError, ModelHash, Profile};
 pub use tokenizer::{MergeFault, Tokenizer};
 pub use unfold::{UnfoldOptions, container_overlap, unfold, unfold_with};
 
@@ -111,6 +116,15 @@ pub const LOGS_BLOCK_SIZE: BlockSize = {
     let Ok(b) = BlockSize::new(64 * 1024) else { panic!("the block size is not 0") };
     b
 };
+
+/// The `.taco` container versions that [`unfold`] and [`stream`] read (ADR 0006, ADR 0011).
+pub const CONTAINER_READS: [u16; 2] = [taco_format::VERSION_1, taco_format::VERSION];
+
+/// The `.taco` container version that [`fold`] and [`stream`] write (ADR 0011).
+pub const CONTAINER_WRITES: u16 = taco_format::VERSION;
+
+/// The `.hsm` model-file versions that [`Model::load`] reads.
+pub const MODEL_FILE_READS: [u32; 2] = [hardshell::hsm::VERSION_1, hardshell::hsm::VERSION_2];
 
 /// The model hash of `model` as the container stores it.
 ///

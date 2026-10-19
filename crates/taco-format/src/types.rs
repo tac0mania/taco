@@ -127,6 +127,22 @@ impl BlockSize {
         }
     }
 
+    /// Refuses a block size above [`crate::MAX_BLOCK_SIZE`]: the reader and the writer of
+    /// both versions apply this rule.
+    ///
+    /// # Errors
+    ///
+    /// [`FormatError::BlockSizeTooLarge`].
+    pub fn check_max(self) -> Result<Self> {
+        if self.get() > crate::MAX_BLOCK_SIZE.get() {
+            return Err(FormatError::BlockSizeTooLarge {
+                block_size: self.get(),
+                max: crate::MAX_BLOCK_SIZE.get(),
+            });
+        }
+        Ok(self)
+    }
+
     /// The block size in bytes. It is at least 1.
     #[must_use]
     #[inline]

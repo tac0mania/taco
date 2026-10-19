@@ -63,6 +63,26 @@ The writer of version 2 cannot make this file again. It is the proof that the re
 reads version 1 (plan §3 rule 8). `golden_v1_container_still_unfolds` in
 `crates/taco/tests/container.rs` checks its hash and unfolds it. Do not change the file.
 
+## The version 2 vectors: `v2/`
+
+Container version 2 is frozen (ADR 0011, addendum "Version 2 is frozen"). `v2/` holds 17
+vectors: for each one an input (`<name>.in`) and its container (`<name>.taco`), folded with
+`tiny.hsm`. `v2/vectors.tsv` lists the profile, the block size, the overlap `K`, the lengths,
+the SHA-256 of the input and of the container, and the block kinds. ADR 0011, addendum §6,
+has the table.
+
+- The vectors hold all four block kinds (raw, zstd, coded, mixed), the profiles `text`, `logs`
+  and `auto`, and `K = 0` and `K > 0` with coded and mixed blocks.
+- The weights of `tiny.hsm` are random, so English text codes larger than zstd. The inputs
+  `predicted_*` and `all_kinds_*` are bytes that the tiny model predicts, so they give coded
+  and mixed blocks.
+- `crates/taco-cli/tests/conformance.rs` checks every vector: the hashes, the fold (in memory
+  and as a stream), and the unfold (in memory and with both stream readers). The Mac (ARM)
+  and devbox (x86) pass it (measured, 2026-10-19).
+- Do not change the files. A change of the format, the coder, the tokenizer, the match model or
+  the zstd library changes them. Then make them again with the ignored test
+  `write_the_vectors` (its documentation has the command), only with the lead's decision.
+
 ## The GPT-2 model
 
 The GPT-2 model file is not committed (plan §11.1). `tools/convert/gpt2.py` makes it from the

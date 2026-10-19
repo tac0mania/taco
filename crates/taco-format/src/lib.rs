@@ -25,12 +25,12 @@
 //! | 8 | 32 | model hash | SHA-256 of the model file. All zero: the raw-only mode. |
 //! | 40 | 8 | original length | `u64`, the number of bytes of the original data. |
 //! | 48 | 32 | checksum | SHA-256 of the original data. |
-//! | 80 | 4 | block size | `u32`, at least 1. |
+//! | 80 | 4 | block size | `u32`, at least 1, at most [`MAX_BLOCK_SIZE`] (64 MiB). |
 //! | 84 | 4 | block count | `u32`, exactly `ceil(original length / block size)`. |
 //! | 88 | 1 | profile | Version 2 only. `u8`: 0 text, 1 logs (ADR 0012). |
 //! | 89 | 1 | reserved | Version 2 only. 0. |
 //! | 90 | 2 | coding parts | Version 2 only. `u16` bit set. Bit 0: the match model and the mixer (ADR 0010). Bit 1: the context overlap (ADR 0015). Other bits 0. |
-//! | 92 | 12 | coding parameters | Version 2 only. Byte 0: the mixer rule version (1) if bit 0 is set, else 0. Byte 1: 0. Bytes 2 and 3: the overlap `K` (`u16`, 1 or more) if bit 1 is set, else 0. Bytes 4 to 11: 0. |
+//! | 92 | 12 | coding parameters | Version 2 only. Byte 0: the mixer rule version (1 or 2, ADR 0017) if bit 0 is set, else 0. Byte 1: 0. Bytes 2 and 3: the overlap `K` (`u16`, 1 or more) if bit 1 is set, else 0. Bytes 4 to 11: 0. |
 //! | H | 5 × count | block table | H = 88 (version 1) or 104 (version 2). For each block: kind (`u8`), stored length (`u32`). |
 //! | H + 5 × count | sum of stored lengths | blocks | The stored bytes of each block, in table order, with no gap. |
 //!
@@ -45,11 +45,12 @@
 //!    [`FormatError::UnsupportedVersion`] before it reads other fields.
 //! 2. Version 2: the profile is 0 or 1. The reserved byte is 0. The coding parts have only
 //!    bits 0 and 1, and the profile `text` does not have bit 0. With bit 0, byte 0 of the
-//!    coding parameters is a known mixer rule version (1); without it, byte 0 is 0. With bit
+//!    coding parameters is a known mixer rule version (1 or 2); without it, byte 0 is 0. With bit
 //!    1, bytes 2 and 3 hold `K >= 1`; without it, they are 0. Byte 1 and bytes 4 to 11 of the
 //!    coding parameters are 0. A reader that does not know a bit refuses the container, so it
 //!    never decodes with the wrong rule.
-//! 3. The block size is at least 1. The block count is `ceil(original length / block size)`.
+//! 3. The block size is at least 1 and at most [`MAX_BLOCK_SIZE`] (64 MiB, both versions; ADR 0011,
+//!    addendum §4). The block count is `ceil(original length / block size)`.
 //!    Thus empty data has 0 blocks and a container of exactly the header.
 //! 4. A raw block stores exactly its original bytes: its stored length equals its original
 //!    length.
@@ -90,6 +91,7 @@ mod error;
 mod header;
 mod layout;
 mod reader;
+mod stream;
 mod types;
 mod writer;
 mod zstd_block;
@@ -99,6 +101,7 @@ pub use error::{FormatError, Result};
 pub use header::Header;
 pub use layout::worst_case_len;
 pub use reader::{BlockRef, Container};
+pub use stream::{ChecksumBuilder, StreamWriter, TableEntry, TableReader};
 pub use types::{BlockKind, BlockSize, Checksum, ModelHash, Profile};
 pub use writer::{Block, ContainerParams};
 pub use zstd_block::{
@@ -119,6 +122,22 @@ pub const HEADER_LEN: usize = 104;
 
 /// The length of the header of version 1, in bytes.
 pub const HEADER_LEN_V1: usize = 88;
+
+/// The largest block size of versions 1 and 2: 64 MiB (ADR 0011, addendum "Version 2 is
+/// frozen", §4). The reader refuses a header with a larger block size, and the writer refuses
+/// to write one ([`FormatError::BlockSizeTooLarge`]).
+///
+/// The block size bounds the work and the memory of one block: a coded block has at most one
+/// token for each original byte, and the decoder holds at most the stored and the restored
+/// bytes of a block. NOTE: the largest block size that a measurement used is 1 MiB (the logs
+/// profile, ADR 0012); 64 MiB keeps a factor of 64 above it.
+// NOTE: the compiler evaluates this constant. A panic here is a build error, not a run-time
+// panic, and 64 MiB is not 0.
+#[allow(clippy::panic)]
+pub const MAX_BLOCK_SIZE: BlockSize = {
+    let Ok(b) = BlockSize::new(64 * 1024 * 1024) else { panic!("the block size is not 0") };
+    b
+};
 
 /// The length of one entry of the block table, in bytes: the kind (1) and the stored length
 /// (4).

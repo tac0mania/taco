@@ -118,12 +118,15 @@ fn false_content_size_cannot_make_more_or_fewer_bytes() {
 
 #[test]
 fn huge_original_length_is_not_allocated() {
-    // A header of 4 GiB in one block and a frame of 14 bytes that says 4 GiB but gives 1,000
-    // bytes. The decoder must not reserve 4 GiB.
-    let claim = u32::MAX;
+    // A header of 64 MiB (the largest block size) in one block and a frame of 14 bytes that
+    // says 64 MiB but gives 1,000 bytes. The decoder must not reserve 64 MiB.
+    let claim = taco_format::MAX_BLOCK_SIZE.get();
     let frame = rle_frame(claim, 1_000, b'h');
     assert_eq!(frame.len(), 14);
     let bytes = one_block(&frame, claim, b"");
+    // A block of 4 GiB: the parser refuses the block size (ADR 0011, addendum §4).
+    let huge = one_block(&rle_frame(u32::MAX, 1_000, b'h'), u32::MAX, b"");
+    assert!(matches!(Container::parse(&huge), Err(FormatError::BlockSizeTooLarge { .. })));
     let (r, out) = decode_only(&bytes);
     assert!(matches!(r, Err(FormatError::CorruptZstdBlock { block: 0, .. })), "{r:?}");
     assert!(out.capacity() < 1 << 20, "{}", out.capacity());

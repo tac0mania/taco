@@ -157,6 +157,44 @@ impl Header {
         }
     }
 
+    /// The bytes of a version 2 header: [`HEADER_LEN`] bytes. The stream writer uses it.
+    ///
+    /// # Errors
+    ///
+    /// [`FormatError::LengthOverflow`] if the header is not a version 2 header (not on a valid
+    /// path: the writer makes version 2 only).
+    pub(crate) fn to_bytes_v2(self) -> Result<[u8; HEADER_LEN]> {
+        let mut out = Vec::with_capacity(HEADER_LEN);
+        self.write(&mut out);
+        out.try_into().map_err(|_| FormatError::LengthOverflow { part: "header" })
+    }
+
+    /// The header length of a container from its first 6 bytes (the magic and the version):
+    /// 88 bytes for version 1, 104 bytes for version 2. A reader of a stream reads this many
+    /// bytes, then calls [`Header::from_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// [`FormatError::BadMagic`], [`FormatError::UnsupportedVersion`], or
+    /// [`FormatError::Truncated`] if `prefix` has fewer than 6 bytes.
+    pub fn len_from_prefix(prefix: &[u8]) -> Result<usize> {
+        let found = u64::try_from(prefix.len()).unwrap_or(u64::MAX);
+        Ok(header_len(check_magic_and_version(prefix, found)?))
+    }
+
+    /// Parses and checks the header at the start of `bytes`, with the header checks of
+    /// [`crate::Container::parse`]. The bytes after the header are not read. Cost: a few
+    /// compares.
+    ///
+    /// # Errors
+    ///
+    /// The header errors of [`crate::Container::parse`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let found = u64::try_from(bytes.len())
+            .map_err(|_| FormatError::LengthOverflow { part: "container" })?;
+        Ok(Self::parse(bytes, found)?.0)
+    }
+
     /// Appends the header bytes to `out`: 88 bytes for version 1, 104 bytes for version 2.
     /// The flags and the reserved fields are zero.
     pub(crate) fn write(&self, out: &mut Vec<u8>) {
@@ -233,7 +271,7 @@ fn read_common(version: u16, bytes: &[u8; HEADER_LEN_V1]) -> Result<Header> {
     let model_hash = ModelHash::from_bytes(take(&mut rest)?);
     let original_len = u64::from_le_bytes(take(&mut rest)?);
     let checksum = Checksum::from_bytes(take(&mut rest)?);
-    let block_size = BlockSize::new(u32::from_le_bytes(take(&mut rest)?))?;
+    let block_size = BlockSize::new(u32::from_le_bytes(take(&mut rest)?))?.check_max()?;
     let block_count = u32::from_le_bytes(take(&mut rest)?);
     let expected = expected_block_count(original_len, block_size);
     if expected != u64::from(block_count) {

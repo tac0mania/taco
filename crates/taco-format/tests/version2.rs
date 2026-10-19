@@ -193,7 +193,11 @@ fn mixed_block_needs_the_coding_part() {
 
 #[test]
 fn coding_part_needs_a_known_mixer_rule() {
-    for rule in [0, 2, 3, 0x80, u8::MAX] {
+    // Rule version 2 (ADR 0017 §5) is known.
+    let mut c = mixed_sample();
+    c.section[4] = 2;
+    assert!(Container::parse(&c.bytes()).is_ok());
+    for rule in [0, 3, 0x80, u8::MAX] {
         let mut c = mixed_sample();
         c.section[4] = rule;
         assert_eq!(parse_err(&c), FormatError::UnknownMixerRule { rule });

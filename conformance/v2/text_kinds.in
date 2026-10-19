@@ -1,0 +1,11 @@
+It was the best of times and the worst of times. The sun rose over the hills, and the farmers went out into the fields as they had done for a hundred years. Nobody in the village thought that this morning was different from the others, but the old miller stood at his door and looked at the road for a long time. Then he went in, and he shut the door.
+It was the best of times and the worst of times. The sun rose over the hills, and the farmers went out into the fields as they had done for a hundred years. Nobody in the village thought that this morning was different from the others, but the old miller stood at his door and looked at the road for a long time. Then he went in, and he shut the door.
+ZøGEÅD!+èc§<ûVkûwØÙË ïãÖ!ß¶—õÎåNïLË"ßÉ‘cC3ðÍè²ù“•mlðZ9ë}Ä_Ãf™3ÏÃ†€ØåzZNxîYgoõ¿
+¯¢®£êëÆÐòŽÊ¿DÑ¾»“ÅFÔ:­0;–&oôGY—ÄŽå²ûÕ÷í”Lrú¡¾	±#Ø½šåË³6†¯èÓñâiÄËÕRØ«ÈÐ«ýCD°¤º§§åµhp54pE£µZêc{µ?¾]ÄÔÒ0ËÂ1·s€¨h×Á+óx¾cS†ç^yâ¿§Ý¼Ì§fbß¦ªü†²GBÕÌ—¼¹¾\Ç»JQ«ª
+dÇS½Ñ.ÜóLŽfO	×¸ï<ÎtFNTU¥ÇÞ-Š	3abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcfn main() {
+    let xs: Vec<u32> = (0..10).map(|x| x * x).collect();
+    for x in &xs {
+        println!("{x}");
+    }
+}
+{"id": 1850006136, "user": {"name": "taco", "followers": 42}, "tags": ["compression", "gpt2"], "ratio": 1.992, "ok": true, "next": null}
