@@ -418,8 +418,25 @@ of them changes that property, and files from the alpha stay readable.
 
 ### Experiments that do not ship
 
-| Experiment | Result (measured) | State |
-|---|---|---|
+**A model fine-tuned on logs ("Route A", frozen).** distilgpt2 (6 layers) fine-tuned on 12
+Loghub systems, against GPT-2 and the general compressors. `taco fold --profile logs`, the
+first 16 KiB of each file, sizes in bytes (measured, `docs/research/2026-10-19-route-a.md` §8):
+
+| Sample (16,384 bytes each) | xz -9e | zstd -19 | Taco, GPT-2 | Taco, fine-tuned |
+|---|---:|---:|---:|---:|
+| 4 log systems **seen** in training (Android, HDFS, Mac, OpenStack) | 10,872 | 10,897 | 7,672 | **3,593** |
+| 4 log systems **not seen** in training (Apache, HealthApp, Proxifier, Zookeeper) | 4,664 | 4,578 | **3,709** | 3,879 |
+
+- On seen systems, the fine-tuned model is 67% smaller than xz and 53% smaller than GPT-2.
+- On unseen systems, it is 4.6% larger than GPT-2 (but still 17% smaller than xz).
+- Its engine is 1.5 times faster than GPT-2 (30,319 against 20,472 tokens/s), because it has
+  6 layers instead of 12.
+- Thus a model fine-tuned on the logs of one company would be the strong case. It is frozen,
+  because the alpha is about the same bits on every machine, not about ratio. Details:
+  [`docs/core-architecture.md`](docs/core-architecture.md) §8.6.
+- ts_zip publishes no log results, so this table has no ts_zip column.
+
+---|---|---|
 | A model fine-tuned on logs (distilgpt2, 6 layers, trained on 12 Loghub systems; "Route A") | On logs of the 12 trained systems: 53.2% smaller than GPT-2 (profile `logs`). On 4 unseen systems: 4.6% larger. Engine 1.5 times faster (30,319 against 20,472 tokens/s, smaller model) | Frozen: the alpha is about cross-machine bits, not ratio. Details: [`docs/core-architecture.md`](docs/core-architecture.md) §8.6 |
 
 ---
