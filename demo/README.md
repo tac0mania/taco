@@ -12,7 +12,7 @@ downloaded. The folder holds:
 | `samples/sample.txt` | A short English text (3,672 bytes). |
 
 > [!WARNING]
-> **Taco is slow, and this is a pre-release.** It is an experiment, not a replacement for
+> **Taco is slow, and this is an alpha (a proof of concept).** It is an experiment, not a replacement for
 > zip, zstd or xz. Keep a second copy of each file that you fold. Do not use it for important
 > data.
 
@@ -23,19 +23,20 @@ downloaded. The folder holds:
 
 ## 1. Run the demo (one command)
 
-Unpack the zip. Open a terminal in the unpacked folder. Then run the command for your system.
+**Open a terminal in this folder** (the folder that has this README, `try` and `gpt2.hsm`):
 
-**macOS (Apple Silicon) and Linux (x86-64):**
+| System | Do this |
+|---|---|
+| macOS | Open the Terminal app. Type `cd ` (with a space), drag this folder from Finder into the Terminal window, and press Return. |
+| Linux | Open a terminal and `cd` to this folder, for example `cd ~/Downloads/taco-demo-0.1.0`. |
+| Windows | Open this folder in Explorer. Click the address bar, type `cmd`, and press Enter. |
 
-```bash
-./try
-```
+**Then type the command and press Return (Enter):**
 
-**Windows (x86-64), in Command Prompt or PowerShell:**
-
-```bat
-.\try.cmd
-```
+| System | Command |
+|---|---|
+| macOS (Apple Silicon), Linux (x86-64) | `./try` |
+| Windows (x86-64) | `try.cmd` |
 
 The demo prints `PASS: the file came back byte for byte`, the sizes, the times, and the
 SHA-256 of the `.taco` file. On an Apple M2 with the CPU only, the sample (3,672 bytes)
@@ -76,7 +77,7 @@ do not get smaller: Taco stores them with zstd or raw.
 | Machine | Fold (compress) | Unfold (restore) |
 |---|---:|---:|
 | NVIDIA GPU (RTX 3060 Laptop, CUDA), English text | 85 to 129 KB/s | 26 to 31 KB/s |
-| CPU only (Apple M2, AMD Ryzen 7) | 0.3 to 2 KB/s | 0.1 to 1 KB/s |
+| CPU only (Apple M2, AMD Ryzen 7) | 0.3 to 2 KB/s | 0.1 to 0.5 KB/s |
 
 These numbers are measured on our machines. Your speed can be different.
 
@@ -107,4 +108,5 @@ test fails. The output is the same on each backend.
 - `bin/<platform>/BUILDINFO` records the commit and the toolchain of each program.
 - `SHA256SUMS` lists the SHA-256 of each file in this folder.
 - Licence: Apache-2.0 (`LICENSE`). The libraries in the programs: `THIRD-PARTY-LICENSES.txt`.
-  The model is converted from GPT-2 by OpenAI (modified MIT licence).
+  The model is converted from GPT-2 by OpenAI; its licence is in `MODEL-LICENSE.txt`
+  ("Modified MIT License").

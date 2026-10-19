@@ -3,15 +3,21 @@
 # x86-64, the model file, the launchers and the sample. The user unpacks it and runs one
 # command (demo/README.md). Nothing is compiled or downloaded on the user's machine.
 #
-#   scripts/release/demo.sh <gpt2.hsm> [<dist dir>]
+#   scripts/release/demo.sh <gpt2.hsm> <gpt-2 licence> [<dist dir>]
+#
+# <gpt-2 licence> is a reviewed copy of the licence of the GPT-2 weights (the "Modified MIT
+# License" of OpenAI, https://github.com/openai/gpt-2/blob/master/LICENSE). The demo carries it
+# as MODEL-LICENSE.txt, because the demo carries the converted weights.
 #
 # <dist dir> (default target/dist) holds the release archives that mac.sh, linux.sh and
 # windows.sh made. The output is target/demo/taco-demo-<version>/ and
 # target/demo/taco-demo-<version>.zip. Both are ignored by git: the model file is 127 MB.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-model=${1:?usage: scripts/release/demo.sh <gpt2.hsm> [<dist dir>]}
-dist=${2:-target/dist}
+model=${1:?usage: scripts/release/demo.sh <gpt2.hsm> <gpt-2 licence> [<dist dir>]}
+licence=${2:?usage: scripts/release/demo.sh <gpt2.hsm> <gpt-2 licence> [<dist dir>]}
+dist=${3:-target/dist}
+[ -s "$licence" ] || { echo "demo.sh: the licence file $licence is empty or missing" >&2; exit 66; }
 expected=aaa03eb96e9ad7957432168c8ac6b4a99ed55d57e637e4786a664b51001ba5c2
 actual=$(shasum -a 256 "$model" | cut -d' ' -f1)
 if [ "$actual" != "$expected" ]; then
@@ -50,6 +56,7 @@ for f in taco.cmd try.cmd; do perl -pe 's/\r?\n/\r\n/' "demo/$f" > "$stage/$f"; 
 cp demo/samples/sample.txt "$stage/samples/"
 cp LICENSE "$stage/LICENSE"
 cp "$model" "$stage/gpt2.hsm"
+cp "$licence" "$stage/MODEL-LICENSE.txt"
 chmod 0755 "$stage/taco" "$stage/try" "$stage/bin/macos-arm64/taco" "$stage/bin/linux-x86_64/taco"
 (cd "$stage" && find . -type f ! -name SHA256SUMS | sort | sed 's|^\./||' | xargs shasum -a 256 > SHA256SUMS)
 (cd "$out" && zip -qrX "$name.zip" "$name")

@@ -14,8 +14,8 @@ taco unfold notes.txt.taco   # restores notes.txt, byte for byte
 ```
 
 > [!WARNING]
-> **Pre-release (private beta, 2026-10-19).** Taco is an experiment. It is slow, and it is
-> not a replacement for zstd or xz. Keep a second copy of data that you fold. Read
+> **Alpha: a proof of concept (version 0.1.0, 2026-10-19).** Taco is an experiment. It is
+> slow, and it is not a replacement for zstd or xz. Keep a second copy of data that you fold. Read
 > [Limits](#limits) before you use it.
 
 > [!NOTE]
@@ -44,22 +44,53 @@ taco unfold notes.txt.taco   # restores notes.txt, byte for byte
 
 ## Try it
 
-Download the demo zip, unpack it, and run one command. It has the programs for macOS (Apple
-Silicon), Linux (x86-64) and Windows (x86-64) and the model file. You do not compile or
-download anything else.
+You need no compiler, no Python and no download other than one zip. A GPU is optional.
 
-```bash
-./try          # macOS, Linux
-.\try.cmd      # Windows
+**1. Get the demo zip.** Download `taco-demo-0.1.0.zip` (about 120 MB) from the
+[Releases page](https://github.com/tac0mania/taco/releases) of this repository, or from the
+link that you received. It holds the programs for macOS (Apple Silicon), Linux (x86-64) and
+Windows (x86-64), and the model file.
+
+**2. Unpack it, and open a terminal in the unpacked folder.**
+
+| System | Do this |
+|---|---|
+| macOS | Double-click the zip. Open the Terminal app. Type `cd ~/Downloads/taco-demo-0.1.0` and press Return. |
+| Linux | `unzip taco-demo-0.1.0.zip && cd taco-demo-0.1.0` |
+| Windows | Right-click the zip, select **Extract All**, then open the folder. Click the address bar, type `cmd`, and press Enter. |
+
+**3. Run the demo.**
+
+| System | Type |
+|---|---|
+| macOS, Linux | `./try` |
+| Windows | `try.cmd` |
+
+The demo folds and unfolds a short English text (3,672 bytes). It takes about 15 s to 1 minute.
+The end of the output looks like this:
+
+```
+PASS: the file came back byte for byte.
+Original: 3672 bytes. Folded: 648 bytes.
+Fold: 6 s. Unfold: 9 s.
+SHA-256 of the .taco file: EXPECTED_SAMPLE_HASH
 ```
 
-The demo folds and unfolds a sample text, checks it, and prints the SHA-256 of the `.taco`
-file. That hash is the same on every machine. Details and times: [`demo/README.md`](demo/README.md).
+**4. Compare the hash.** The SHA-256 must be the value above, on every machine and every backend.
+Run the demo on a second computer (another processor, another GPU) and compare. This is the
+main property of Taco.
+
+**5. Try your own files** in the same terminal:
+
+```bash
+./taco fold notes.txt            # Windows: taco.cmd fold notes.txt
+./taco unfold notes.txt.taco     # Windows: taco.cmd unfold notes.txt.taco
+```
 
 > [!CAUTION]
 > Taco is slow. With a GPU, it folds text at about 85 to 129 KB/s and unfolds at about 26 to
-> 31 KB/s. With the CPU only, it gives about 0.3 to 2 KB/s (measured). Start with a file of a
-> few KB.
+> 31 KB/s. With the CPU only, it folds at about 0.3 to 2 KB/s and unfolds at about 0.1 to
+> 0.5 KB/s (measured). Start with a file of a few KB. More details and troubleshooting: [`demo/README.md`](demo/README.md).
 
 ---
 
@@ -134,10 +165,28 @@ the integer model is 2.3% larger (`docs/research/2026-10-18-integer-gpt2.md` §6
 | Engine, decode over a full 1,024-token window | 20,472 tokens/s |
 | `taco fold`, English text | 85 to 129 KB/s |
 | `taco unfold`, English text | 26 to 31 KB/s |
-| `taco fold` and `unfold`, CPU only | about 0.3 to 2 KB/s |
+| `taco fold`, CPU only | about 0.3 to 2 KB/s |
+| `taco unfold`, CPU only | about 0.1 to 0.5 KB/s |
 
 For comparison, `zstd -3` compresses at hundreds of MB/s and `xz -9e` at about 0.7 MB/s.
 ts_zip states "up to 1 MB/s" on an RTX 4090 (published, a different GPU).
+
+### Large files (streaming): a memory test, not a speed test
+
+This test checks that the memory does not grow with the file (ADR 0018). It used 200,000,000
+bytes of random words and the small test model, on the devbox CPU.
+
+| Run | Largest memory (RSS) |
+|---|---:|
+| fold, file to file | 254 MiB |
+| fold, stdin to stdout | 276 MiB |
+| unfold, file to file | 38 MiB |
+| unfold, stdin to stdout | 35 MiB |
+
+Both unfolds restored the input byte for byte. **Its times say nothing about Taco's speed:**
+the test model has random weights, so every block was stored with zstd or raw, and unfold ran
+no model step. The real speed is in the table above. The largest files folded with GPT-2 so
+far are 2.4 to 2.7 MB (measured).
 
 ### Same bits on different machines
 
@@ -324,21 +373,20 @@ taco unfold <input.taco> [-o <output>] [-c] [--backend auto|cuda|gpu|cpu]
 | `--threads <n>` | Worker threads. The output does not change. |
 | `-f`, `-q`, `-V` | Replace an output file; no progress output; show the version. |
 
-Files of any size stream with bounded memory: a 200 MB file folded with 254 MiB and unfolded
-with 38 MiB (measured). `taco --help` and `docs/man/taco.1` have all the details.
+Files of any size stream with bounded memory ([Large files](#large-files-streaming-a-memory-test-not-a-speed-test)). `taco --help` and `docs/man/taco.1` have all the details.
 
 ---
 
 ## Roadmap
 
-The beta is about one property: the same bits on every machine. These items come after the
-beta. None of them changes that property, and files from the beta stay readable.
+The alpha shows one property: the same bits on every machine. These items come later. None
+of them changes that property, and files from the alpha stay readable.
 
 | Item | Expected gain |
 |---|---|
 | Speculative decoding in `taco unfold` (ADR 0017) | Unfold 1.8 to 3.7 times faster (est., simulation) |
 | Skip rule (mixer rule 2) for the profile `logs` | Logs 4.8 to 7.3% smaller (est., simulation on 18 log files) |
-| Smaller blocks for small text files | Unfold of a 25 KB file from 13.7 s to 4.7 s, for 1 to 2% more bytes (measured) |
+| Smaller blocks for small text files | Unfold of a 25 KB file from 13.7 s to 4.7 s, for 2.3% more bytes; a 427 KB file from 17.7 s to 10.7 s, for 1.0% more (measured) |
 | More context for the profile `text` | Smaller files (not measured) |
 | Range coder on the GPU | Removes one CPU-GPU round trip for each token (not measured) |
 | CUDA for compute capability 6.1 and 7.5 | Faster on older NVIDIA GPUs (not measured) |
