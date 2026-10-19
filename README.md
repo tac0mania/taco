@@ -184,6 +184,31 @@ Against another compressor with a language model, on the whole `alice29.txt` (15
 ts_zip is 44% smaller. It uses a larger and newer model (RWKV, 169M parameters; GPT-2 small
 has 124M), and Taco's profile `text` restarts the model context at each 16 KiB block.
 
+### Logs (profile `logs`: GPT-2, a match model and a mixer)
+
+The 16 Loghub log files (4,458,875 bytes in total), the defaults of the profile `logs` (blocks
+of 64 KiB, context overlap 512), whole files for the other compressors
+(`docs/research/2026-10-19-overlap-cli.md`, `docs/research/2026-10-19-logs-profile.md`):
+
+| Compressor | Bits per byte |
+|---|---:|
+| zstd -19 --long=27 | 0.597 |
+| xz -9e | 0.554 |
+| **Taco, profile `logs`** | **0.494** (10.8% smaller than xz) |
+| paq8px -8 (a slow context-mixing compressor) | smaller than Taco: 0.348 against 0.600 (est.) on 6 other whole logs |
+
+Speed of the profile `logs` with the GPU mixer (RTX 3060 at 95 W, CUDA, commit 1493af3):
+
+| File | Fold | Unfold |
+|---|---:|---:|
+| `Apache_2k.log`, 171 KB | 4.5 s (was 208.8 s on the CPU) | 53.8 s (was 90.1 s) |
+| `apache_access.log`, 2.37 MB | 70 to 98 s | 255 to 280 s |
+
+What can make logs smaller (not in this version): the skip rule, 4.8 to 7.3% smaller (est.,
+simulation, ADR 0017); and a model fine-tuned on the logs of known systems, 53.2% smaller on
+those systems but 4.6% larger on other systems (measured, frozen;
+[Experiments](#experiments-that-do-not-ship)).
+
 ### Integer model against the float model
 
 | Model | Bits per byte (16 text files, 42,256 bytes) |
