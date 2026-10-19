@@ -13,7 +13,9 @@ size() { wc -c < "$1" | tr -d ' '; }
 echo "Taco demo: fold and unfold $(size "$sample") bytes. This takes about 15 s to 1 minute."
 echo
 start=$(date +%s)
-"$here/taco" fold "$sample" -o "$work/sample.txt.taco" -f "$@"
+# NOTE: the profile text runs fold on the GPU too (in 0.1.0, auto folds on the CPU), so the
+# demo tests the GPU in both directions.
+"$here/taco" fold "$sample" -o "$work/sample.txt.taco" -f --profile text "$@"
 mid=$(date +%s)
 "$here/taco" unfold "$work/sample.txt.taco" -o "$work/sample.txt" -f "$@"
 end=$(date +%s)

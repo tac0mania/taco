@@ -48,7 +48,7 @@ The SHA-256 of the `.taco` file of the sample is the same on every machine and e
 backend (CPU, NVIDIA, AMD, Apple, Intel GPU):
 
 ```
-fc42949200a1aff66afe89f5edc3306bf920891e9b4bde0b0a4aa7c20a3259fc
+2fab1ef7a1c70cd4e39ddfd88a8d66389ae07a403111db131326ae425460652e
 ```
 
 Run the demo on two different computers. The hash is the same. Thus a file that one machine

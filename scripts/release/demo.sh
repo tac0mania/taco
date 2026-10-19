@@ -12,6 +12,9 @@
 # <dist dir> (default target/dist) holds the release archives that mac.sh, linux.sh and
 # windows.sh made. The output is target/demo/taco-demo-<version>/ and
 # target/demo/taco-demo-<version>.zip. Both are ignored by git: the model file is 127 MB.
+#
+# TACO_DEMO_SKIP names demo platforms to leave out (for example "windows-x86_64"), when a
+# program cannot be built yet. The launcher then says that the folder has no program.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 model=${1:?usage: scripts/release/demo.sh <gpt2.hsm> <gpt-2 licence> [<dist dir>]}
@@ -36,6 +39,7 @@ for row in "macos-arm64 aarch64-apple-darwin taco tar.gz" \
            "linux-x86_64 x86_64-unknown-linux-gnu taco tar.gz" \
            "windows-x86_64 x86_64-pc-windows-gnu taco.exe zip"; do
   set -- $row
+  case " ${TACO_DEMO_SKIP:-} " in *" $1 "*) echo "demo.sh: leaving out $1 (TACO_DEMO_SKIP)" >&2; continue ;; esac
   archive="$dist/taco-$version-$2.$4"
   if [ ! -f "$archive" ]; then
     echo "demo.sh: $archive is missing (build it with scripts/release/)" >&2; missing=1; continue
@@ -57,7 +61,8 @@ cp demo/samples/sample.txt "$stage/samples/"
 cp LICENSE "$stage/LICENSE"
 cp "$model" "$stage/gpt2.hsm"
 cp "$licence" "$stage/MODEL-LICENSE.txt"
-chmod 0755 "$stage/taco" "$stage/try" "$stage/bin/macos-arm64/taco" "$stage/bin/linux-x86_64/taco"
+chmod 0755 "$stage/taco" "$stage/try"
+for b in "$stage/bin/macos-arm64/taco" "$stage/bin/linux-x86_64/taco"; do [ ! -f "$b" ] || chmod 0755 "$b"; done
 (cd "$stage" && find . -type f ! -name SHA256SUMS | sort | sed 's|^\./||' | xargs shasum -a 256 > SHA256SUMS)
 (cd "$out" && zip -qrX "$name.zip" "$name")
 echo "demo.sh: $stage"

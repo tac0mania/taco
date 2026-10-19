@@ -27,6 +27,7 @@ taco unfold notes.txt.taco   # restores notes.txt, byte for byte
 
 ## Contents
 
+- [Proof: the same bytes on every machine](#proof-the-same-bytes-on-every-machine)
 - [Try it](#try-it)
 - [What Taco is, and what it is not](#what-taco-is-and-what-it-is-not)
 - [Results](#results)
@@ -39,6 +40,31 @@ taco unfold notes.txt.taco   # restores notes.txt, byte for byte
 - [Roadmap](#roadmap)
 - [Development](#development)
 - [Licence](#licence)
+
+---
+
+## Proof: the same bytes on every machine
+
+This is the point of Taco. Speed and ratio come second.
+
+The release program of version 0.1.0 folded the demo sample (`demo/samples/sample.txt`, 3,672
+bytes, `--profile text`) and unfolded it again on 7 backends: 3 operating systems, 2 CPU
+architectures and 4 kinds of processors. Each fold ran on the backend in the row, and each
+unfold restored the sample byte for byte (measured, 2026-10-19):
+
+| Machine | System | Backend | SHA-256 of the `.taco` file |
+|---|---|---|---|
+| Apple M2 | macOS (ARM) | CPU (NEON) | `2fab1ef7a1c70cd4e39ddfd88a8d66389ae07a403111db131326ae425460652e` |
+| Apple M2 | macOS (ARM) | GPU (Metal) | `2fab1ef7a1c70cd4e39ddfd88a8d66389ae07a403111db131326ae425460652e` |
+| AMD Ryzen 7 5800H | Linux x86-64 | CPU (AVX2) | `2fab1ef7a1c70cd4e39ddfd88a8d66389ae07a403111db131326ae425460652e` |
+| NVIDIA RTX 3060 Laptop | Linux x86-64 | CUDA | `2fab1ef7a1c70cd4e39ddfd88a8d66389ae07a403111db131326ae425460652e` |
+| AMD Ryzen 7 5800H | Windows x86-64 | CPU (AVX2) | `2fab1ef7a1c70cd4e39ddfd88a8d66389ae07a403111db131326ae425460652e` |
+| NVIDIA RTX 3060 Laptop | Windows x86-64 | CUDA | `2fab1ef7a1c70cd4e39ddfd88a8d66389ae07a403111db131326ae425460652e` |
+| NVIDIA RTX 3060 Laptop | Windows x86-64 | GPU (Vulkan) | `2fab1ef7a1c70cd4e39ddfd88a8d66389ae07a403111db131326ae425460652e` |
+
+Thus a file that any of these machines folds unfolds on all of the others. To add a row, run
+`./try` on your machine ([Try it](#try-it)) and compare the hash. More checks of the same
+property, with more inputs, are in [Same bits on different machines](#same-bits-on-different-machines).
 
 ---
 
@@ -62,7 +88,7 @@ of the `.taco` file. It takes about 10 s to 1 minute. The end of the output:
 ```
 PASS: the file came back byte for byte.
 Original: 3672 bytes. Folded: 648 bytes.
-SHA-256 of the .taco file: fc42949200a1aff66afe89f5edc3306bf920891e9b4bde0b0a4aa7c20a3259fc
+SHA-256 of the .taco file: 2fab1ef7a1c70cd4e39ddfd88a8d66389ae07a403111db131326ae425460652e
 ```
 
 **This hash is the same on every machine and every backend.** Run the demo on a second
@@ -83,7 +109,7 @@ uv run --project tools python -m convert.gpt2       # makes tools/data/out/gpt2.
 shasum -a 256 tools/data/out/gpt2.hsm               # must be aaa03eb96e9ad795...b51001ba5c2
 cargo build --release --locked -p taco-cli
 export TACO_MODEL="$PWD/tools/data/out/gpt2.hsm"
-./target/release/taco fold demo/samples/sample.txt -o /tmp/sample.taco
+./target/release/taco fold demo/samples/sample.txt --profile text -o /tmp/sample.taco
 shasum -a 256 /tmp/sample.taco                      # must be the hash in section A
 ./target/release/taco unfold /tmp/sample.taco -o /tmp/sample.txt
 cmp demo/samples/sample.txt /tmp/sample.txt && echo "restored byte for byte"

@@ -8,7 +8,8 @@ mkdir "%WORK%"
 echo Taco demo: fold and unfold the sample file. This takes about 15 s to 1 minute.
 echo.
 echo Fold started at %TIME%
-call "%HERE%taco.cmd" fold "%HERE%samples\sample.txt" -o "%WORK%\sample.txt.taco" -f %*
+rem The profile text runs fold on the GPU too, so the demo tests the GPU in both directions.
+call "%HERE%taco.cmd" fold "%HERE%samples\sample.txt" -o "%WORK%\sample.txt.taco" -f --profile text %*
 if errorlevel 1 goto failed
 echo Unfold started at %TIME%
 call "%HERE%taco.cmd" unfold "%WORK%\sample.txt.taco" -o "%WORK%\sample.txt" -f %*
