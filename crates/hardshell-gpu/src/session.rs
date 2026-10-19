@@ -1,6 +1,7 @@
 //! One GPT-2 session on the GPU, with the API shape of `hardshell::gpt2::Session`.
 
 use hardshell::TokenId;
+use hardshell::gpt2::Overlap;
 
 use crate::batch::GpuBatch;
 use crate::error::Result;
@@ -20,6 +21,22 @@ impl<'m> GpuSession<'m> {
     /// The errors of [`GpuBatch::new`].
     pub fn new(model: &'m GpuModel) -> Result<Self> {
         Ok(Self { batch: GpuBatch::new(model, 1)? })
+    }
+
+    /// Makes a session with an empty context and the context overlap `overlap` (ADR 0015), as
+    /// `hardshell::gpt2::ReferenceSession::with_overlap` and
+    /// `hardshell::gpt2::SessionConfig::with_overlap` do.
+    ///
+    /// # Errors
+    /// The errors of [`GpuBatch::with_overlap`]: `InvalidOverlap` if `K > n_ctx - 2`.
+    pub fn with_overlap(model: &'m GpuModel, overlap: Overlap) -> Result<Self> {
+        Ok(Self { batch: GpuBatch::with_overlap(model, 1, overlap)? })
+    }
+
+    /// The context overlap of this session (ADR 0015).
+    #[must_use]
+    pub fn overlap(&self) -> Overlap {
+        self.batch.overlap()
     }
 
     /// Empties the context.

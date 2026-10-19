@@ -9,10 +9,10 @@
 mod common;
 mod support;
 
-use common::builder::{build, tiny_dims};
+use common::builder::{build, build_wide, tiny_dims};
 use hardshell::TokenId;
 use hardshell::gpt2::{Model, Session};
-use hardshell_gpu::{GpuBatch, GpuModel, GpuSession};
+use hardshell_gpu::{Error, GpuBatch, GpuModel, GpuSession};
 use sha2::{Digest, Sha256};
 use support::device;
 
@@ -129,4 +129,15 @@ fn step_refuses_bad_slots_and_tokens() {
     assert!(batch.step(&[(1, TokenId::new(300))]).is_err());
     assert_eq!(batch.position(0), 0);
     assert_eq!(batch.position(1), 0);
+}
+
+#[test]
+fn model_file_version_2_is_refused() {
+    // The kernels implement only the rules of model-file version 1 (ADR 0004 addendum B).
+    let Some(dev) = device("model_file_version_2_is_refused") else { return };
+    let wide = build_wide(tiny_dims(), 5, 16);
+    assert!(Model::load(&wide.bytes).unwrap().is_wide());
+    let e = GpuModel::load(&dev, &wide.bytes).unwrap_err();
+    assert!(matches!(e, Error::Unsupported { .. }), "{e}");
+    assert!(GpuModel::load(&dev, &build(tiny_dims(), 5, 16).bytes).is_ok());
 }

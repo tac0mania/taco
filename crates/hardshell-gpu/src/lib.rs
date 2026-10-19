@@ -13,7 +13,7 @@
 //! - [`GpuDevice`]: an adapter and its device.
 //! - [`GpuModel`]: a GPT-2 model file in GPU memory.
 //! - [`GpuBatch`]: many independent sessions that step together, so one read of the weights
-//!   serves many tokens.
+//!   serves many tokens. A batch has a context overlap `K` (ADR 0015), as the CPU paths.
 //! - [`GpuSession`]: one session, with the API shape of `hardshell::gpt2::Session`.
 //! - [`GpuOps`]: single ops, for tests and measurements.
 #![deny(clippy::float_arithmetic)]
