@@ -136,6 +136,24 @@ gpumixer (the mixer on the GPU in hardshell-cuda). Status files in .agent-status
 Open items for Rohit: the GPU power cap (laptop power mode); the patent freedom-to-operate
 check before commercial use; the business validation steps (customer conversations).
 
+### 4c. State on 2026-10-19 at 08:25 +04 (the Mac is not available during the day)
+
+- Committed: the GPU mixer (dda9edd). No agent runs. The lead stopped the overlap agent. Its
+  work (28 files) is in the working tree and is NOT committed. Its state is in
+  `.agent-status/overlap.md`.
+- A Mac binary of dda9edd, with `gpt2.hsm` and a README, is in `~/Downloads/taco`. Round
+  trips on the Mac passed (CPU and Metal).
+- Jobs on devbox (tmux, no agent needed):
+  - `overlap-b64`, then `overlap-b16k0`, then `overlap-b16k512` (moved from the Mac): log
+    sizes for the block-size decision, processors 8-13. Output: `~/scratch/overlap/`.
+  - `overlap-speed`: fold and unfold speed, processors 0-5.
+  - `bench-whole-gpu`: starts after `overlap-speed`. All 23 whole files (profile text, CUDA),
+    then 6 logs and twitter.json (profile logs). Binary: the overlap tree (not committed).
+    Output: `~/bench/whole-gpu/results.tsv` (the last line is DONE).
+- Next: read the results, resume the overlap work (note, block size, ADRs), commit it. Then
+  the GPU mixer in fold/unfold. Owner decisions that are open: learn while reading (level 1),
+  the small fast model (a change to ADR 0005).
+
 ## 5. Next steps, in order
 
 1. **Phase 2 gate: passed** on 2026-10-18 (`docs/research/2026-10-18-cross-machine.md`). Run
