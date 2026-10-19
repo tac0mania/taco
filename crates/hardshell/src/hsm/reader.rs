@@ -4,11 +4,13 @@ use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
 
-use super::header::{Header, ModelConfig, TensorEntry};
+use super::header::{Header, ModelConfig, TensorEntry, V2Constants};
 use super::merges::{self, MergePair};
-use super::{MAGIC, MAX_VOCAB, PREAMBLE_LEN, VERSION, align64, is_valid_name};
+use super::{
+    MAGIC, MAX_VOCAB, PREAMBLE_LEN, VERSION_1, VERSION_2, align64, is_valid_name, required_version,
+};
 use crate::error::{Error, Result};
-use crate::layernorm::LnConstants;
+use crate::layernorm::{LnConstants, MAX_BETA_FRAC};
 use crate::softmax::MAX_P;
 use crate::tensor::{DType, Element, Tensor};
 use crate::types::{ModelHash, TokenId};
@@ -189,7 +191,10 @@ impl Vocabulary {
 /// A parsed and validated `.hsm` file. All tensors are owned copies.
 #[derive(Clone, Debug)]
 pub struct HsmFile {
+    version: u32,
     config: ModelConfig,
+    ln_f_bits: u8,
+    ln_beta_frac: u8,
     vocabulary: Vocabulary,
     tensors: BTreeMap<String, StoredTensor>,
     order: Vec<String>,
@@ -253,6 +258,31 @@ fn check_config(c: &ModelConfig) -> Result<()> {
     Ok(())
 }
 
+/// Checks the format version rules (module documentation, "Format version 2").
+fn check_version(version: u32, v2: V2Constants, tensors: &[TensorEntry]) -> Result<()> {
+    if v2.ln_f_bits.is_some_and(|b| b != 16) {
+        return Err(Error::InvalidHeader {
+            field: "model.constants.ln_f_bits".into(),
+            reason: "must be 16 (omit the field for 8)",
+        });
+    }
+    if v2.ln_beta_frac.is_some_and(|f| f == 0 || f > MAX_BETA_FRAC) {
+        return Err(Error::InvalidHeader {
+            field: "model.constants.ln_beta_frac".into(),
+            reason: "must be in 1..=16 (omit the field for 0)",
+        });
+    }
+    let entries = tensors.iter().map(|e| (e.name.as_str(), e.dtype.as_str()));
+    if required_version(v2.any(), entries) != version {
+        return Err(Error::InvalidHeader {
+            field: "version".into(),
+            reason: "a file is version 2 if and only if it has a version 2 constant or an i16 \
+                     GELU table",
+        });
+    }
+    Ok(())
+}
+
 fn read_tensor(bytes: &[u8], e: &TensorEntry, expected_offset: u64) -> Result<StoredTensor> {
     let mismatch = |reason| Error::TensorMismatch { name: e.name.clone(), reason };
     let dtype = DType::from_name(&e.dtype).ok_or(mismatch("unknown dtype"))?;
@@ -291,7 +321,7 @@ fn read_tensor(bytes: &[u8], e: &TensorEntry, expected_offset: u64) -> Result<St
 }
 
 impl HsmFile {
-    /// Parses and validates a full `.hsm` file (format version 1).
+    /// Parses and validates a full `.hsm` file (format version 1 or 2).
     ///
     /// Cost: one pass over the file to copy the tensors, and one SHA-256 pass for the model
     /// hash. The result holds a copy of every tensor.
@@ -308,7 +338,7 @@ impl HsmFile {
             return Err(Error::BadMagic);
         }
         let version = u32::from_le_bytes(le_bytes(pre.get(8..12).unwrap_or(&[])));
-        if version != VERSION {
+        if version != VERSION_1 && version != VERSION_2 {
             return Err(Error::UnsupportedVersion { version });
         }
         let header_len = u64::from(u32::from_le_bytes(le_bytes(pre.get(12..16).unwrap_or(&[]))));
@@ -319,7 +349,10 @@ impl HsmFile {
             column: e.column(),
             message: e.to_string(),
         })?;
-        check_config(&header.model)?;
+        let (config, v2) = header.model.into_parts();
+        check_config(&config)?;
+        check_version(version, v2, &header.tensors)?;
+        let (ln_f_bits, ln_beta_frac) = (v2.ln_f_bits.unwrap_or(8), v2.ln_beta_frac.unwrap_or(0));
 
         let header_end = PREAMBLE_LEN + header_len;
         let layout_err = |name: &str, reason| Error::Layout { name: name.into(), reason };
@@ -329,7 +362,7 @@ impl HsmFile {
         }
         check_padding(bytes, header_end, vocab_offset)?;
         let section = slice(bytes, vocab_offset, header.vocabulary.length)?;
-        let mut vocabulary = Vocabulary::parse(section, header.model.vocab_size)?;
+        let mut vocabulary = Vocabulary::parse(section, config.vocab_size)?;
 
         let mut cursor = vocab_offset + header.vocabulary.length;
         if let Some(m) = header.merges {
@@ -371,13 +404,33 @@ impl HsmFile {
             return Err(layout_err("file", "the file does not end at the end of the last section"));
         }
         let hash = ModelHash::from_bytes(Sha256::digest(bytes).into());
-        Ok(Self { config: header.model, vocabulary, tensors, order, hash })
+        Ok(Self { version, config, ln_f_bits, ln_beta_frac, vocabulary, tensors, order, hash })
     }
 
     /// The model description of the header.
     #[must_use]
     pub fn config(&self) -> &ModelConfig {
         &self.config
+    }
+
+    /// The format version of the file: [`super::VERSION_1`] or [`super::VERSION_2`].
+    #[must_use]
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// The output bits of the final LayerNorm: 8 (version 1, and version 2 without the header
+    /// constant `ln_f_bits`) or 16 (version 2 with `ln_f_bits = 16`).
+    #[must_use]
+    pub fn ln_f_bits(&self) -> u8 {
+        self.ln_f_bits
+    }
+
+    /// The extra bits of every LayerNorm beta: 0 (version 1, and version 2 without the header
+    /// constant `ln_beta_frac`) or 1 to 16 (`LayerNorm::with_beta_frac`).
+    #[must_use]
+    pub fn ln_beta_frac(&self) -> u8 {
+        self.ln_beta_frac
     }
 
     /// The vocabulary.

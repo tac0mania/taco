@@ -37,7 +37,7 @@ from convert import exact as ex
 from convert import recipe as rc
 from convert.build import build
 from convert.calibrate import STATS_PATH
-from convert.hsmfile import to_bytes, write_bytes
+from convert.hsmfile import to_bytes, version_of, write_bytes
 from convert.model import load_gpt2
 from convert.selfcheck import Inputs, SelfCheckError, check
 
@@ -87,11 +87,12 @@ def main() -> int:
     inputs = Inputs(name, model_sha, args.recipe, stats_sha)
     with ex.no_float_model():
         stats = rc.load_stats(args.stats)
-        sc = rc.scales(stats, rc.RECIPES[args.recipe])
+        sc = rc.scales(stats, rc.RECIPES[args.recipe], wide=rc.WIDE.get(args.recipe, frozenset()))
         tok = Tokenizer()
         vocab, merges = vocabulary_and_merges(tok)
         fm = load_gpt2(args.model)
-        hsm = build(fm, sc, vocab, merges)
+        frac = rc.BETA_FRAC.get(args.recipe, 0)
+        hsm = build(fm, sc, vocab, merges, ln_beta_frac=frac)
         data = to_bytes(hsm)
     size, sha = len(data), hashlib.sha256(data).hexdigest()
     try:
@@ -108,6 +109,9 @@ def main() -> int:
                    "stats": str(args.stats.name), "stats_sha256": stats_sha},
         "recipe": args.recipe,
         "recipe_rules": rc.RECIPES[args.recipe],
+        "i16_sites": sorted(sc.wide),
+        "ln_beta_frac": frac,
+        "hsm_version": version_of(hsm),
         "residual_scale": res,
         "residual_scale_exact": str(sc.res),
         "residual_max_units": float(stats["residual"]["max"] / sc.res),
@@ -122,7 +126,8 @@ def main() -> int:
     }
     rec_path = args.out.with_suffix(".ranges.json")
     rec_path.write_text(json.dumps(record, indent=1))
-    print(f"wrote {args.out}: {size} bytes, sha256 {sha} ({time.time() - t0:.1f} s)")
+    print(f"wrote {args.out}: {size} bytes, hsm version {version_of(hsm)}, sha256 {sha} "
+          f"({time.time() - t0:.1f} s)")
     print(f"wrote {rec_path}")
     return 0
 

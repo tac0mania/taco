@@ -6,7 +6,10 @@ use hardshell::hsm::{Constants, HsmWriter, ModelConfig, TensorData};
 use hardshell::tensor::Tensor;
 
 use super::reference::{Calib, Dims, FBlock, FloatModel, Lin, QMat};
-use super::{Rng, exp_table_i32, exp_table_u64, gelu_table, pow2, quant_mult, quant_mult_rows};
+use super::{
+    Rng, exp_table_i32, exp_table_u64, gelu_table, gelu_table_i16, pow2, quant_mult,
+    quant_mult_rows,
+};
 
 pub(crate) const LN_K: u8 = 48;
 pub(crate) const LN_J: u8 = 8;
@@ -98,10 +101,13 @@ fn i8_matrix(m: &QMat) -> TensorData {
 }
 
 /// Quantised LayerNorm tensors: gamma (i16), beta (i32, output units), rescale (m, s).
-fn add_layernorm(w: &mut HsmWriter, p: &str, g: &[f64], b: &[f64], s_out: f64) {
+/// LayerNorm tensors. `frac` is the header constant `ln_beta_frac` (0 in version 1): beta is
+/// stored in units of `s_out / 2^frac`.
+fn add_layernorm(w: &mut HsmWriter, p: &str, g: &[f64], b: &[f64], s_out: f64, frac: u8) {
     let s_gamma = g.iter().fold(0.0f64, |a, v| a.max(v.abs())) / 32767.0;
     let gq: Vec<i16> = g.iter().map(|v| (v / s_gamma).round() as i16).collect();
-    let bq: Vec<i32> = b.iter().map(|v| (v / s_out).round() as i32).collect();
+    let unit = s_out / pow2(i32::from(frac));
+    let bq: Vec<i32> = b.iter().map(|v| (v / unit).round() as i32).collect();
     let (m, s) = quant_mult(s_gamma / (pow2(i32::from(LN_K) - i32::from(LN_J)) * s_out));
     w.add_tensor(format!("{p}.g"), TensorData::I16(Tensor::new(&[gq.len()], gq).unwrap()), None);
     w.add_tensor(format!("{p}.b"), i32_tensor(bq), None);
@@ -121,8 +127,20 @@ fn add_linear(w: &mut HsmWriter, p: &str, l: &Lin, s_in: f64, s_out: &dyn Fn(usi
 }
 
 /// Builds a model: random weights from `seed`, calibration on `calib_tokens` (which start with
-/// the `<|endoftext|>` token), and the `.hsm` bytes.
+/// the `<|endoftext|>` token), and the `.hsm` bytes (format version 1).
 pub(crate) fn build(d: Dims, seed: u64, calib_len: usize) -> Built {
+    build_with(d, seed, calib_len, false)
+}
+
+/// The model of [`build`] with `i16` GELU outputs, `i16` final LayerNorm outputs and a LayerNorm
+/// beta with 8 more bits (hsm format version 2, ADR 0004 addendum B). The float weights are the
+/// same as for `build`.
+pub(crate) fn build_wide(d: Dims, seed: u64, calib_len: usize) -> Built {
+    build_with(d, seed, calib_len, true)
+}
+
+fn build_with(d: Dims, seed: u64, calib_len: usize, wide: bool) -> Built {
+    let act_max = if wide { 32767.0 } else { 127.0 };
     let mut rng = Rng::new(seed);
     let float = random_model(d, &mut rng);
     let eot = d.vocab - 1;
@@ -151,8 +169,14 @@ pub(crate) fn build(d: Dims, seed: u64, calib_len: usize) -> Built {
     };
     let mut w = HsmWriter::new(config);
     w.set_vocabulary(vocabulary(d.vocab));
+    // The tiny wide model uses all rules of version 2: ln_beta_frac = 8 as the recipe `wide`.
+    let frac = if wide { 8 } else { 0 };
+    if wide {
+        w.set_ln_f_bits(16);
+        w.set_ln_beta_frac(frac);
+    }
 
-    let s_lnf = c.lnf / 127.0;
+    let s_lnf = c.lnf / act_max;
     w.add_tensor("wte", i8_matrix(&float.wte), None);
     let embed: Vec<f64> = float.wte.scale.iter().map(|s| s / s_res).collect();
     let (m, s) = quant_mult_rows(&embed);
@@ -171,8 +195,8 @@ pub(crate) fn build(d: Dims, seed: u64, calib_len: usize) -> Built {
         let (s_q, s_k, s_v) = (c.q[l] / 127.0, c.k[l] / 127.0, c.v[l] / 127.0);
         let s_att = c.att[l] / 127.0;
         let s_gin = c.fc[l] / 32767.0;
-        let s_gout = c.gelu[l] / 127.0;
-        add_layernorm(&mut w, &format!("{p}.ln_1"), &b.ln1_g, &b.ln1_b, s_ln1);
+        let s_gout = c.gelu[l] / act_max;
+        add_layernorm(&mut w, &format!("{p}.ln_1"), &b.ln1_g, &b.ln1_b, s_ln1, frac);
         let dm = d.d_model;
         let qkv_scale = move |r: usize| {
             if r < dm {
@@ -189,17 +213,19 @@ pub(crate) fn build(d: Dims, seed: u64, calib_len: usize) -> Built {
         let (m, s) = quant_mult(s_v / (pow2(i32::from(SOFTMAX_P)) * s_att));
         w.add_tensor(format!("{p}.attn.out.rescale"), i32_tensor(vec![m]), Some(s));
         add_linear(&mut w, &format!("{p}.attn.c_proj"), &b.c_proj, s_att, &|_| s_res);
-        add_layernorm(&mut w, &format!("{p}.ln_2"), &b.ln2_g, &b.ln2_b, s_ln2);
+        add_layernorm(&mut w, &format!("{p}.ln_2"), &b.ln2_g, &b.ln2_b, s_ln2, frac);
         add_linear(&mut w, &format!("{p}.mlp.c_fc"), &b.fc, s_ln2, &|_| s_gin);
-        let g = gelu_table(16, s_gin, s_gout);
-        w.add_tensor(
-            format!("{p}.mlp.gelu"),
-            TensorData::I8(Tensor::new(&[g.len()], g).unwrap()),
-            None,
-        );
+        let table = if wide {
+            let g = gelu_table_i16(16, s_gin, s_gout);
+            TensorData::I16(Tensor::new(&[g.len()], g).unwrap())
+        } else {
+            let g = gelu_table(16, s_gin, s_gout);
+            TensorData::I8(Tensor::new(&[g.len()], g).unwrap())
+        };
+        w.add_tensor(format!("{p}.mlp.gelu"), table, None);
         add_linear(&mut w, &format!("{p}.mlp.c_proj"), &b.proj, s_gout, &|_| s_res);
     }
-    add_layernorm(&mut w, "ln_f", &float.lnf_g, &float.lnf_b, s_lnf);
+    add_layernorm(&mut w, "ln_f", &float.lnf_g, &float.lnf_b, s_lnf, frac);
     w.add_tensor("attn_exp", i32_tensor(exp_table_i32(30, delta, TABLE_LEN)), None);
     let t = exp_table_u64(40, delta, TABLE_LEN);
     w.add_tensor("logits_exp", TensorData::U64(Tensor::new(&[t.len()], t).unwrap()), None);

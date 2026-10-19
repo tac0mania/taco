@@ -447,25 +447,28 @@ def _gelu(v: Decimal, c: Decimal, ctx: Context) -> Decimal:
     return ctx.multiply(ctx.multiply(Decimal("0.5"), v), ctx.add(Decimal(1), t))
 
 
-def gelu_table(bits: int, s_in: Fraction, s_out: Fraction) -> np.ndarray:
-    """A GELU table for inputs of `bits` bits at scale s_in, with i8 outputs at scale s_out.
+def gelu_table(bits: int, s_in: Fraction, s_out: Fraction, out_max: int = I8_MAX) -> np.ndarray:
+    """A GELU table for inputs of `bits` bits at scale s_in, with outputs at scale s_out.
 
-    The entry at index `x + 2^(bits-1)` is clamp(R(gelu(x * s_in) / s_out), -127, 127).
-    The identity gelu(-v) = gelu(v) - v gives the negative half from the positive half.
-    Cost: one decimal `exp` for each positive x (32,767 for an i16 table).
+    The entry at index `x + 2^(bits-1)` is clamp(R(gelu(x * s_in) / s_out), -q, q) with
+    `q = out_max`: 127 for an i8 table, 32,767 for an i16 table (hsm version 2, ADR 0004
+    addendum B). The identity gelu(-v) = gelu(v) - v gives the negative half from the positive
+    half. Cost: one decimal `exp` for each positive x (32,767 for an i16 input).
     """
+    if out_max not in (I8_MAX, I16_MAX):
+        raise ValueError(f"out_max must be {I8_MAX} or {I16_MAX}")
     ctx = context()
     c = ctx.sqrt(ctx.divide(Decimal(2), _pi(ctx)))
     half = 1 << (bits - 1)
-    out = np.zeros(2 * half, dtype=np.int8)
-    lim = Decimal(I8_MAX + 1)
+    out = np.zeros(2 * half, dtype=np.int8 if out_max == I8_MAX else np.int16)
+    lim = Decimal(out_max + 1)
     num, den = Decimal(s_out.denominator), Decimal(s_out.numerator)
 
     def entry(y: Decimal) -> int:
         if ctx.abs(y) >= lim:
-            return I8_MAX if y > 0 else -I8_MAX
+            return out_max if y > 0 else -out_max
         TieStats.see(y, ctx)
-        return max(-I8_MAX, min(I8_MAX, _round_entry(y, ctx, "gelu_table")))
+        return max(-out_max, min(out_max, _round_entry(y, ctx, "gelu_table")))
 
     for x in range(1, half + 1):
         v = _dec(Fraction(x) * s_in, ctx)

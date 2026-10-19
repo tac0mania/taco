@@ -12,7 +12,7 @@
 //! `len * 2^14 <= 2^30 < 2^31`. Thus no partial sum overflows, and the order of the additions
 //! does not change the result.
 
-use super::{MAX_DOT_LEN_I32, portable};
+use super::{MAX_DOT_LEN_I32, MAX_DOT_LEN_I64, portable};
 use crate::error::{Error, Result};
 use crate::int::{clamp, clamp_wide, rescale};
 
@@ -162,6 +162,36 @@ impl Kernels {
             #[cfg(target_arch = "x86_64")]
             Isa::Avx2(cpu) => super::avx2::matmul(cpu, w, x, shape, out),
         }
+        Ok(())
+    }
+}
+
+impl Kernels {
+    /// The matrix product `out[r][o] = w[o] . x[r]` for `i8` weights and `i16` activations,
+    /// with `i64` results: the same values as [`super::dot_i8_i16`]. This is the product of
+    /// the `i16` activations of hsm format version 2 (ADR 0004 addendum B).
+    ///
+    /// The shapes are the shapes of [`Kernels::matmul_i8`]. Every selection uses the portable
+    /// code (`portable::matmul_i8_i16`).
+    ///
+    /// PERF: no SIMD variant yet. The portable loop sums blocks of 256 products in `i32`, which
+    /// the compiler can vectorise.
+    ///
+    /// # Errors
+    /// [`Error::DotTooLong`] if `cols > MAX_DOT_LEN_I64`; [`Error::LengthMismatch`] if `cols`
+    /// is 0 or does not divide `w.len()` or `x.len()`, or if `out.len()` is not `n * rows`.
+    pub fn matmul_i8_i16(self, w: &[i8], x: &[i16], cols: usize, out: &mut [i64]) -> Result<()> {
+        if cols > MAX_DOT_LEN_I64 {
+            return Err(Error::DotTooLong { len: cols, max: MAX_DOT_LEN_I64 });
+        }
+        if cols == 0 || !w.len().is_multiple_of(cols) || !x.len().is_multiple_of(cols) {
+            return Err(Error::LengthMismatch { expected: cols, found: w.len() });
+        }
+        let (rows, n) = (w.len() / cols, x.len() / cols);
+        if out.len() != rows * n {
+            return Err(Error::LengthMismatch { expected: rows * n, found: out.len() });
+        }
+        portable::matmul_i8_i16(w, x, cols, out);
         Ok(())
     }
 }

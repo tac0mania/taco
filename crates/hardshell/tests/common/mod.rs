@@ -127,6 +127,15 @@ pub(crate) fn exp_table_u64(e: i32, delta: f64, len: usize) -> Vec<u64> {
 }
 
 /// A GELU table for inputs of `bits` bits at scale s_in, with i8 outputs at scale s_out.
+/// A GELU table with `i16` outputs (hsm format version 2): the rule of [`gelu_table`] with the
+/// clamp at 32,767.
+pub(crate) fn gelu_table_i16(bits: u32, s_in: f64, s_out: f64) -> Vec<i16> {
+    let half = 1i64 << (bits - 1);
+    (-half..half)
+        .map(|q| (gelu(q as f64 * s_in) / s_out).round().clamp(-32767.0, 32767.0) as i16)
+        .collect()
+}
+
 pub(crate) fn gelu_table(bits: u32, s_in: f64, s_out: f64) -> Vec<i8> {
     let half = 1i64 << (bits - 1);
     (-half..half)

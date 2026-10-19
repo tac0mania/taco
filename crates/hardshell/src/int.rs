@@ -89,6 +89,22 @@ pub const fn rescale_wide(x: i128, m: i32, s: u8) -> i128 {
     shift_round(product, s, RESCALE_WIDE_MAX_SHIFT)
 }
 
+/// Rescale with an addend before the rounding: `floor((x * m + c + 2^(s-1)) / 2^s)`.
+///
+/// This is [`rescale_wide`] with one more term. The LayerNorm of a model file with
+/// `ln_beta_frac` uses it to add `beta` before the one rounding (ADR 0004 addendum B).
+///
+/// The result is exact if `|x| < 2^95`, `|c| < 2^124` and `s <= 120`: then
+/// `|x * m + c| < 2^126 + 2^124`, and no step overflows. If the caller breaks this bound, the operations wrap: the result is
+/// wrong but it is still defined, and it is the same on every machine. Cost: one 128-bit
+/// multiplication.
+#[must_use]
+pub const fn rescale_wide_offset(x: i128, m: i32, c: i128, s: u8) -> i128 {
+    // INVARIANT: the caller keeps the bound of the doc comment.
+    let p = x.wrapping_mul(m as i128).wrapping_add(c);
+    shift_round(p, s, RESCALE_WIDE_MAX_SHIFT)
+}
+
 /// `floor((p + 2^(s-1)) / 2^s)`. The caller gives `max_shift <= 126` such that
 /// `|p| < 2^max_shift` and `|p| + 2^(max_shift-1) < 2^127`.
 const fn shift_round(p: i128, s: u8, max_shift: u32) -> i128 {
@@ -142,6 +158,20 @@ pub const fn clamp_act_i8(x: i128) -> i8 {
     // INVARIANT: -127 <= c <= 127, so the conversion is exact.
     #[allow(clippy::cast_possible_truncation)]
     let narrow = c as i8;
+    narrow
+}
+
+/// The largest value of an `i16` activation (hsm format version 2, ADR 0004 addendum B).
+/// Activations are symmetric: `-32767..=32767`.
+pub const ACT_I16_MAX: i64 = 32_767;
+
+/// Clamp to the symmetric `i16` activation range `[-32767, 32767]` and convert.
+#[must_use]
+pub const fn clamp_act_i16(x: i128) -> i16 {
+    let c = clamp_wide(x, -ACT_I16_MAX, ACT_I16_MAX);
+    // INVARIANT: -32767 <= c <= 32767, so the conversion is exact.
+    #[allow(clippy::cast_possible_truncation)]
+    let narrow = c as i16;
     narrow
 }
 

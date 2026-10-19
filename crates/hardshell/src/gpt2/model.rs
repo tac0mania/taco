@@ -8,7 +8,7 @@ use crate::kernels::MAX_DOT_LEN_I32;
 use crate::layernorm::{LayerNorm, LnConstants, MAX_WIDTH};
 use crate::logits::LogitTable;
 use crate::softmax::ExpTable;
-use crate::tensor::Matrix;
+use crate::tensor::{DType, Matrix};
 use crate::types::{ModelHash, TokenId};
 
 /// One rescale `(m, s)` with a single multiplier.
@@ -33,6 +33,31 @@ pub(crate) struct Linear {
     pub(crate) rescale: RowRescale,
 }
 
+/// The GELU table of one block: `i8` outputs (format version 1), or `i16` outputs (format
+/// version 2, ADR 0004 addendum B). The dtype of the tensor `h.{l}.mlp.gelu` selects it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Gelu {
+    /// `i8` outputs.
+    Narrow(GeluTable<i8>),
+    /// `i16` outputs.
+    Wide(GeluTable<i16>),
+}
+
+impl Gelu {
+    /// The input range of the table: `(min, max)`.
+    pub(crate) fn input_range(&self) -> (i64, i64) {
+        match self {
+            Self::Narrow(t) => (t.min_input(), t.max_input()),
+            Self::Wide(t) => (t.min_input(), t.max_input()),
+        }
+    }
+
+    /// `true` for a table with `i16` outputs.
+    pub(crate) fn is_wide(&self) -> bool {
+        matches!(self, Self::Wide(_))
+    }
+}
+
 /// One transformer block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Block {
@@ -43,7 +68,7 @@ pub(crate) struct Block {
     pub(crate) c_proj: Linear,
     pub(crate) ln_2: LayerNorm,
     pub(crate) c_fc: Linear,
-    pub(crate) gelu: GeluTable,
+    pub(crate) gelu: Gelu,
     pub(crate) mlp_proj: Linear,
 }
 
@@ -74,6 +99,10 @@ pub struct Model {
     pub(crate) pos: RowRescale,
     pub(crate) blocks: Vec<Block>,
     pub(crate) ln_f: LayerNorm,
+    /// The output bits of `ln_f`: 8, or 16 (format version 2).
+    pub(crate) ln_f_bits: u8,
+    /// The extra bits of every LayerNorm beta: 0, or 1 to 16 (format version 2).
+    pub(crate) ln_beta_frac: u8,
     pub(crate) attn_exp: ExpTable,
     pub(crate) logits_exp: LogitTable,
     vocabulary: Vocabulary,
@@ -203,10 +232,10 @@ impl Loader {
         let g = self.i16_vec(&format!("{prefix}.g"), d)?;
         let b = self.i32_vec(&format!("{prefix}.b"), d)?;
         let r = self.rescale(&format!("{prefix}.rescale"))?;
-        LayerNorm::new(g, b, r.m, r.s)
+        LayerNorm::with_beta_frac(g, b, r.m, r.s, self.file.ln_beta_frac())
     }
 
-    fn gelu(&mut self, name: &str) -> Result<GeluTable> {
+    fn gelu(&mut self, name: &str) -> Result<Gelu> {
         let t = self.file.tensor(name).ok_or(Error::MissingTensor { name: name.into() })?;
         let len = t.data().dims().first().copied().unwrap_or(0);
         if len != 256 && len != 65_536 {
@@ -215,7 +244,11 @@ impl Loader {
                 reason: "a GELU table has 256 or 65536 entries",
             });
         }
-        GeluTable::new(self.i8_vec(name, len)?)
+        // NOTE: the reader permits an i16 GELU table only in a version 2 file.
+        match t.data().dtype() {
+            DType::I16 => Ok(Gelu::Wide(GeluTable::new(self.i16_vec(name, len)?)?)),
+            _ => Ok(Gelu::Narrow(GeluTable::new(self.i8_vec(name, len)?)?)),
+        }
     }
 
     fn table_len(&self, name: &str) -> Result<usize> {
@@ -260,6 +293,7 @@ impl Model {
         let file = HsmFile::parse(bytes)?;
         let d = check_dims(&file)?;
         let c = file.config().clone();
+        let (ln_f_bits, ln_beta_frac) = (file.ln_f_bits(), file.ln_beta_frac());
         let ln_consts = LnConstants::new(c.constants.ln_k, c.constants.ln_j, c.constants.ln_eps)?;
         let mut ld = Loader { file };
         let wte = ld.i8_matrix("wte", d.vocab, d.d_model)?;
@@ -298,6 +332,8 @@ impl Model {
             pos,
             blocks,
             ln_f,
+            ln_f_bits,
+            ln_beta_frac,
             attn_exp,
             logits_exp,
             vocabulary: ld.file.into_vocabulary(),
@@ -327,6 +363,23 @@ impl Model {
     #[must_use]
     pub fn vocabulary(&self) -> &Vocabulary {
         &self.vocabulary
+    }
+
+    /// The output bits of the final LayerNorm: 8, or 16 for a model file of format version 2
+    /// with `ln_f_bits = 16` (ADR 0004 addendum B).
+    #[must_use]
+    pub fn ln_f_bits(&self) -> u8 {
+        self.ln_f_bits
+    }
+
+    /// `true` if the model uses a rule of format version 2 (ADR 0004 addendum B): an `i16`
+    /// GELU table, `ln_f_bits = 16`, or `ln_beta_frac`. A backend that does not implement
+    /// these rules must refuse such a model.
+    #[must_use]
+    pub fn is_wide(&self) -> bool {
+        self.ln_f_bits == 16
+            || self.ln_beta_frac > 0
+            || self.blocks.iter().any(|b| b.gelu.is_wide())
     }
 
     /// The SHA-256 of the model file.

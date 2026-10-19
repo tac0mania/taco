@@ -37,6 +37,22 @@ def rescale_exact(x: np.ndarray, m, s: int) -> np.ndarray:
     return (x * m + (np.int64(1) << np.int64(s - 1))) >> np.int64(s)
 
 
+def rescale_wide(x: np.ndarray, m, s: int) -> np.ndarray:
+    """The rule of `rescale_exact` for |x| < 2^46 and 0 <= m < 2^31 (the i16 activations).
+
+    m = mh * 2^16 + ml, so each product is below 2^62, and
+    floor((x * m + 2^(s-1)) / 2^s) = floor((x * mh + floor((x * ml + 2^(s-1)) / 2^16)) / 2^(s-16))
+    for s >= 16. Exact.
+    """
+    x = np.asarray(x, dtype=np.int64)
+    m = np.asarray(m, dtype=np.int64)
+    if s < 16 or s > 62:
+        raise ValueError(f"rescale_wide: shift {s} is not in 16..=62")
+    mh, ml = m >> np.int64(16), m & np.int64(0xFFFF)
+    low = (x * ml + (np.int64(1) << np.int64(s - 1))) >> np.int64(16)
+    return (x * mh + low) >> np.int64(s - 16)
+
+
 def rescale_float(x: np.ndarray, m, s: int) -> np.ndarray:
     """The same rule in float64, for products that do not fit in int64 (near, not exact)."""
     return np.floor(np.asarray(x, dtype=np.float64) * (float(m) * nm.pow2(-s)) + 0.5)
@@ -51,6 +67,8 @@ class IntModel:
         self.k, self.j = c["constants"]["ln_k"], c["constants"]["ln_j"]
         self.eps = c["constants"]["ln_eps"]
         self.p = c["constants"]["softmax_p"]
+        self.lnf_max = 32767 if c["constants"].get("ln_f_bits") == 16 else 127
+        self.beta_frac = c["constants"].get("ln_beta_frac", 0)
         self.t = {t.name: t for t in hsm.tensors}
 
     def arr(self, name: str) -> np.ndarray:
@@ -64,7 +82,7 @@ class IntModel:
 Hook = Callable[[str, np.ndarray], None]
 
 
-def layernorm(im: IntModel, prefix: str, x: np.ndarray) -> np.ndarray:
+def layernorm(im: IntModel, prefix: str, x: np.ndarray, qmax: int = 127) -> np.ndarray:
     g = im.arr(prefix + ".g").astype(np.float64)
     b = im.arr(prefix + ".b").astype(np.int64)
     m, s = im.resc(prefix + ".rescale")
@@ -74,16 +92,27 @@ def layernorm(im: IntModel, prefix: str, x: np.ndarray) -> np.ndarray:
     var = np.floor((c * c).sum(axis=1) / n)
     root = np.floor(np.sqrt(var * nm.pow2(2 * im.j) + im.eps))
     inv = np.floor(nm.pow2(im.k) / np.maximum(root, 1.0))
-    y = np.floor(c * inv[:, None] * g[None, :] * (float(m[0]) * nm.pow2(-s)) + 0.5)
-    return np.clip(y + b, -127, 127).astype(np.int64)
+    t = c * inv[:, None] * g[None, :] * (float(m[0]) * nm.pow2(-s))
+    if im.beta_frac:
+        # hsm version 2: beta has `beta_frac` more bits, added before the one rounding.
+        y = np.floor(t + b * nm.pow2(-im.beta_frac) + 0.5)
+        return np.clip(y, -qmax, qmax).astype(np.int64)
+    return np.clip(np.floor(t + 0.5) + b, -qmax, qmax).astype(np.int64)
 
 
 def linear(im: IntModel, prefix: str, a: np.ndarray) -> np.ndarray:
-    """rescale(w . a + b) for each row, before the clamp. Exact."""
+    """rescale(w . a + b) for each row, before the clamp. Exact.
+
+    An i16 input (hsm version 2) gives |acc| < 2^46 (est. bound 2^16 * 2^7 * 2^15 + |b|): the
+    float64 product is still exact (< 2^53), and `rescale_wide` keeps the rescale exact.
+    """
     w = im.arr(prefix + ".w").astype(np.float64)
-    acc = np.rint(a.astype(np.float64) @ w.T).astype(np.int64)  # exact: |acc| < 2^30 < 2^53
+    acc = np.rint(a.astype(np.float64) @ w.T).astype(np.int64)  # exact: |acc| < 2^53
     m, s = im.resc(prefix + ".rescale")
-    return rescale_exact(acc + im.arr(prefix + ".b").astype(np.int64), m[None, :], s)
+    acc = acc + im.arr(prefix + ".b").astype(np.int64)
+    if np.abs(acc).max(initial=0) >= 1 << 31:
+        return rescale_wide(acc, m[None, :], s)
+    return rescale_exact(acc, m[None, :], s)
 
 
 def forward(im: IntModel, tokens: np.ndarray, hook: Hook | None = None) -> np.ndarray:
@@ -140,11 +169,12 @@ def forward(im: IntModel, tokens: np.ndarray, hook: Hook | None = None) -> np.nd
         see(p + ".gelu", g)
         x = np.clip(x + linear(im, p + ".mlp.c_proj", g), -R, R)
         see("res", x)
-    a = layernorm(im, "ln_f", x)
+    a = layernorm(im, "ln_f", x, im.lnf_max)
     see("ln_f", a)
     acc = np.rint(a.astype(np.float64) @ wte.astype(np.float64).T).astype(np.int64)
     lm, ls = im.resc("wte.rescale_logits")
-    lg = np.clip(rescale_exact(acc, lm[None, :], ls), -SCORE_LIMIT, SCORE_LIMIT)
+    resc = rescale_wide if np.abs(acc).max(initial=0) >= 1 << 31 else rescale_exact
+    lg = np.clip(resc(acc, lm[None, :], ls), -SCORE_LIMIT, SCORE_LIMIT)
     lt = im.arr("logits_exp").astype(np.uint64)
     idx = np.clip(lg.max(axis=1, keepdims=True) - lg, 0, len(lt) - 1)
     return lt[idx]

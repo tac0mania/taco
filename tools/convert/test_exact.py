@@ -226,6 +226,35 @@ def test_no_float_model_guard() -> None:
     assert model.forward.__name__ == "forward"
 
 
+def test_wide_gelu_table() -> None:
+    """The i16 GELU table of hsm version 2 (ADR 0004 addendum B) against the float rule."""
+    s_in, s_out = Fraction(13, 32767), Fraction(13, 32767)
+    got = ex.gelu_table(16, s_in, s_out, out_max=ex.I16_MAX)
+    assert got.dtype == np.int16 and len(got) == 65536
+    x = np.arange(-32768, 32768, dtype=np.float64) * float(s_in)
+    want = np.clip(np.rint(nm.gelu(x) / float(s_out)), -32767, 32767)
+    assert np.array_equal(got.astype(np.float64), want)
+    assert got.min() >= -32767 and got.max() <= 32767
+
+
+def test_hsm_version_rule() -> None:
+    """hsm version 2 if and only if the model has ln_f_bits or an i16 GELU table."""
+    from convert.hsmfile import HsmModel, gpt2_config, version_of
+
+    cfg = dict(n_layer=1, n_head=1, d_model=4, d_ff=8, vocab_size=2, n_ctx=4, eot_token=1,
+               ln_k=48, ln_j=8, ln_eps=1, softmax_p=30)
+    m = HsmModel(gpt2_config(**cfg), [b"a", b"b"])
+    m.add("h.0.mlp.gelu", "i8", np.zeros(256, dtype=np.int8))
+    assert version_of(m) == 1
+    m = HsmModel(gpt2_config(**cfg, ln_f_bits=16), [b"a", b"b"])
+    assert version_of(m) == 2
+    m = HsmModel(gpt2_config(**cfg), [b"a", b"b"])
+    m.add("h.0.mlp.gelu", "i16", np.zeros(256, dtype=np.int16))
+    assert version_of(m) == 2
+    m = HsmModel(gpt2_config(**cfg, ln_beta_frac=8), [b"a", b"b"])
+    assert version_of(m) == 2 and m.config["constants"]["ln_beta_frac"] == 8
+
+
 def test_selfcheck() -> None:
     from convert.selfcheck import Inputs, SelfCheckError, check
 

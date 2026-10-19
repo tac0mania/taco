@@ -10,10 +10,9 @@
 //! saturation is the rule of `int`, through `kernels::rescale_clamp` (the same results, proved
 //! by a property test).
 
-use super::model::{Linear, Model};
+use super::model::{Gelu, Linear, Model};
 use super::{RESIDUAL_LIMIT as RES, SCORE_LIMIT};
 use crate::error::{Error, Result};
-use crate::gelu::GeluTable;
 use crate::int::{clamp, clamp_i32, rescale};
 use crate::kernels::{Kernels, rescale_clamp};
 use crate::layernorm::{LayerNorm, LnConstants};
@@ -86,8 +85,17 @@ pub(crate) enum LinearOut<'a> {
     Act(&'a mut [i8]),
     /// Add to the residual stream and clamp to `[-R, R]`.
     Residual(&'a mut [i32]),
-    /// Clamp to the input range of a GELU table, then look up the table.
-    Gelu(&'a mut [i8], &'a GeluTable),
+    /// Clamp to the input range of a GELU table with `i8` outputs, then look up the table.
+    /// A table with `i16` outputs is an error ([`Error::Unsupported`]): use `GeluWide`.
+    Gelu(&'a mut [i8], &'a Gelu),
+    /// Clamp to the input range of a GELU table with `i16` outputs (hsm format version 2),
+    /// then look up the table. A table with `i8` outputs is an error.
+    GeluWide(&'a mut [i16], &'a Gelu),
+}
+
+/// The error for an `i16` site on a path for `i8` values, or the reverse.
+fn width_error() -> Error {
+    Error::Unsupported { feature: "this activation width at this op (hsm format version 2)" }
 }
 
 /// `linear`: `y[r] = rescale(W[r] . x + b[r], m[r], s)` for `n` input rows, then the output
@@ -135,7 +143,7 @@ pub(crate) fn linear(
                 }
             }
         }
-        LinearOut::Gelu(g, table) => {
+        LinearOut::Gelu(g, Gelu::Narrow(table)) => {
             let g = g.get_mut(..n * rows).ok_or(internal(n * rows, 0))?;
             let (lo, hi) = (table.min_input(), table.max_input());
             for (gr, ar) in g.chunks_exact_mut(rows).zip(acc.chunks_exact(rows)) {
@@ -143,6 +151,53 @@ pub(crate) fn linear(
                     *o = table.apply(rescale_clamp(v, m, s, lo, hi));
                 }
             }
+        }
+        LinearOut::GeluWide(g, Gelu::Wide(table)) => {
+            let g = g.get_mut(..n * rows).ok_or(internal(n * rows, 0))?;
+            let (lo, hi) = (table.min_input(), table.max_input());
+            for (gr, ar) in g.chunks_exact_mut(rows).zip(acc.chunks_exact(rows)) {
+                for (o, (v, m)) in gr.iter_mut().zip(terms(ar, &lin.b, m)) {
+                    *o = table.apply(rescale_clamp(v, m, s, lo, hi));
+                }
+            }
+        }
+        LinearOut::Gelu(_, Gelu::Wide(_)) | LinearOut::GeluWide(_, Gelu::Narrow(_)) => {
+            return Err(width_error());
+        }
+    }
+    Ok(())
+}
+
+/// `linear` for `i16` input rows (the `i16` GELU outputs of hsm format version 2): `x[r] =
+/// clamp(x[r] + rescale(W[r] . g + b[r], m[r], s), -R, R)` for `n` rows of `g`. `acc` is
+/// scratch space of at least `n * out_rows` values. Cost: one matrix product
+/// (`Kernels::matmul_i8_i16`) and one rescale for each output.
+///
+/// # Errors
+/// The errors of [`Kernels::matmul_i8_i16`], or an internal length error.
+pub(crate) fn linear_wide_residual(
+    k: Kernels,
+    lin: &Linear,
+    g: &[i16],
+    acc: &mut [i64],
+    x: &mut [i32],
+) -> Result<()> {
+    let (rows, cols) = (lin.w.rows(), lin.w.cols());
+    let n = g.len() / cols;
+    let have = acc.len();
+    let acc = acc.get_mut(..n * rows).ok_or(internal(n * rows, have))?;
+    k.matmul_i8_i16(lin.w.data(), g, cols, acc)?;
+    let x = x.get_mut(..n * rows).ok_or(internal(n * rows, 0))?;
+    let (m, s) = (&lin.rescale.m, lin.rescale.s);
+    let (lim, res) = (1i64 << 40, i64::from(RES));
+    for (xr, ar) in x.chunks_exact_mut(rows).zip(acc.chunks_exact(rows)) {
+        for ((xv, (&v, &b)), &m) in xr.iter_mut().zip(ar.iter().zip(lin.b.iter())).zip(m.iter()) {
+            // INVARIANT: |v| <= cols * 2^22 <= 2^38 (cols <= MAX_DOT_LEN_I32), so v + b does not
+            // overflow. The clamp of delta to 2^40 keeps the result of the reference, as in
+            // `linear` (`LinearOut::Residual`).
+            let delta = rescale_clamp(v + i64::from(b), m, s, -lim, lim);
+            let sum = clamp(i64::from(*xv) + delta, -res, res);
+            *xv = i32::try_from(sum).unwrap_or(0);
         }
     }
     Ok(())
@@ -164,6 +219,9 @@ pub(crate) fn logits(
     slots: impl Iterator<Item = usize>,
 ) -> Result<()> {
     let (k, model) = (cx.k, cx.model);
+    if model.ln_f_bits != 8 {
+        return Err(width_error());
+    }
     let (vocab, d) = (model.dims.vocab, model.dims.d_model);
     let n = a.len() / d;
     let acc = acc.get_mut(..n * vocab).ok_or(internal(n * vocab, 0))?;
@@ -173,6 +231,39 @@ pub(crate) fn logits(
         let w = weights.get_mut(slot * vocab..(slot + 1) * vocab).ok_or(internal(slot, 0))?;
         for ((l, &v), &m) in logits.iter_mut().zip(ar).zip(model.logit.m.iter()) {
             *l = rescale_clamp(i64::from(v), m, s, -SCORE_LIMIT, SCORE_LIMIT);
+        }
+        weights_fast(logits, model.logits_exp.entries(), w)?;
+    }
+    Ok(())
+}
+
+/// `logits` for the `i16` outputs of the final LayerNorm (`ln_f_bits = 16`, hsm format version
+/// 2), with `i64` accumulators. The arguments and the cost are those of [`logits`].
+///
+/// # Errors
+/// The errors of [`Kernels::matmul_i8_i16`] and `logits_to_weights`, an internal length
+/// error, or [`Error::Unsupported`] if the model has `i8` outputs at `ln_f`.
+pub(crate) fn logits_wide(
+    cx: Ctx<'_>,
+    a: &[i16],
+    acc: &mut [i64],
+    logits: &mut [i64],
+    weights: &mut [u64],
+    slots: impl Iterator<Item = usize>,
+) -> Result<()> {
+    let (k, model) = (cx.k, cx.model);
+    if model.ln_f_bits != 16 {
+        return Err(width_error());
+    }
+    let (vocab, d) = (model.dims.vocab, model.dims.d_model);
+    let n = a.len() / d;
+    let acc = acc.get_mut(..n * vocab).ok_or(internal(n * vocab, 0))?;
+    k.matmul_i8_i16(model.wte.data(), a, d, acc)?;
+    let s = model.logit.s;
+    for (ar, slot) in acc.chunks_exact(vocab).zip(slots) {
+        let w = weights.get_mut(slot * vocab..(slot + 1) * vocab).ok_or(internal(slot, 0))?;
+        for ((l, &v), &m) in logits.iter_mut().zip(ar).zip(model.logit.m.iter()) {
+            *l = rescale_clamp(v, m, s, -SCORE_LIMIT, SCORE_LIMIT);
         }
         weights_fast(logits, model.logits_exp.entries(), w)?;
     }

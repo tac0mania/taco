@@ -32,4 +32,4 @@ pub use error::{Error, Result};
 pub use kernels::{PTX_SOURCE_LINE, SOURCE as KERNEL_SOURCE, ptx};
 pub use model::CudaModel;
 pub use ops::{MatKernel, matmul_gpu_ns, matmul_i8, matmul_i8_split, read_gpu_ns};
-pub use session::CudaSession;
+pub use session::{CudaSession, RESTART_ROWS};

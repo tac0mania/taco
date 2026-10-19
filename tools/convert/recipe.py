@@ -37,7 +37,22 @@ RECIPES: dict[str, dict[str, str]] = {
     # (ln_f) or the 90th percentile (GELU) over the channels of the channel maximum, and the
     # outlier channels saturate.
     "clip": {**{k: "max" for k in KINDS}, "ln_f": "chan_q50", "gelu": "chan_q90"},
+    # ADR 0004 addendum B (hsm version 2): i16 outputs at ln_f and the GELU tables, so their
+    # largest calibration value can map to 32,767 and no channel saturates, and a LayerNorm beta
+    # with 8 more bits (BETA_FRAC). Measured on the val windows of the log fine-tune (fake
+    # quantisation): +1.55 % against float, `clip` +20.4 %.
+    "wide": {k: "max" for k in (*KINDS, "ln_f")},
 }
+
+# The i16 site kinds of each recipe (hsm version 2, ADR 0004 addendum B). A recipe that is not
+# here has i8 outputs at every site, and its model file is version 1.
+WIDE: dict[str, frozenset[str]] = {"wide": frozenset({"gelu", "ln_f"})}
+
+# The extra bits of every LayerNorm beta (hsm version 2, header constant `ln_beta_frac`). A
+# recipe that is not here adds beta after the rounding (version 1). Measured with the integer
+# simulation on the val windows of the log fine-tune: `wide` without it +4.62 %, with 8 bits
+# +1.63 % against float (research note 2026-10-19-calibration, section 6).
+BETA_FRAC: dict[str, int] = {"wide": 8}
 
 
 def load_stats(path: Path) -> dict:
@@ -80,6 +95,8 @@ def ranges(stats: dict, recipe: dict[str, str], overrides: dict[str, Fraction] |
     return out
 
 
-def scales(stats: dict, recipe: dict[str, str], overrides: dict[str, Fraction] | None = None
-           ) -> Scales:
-    return Scales.from_ranges(residual_scale(stats), ranges(stats, recipe, overrides))
+def scales(stats: dict, recipe: dict[str, str], overrides: dict[str, Fraction] | None = None,
+           wide: frozenset[str] = frozenset()) -> Scales:
+    """The scales of a recipe. `wide` names the i16 site kinds (`gelu`, `ln_f`; hsm version 2)."""
+    return Scales.from_ranges(residual_scale(stats), ranges(stats, recipe, overrides),
+                              wide=wide)

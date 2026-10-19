@@ -230,6 +230,14 @@ impl GpuModel {
     /// error.
     pub fn load(dev: &GpuDevice, bytes: &[u8]) -> Result<Self> {
         let cpu = hardshell::gpt2::Model::load(bytes)?;
+        // DETERMINISM: these kernels implement only the rules of model-file version 1. A model
+        // with a version-2 rule (ADR 0004 addendum B: i16 GELU, ln_f_bits, ln_beta_frac) would
+        // give different bits here, so it is refused instead of run.
+        if cpu.is_wide() {
+            return Err(Error::Unsupported {
+                reason: "the model uses model-file version 2 rules (i16 GELU, ln_f_bits, ln_beta_frac)",
+            });
+        }
         let (eot, hash) = (cpu.eot_token(), cpu.hash());
         drop(cpu);
         let file = HsmFile::parse(bytes)?;

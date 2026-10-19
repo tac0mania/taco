@@ -123,11 +123,27 @@ pub enum Error {
         /// The vocabulary size.
         vocab_size: u32,
     },
+    /// The overlap of the context rule (ADR 0015) is too large for the context of the model:
+    /// it must be at most `n_ctx - 2`.
+    #[error("context overlap {overlap} is not valid for a context of {n_ctx} tokens")]
+    InvalidOverlap {
+        /// The overlap.
+        overlap: u16,
+        /// The context length of the model.
+        n_ctx: usize,
+    },
     /// The writer cannot make the file, because a part is too large for the format.
     #[error("cannot write the .hsm file: {reason}")]
     TooLarge {
         /// What is too large.
         reason: &'static str,
+    },
+    /// This path of the engine cannot run a part of the model yet (for example the `i16`
+    /// activations of hsm format version 2 on a fast path). Use another path.
+    #[error("this path does not support {feature}")]
+    Unsupported {
+        /// The part of the model.
+        feature: &'static str,
     },
 }
 

@@ -3,8 +3,12 @@
 //!
 //! ```text
 //! cargo run --release -p hardshell --example eval_bits -- MODEL.hsm WINDOWS.txt \
-//!     [--threads N] [--digest] [--limit STEPS] [--chunk N] [--reference]
+//!     [--threads N] [--digest] [--limit STEPS] [--chunk N] [--reference] [--overlap K]
 //! ```
+//!
+//! `--overlap K` sets the context rule of ADR 0015: a context restart keeps the last `K`
+//! tokens (default 0, the rule of ADR 0004 section 9). The example then also counts the
+//! restart rows (`<|endoftext|>` and the `K` kept tokens of each restart): the extra compute.
 //!
 //! `--chunk N` runs the window with `Session::step_many`, `N` tokens at a time (the prefill
 //! path). `--reference` runs it with `ReferenceSession` (the scalar reference). The weights,
@@ -27,7 +31,9 @@
 //! Windows are independent, so the example runs them on `N` threads. Each window has its own
 //! session, the results go into a slot for each window, and the totals are summed in window
 //! order. Thus the output does not depend on the thread count. `--digest` also prints the
-//! SHA-256 of all weights of each window, so two runs can be compared bit for bit.
+//! SHA-256 of all weights of each window, so two runs can be compared bit for bit, and the
+//! SHA-256 of the table frequency `f[t]` of each coded token (little-endian `u64`, in token
+//! order, all windows in file order), which a GPU run can compare.
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
@@ -38,7 +44,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use hardshell::TokenId;
-use hardshell::gpt2::{Model, ReferenceSession, Session, SessionConfig};
+use hardshell::gpt2::{Model, Overlap, ReferenceSession, Session, SessionConfig};
 use sha2::{Digest, Sha256};
 
 type AnyResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -58,7 +64,11 @@ struct Outcome {
     zero_weight: usize,
     table_bits: f64,
     seconds: f64,
+    /// The rows of the context restarts: `<|endoftext|>` and the kept tokens.
+    restart_rows: usize,
     digest: Option<String>,
+    /// The table frequencies of the coded tokens, little-endian `u64`, in order.
+    freqs: Vec<u8>,
 }
 
 struct Args {
@@ -69,6 +79,7 @@ struct Args {
     limit: Option<usize>,
     chunk: usize,
     reference: bool,
+    overlap: Overlap,
 }
 
 fn parse_args() -> AnyResult<Args> {
@@ -79,6 +90,7 @@ fn parse_args() -> AnyResult<Args> {
     let mut limit = None;
     let mut chunk = 1;
     let mut reference = false;
+    let mut overlap = 0u16;
     while let Some(a) = it.next() {
         match a.as_str() {
             "--threads" => threads = it.next().ok_or("--threads needs a value")?.parse()?,
@@ -86,6 +98,7 @@ fn parse_args() -> AnyResult<Args> {
             "--limit" => limit = Some(it.next().ok_or("--limit needs a value")?.parse()?),
             "--chunk" => chunk = it.next().ok_or("--chunk needs a value")?.parse()?,
             "--reference" => reference = true,
+            "--overlap" => overlap = it.next().ok_or("--overlap needs a value")?.parse()?,
             _ => pos.push(a),
         }
     }
@@ -99,6 +112,7 @@ fn parse_args() -> AnyResult<Args> {
         limit,
         chunk: chunk.max(1),
         reference,
+        overlap: Overlap::new(overlap),
     })
 }
 
@@ -161,14 +175,15 @@ fn run_window(
     let toks = &w.tokens;
     let inputs = toks.get(..toks.len() - 1).unwrap_or(&[]);
     if args.reference {
-        let mut s = ReferenceSession::new(model);
+        let mut s = ReferenceSession::with_overlap(model, args.overlap);
         f(0, s.start_block()?)?;
         for (i, &t) in inputs.iter().enumerate() {
             f(i + 1, s.step(t)?)?;
         }
         return Ok(());
     }
-    let mut s = Session::with_config(model, SessionConfig::new().with_chunk(args.chunk));
+    let cfg = SessionConfig::new().with_chunk(args.chunk).with_overlap(args.overlap);
+    let mut s = Session::with_config(model, cfg);
     f(0, s.start_block()?)?;
     let mut i = 1;
     for part in inputs.chunks(args.chunk) {
@@ -195,7 +210,11 @@ fn measure(model: &Model, w: &Window, args: &Args) -> AnyResult<Outcome> {
         } else {
             out.zero_weight += 1;
         }
-        out.table_bits -= (table_freq(weights, t) as f64 / TOTAL as f64).log2();
+        let f = table_freq(weights, t);
+        out.table_bits -= (f as f64 / TOTAL as f64).log2();
+        if args.digest {
+            out.freqs.extend_from_slice(&(f as u64).to_le_bytes());
+        }
         if let Some(h) = hasher.as_mut() {
             for &x in weights {
                 h.update(x.to_le_bytes());
@@ -205,9 +224,20 @@ fn measure(model: &Model, w: &Window, args: &Args) -> AnyResult<Outcome> {
         Ok(())
     })?;
     out.bytes = bytes.len();
+    out.restart_rows = restart_rows(model.n_ctx(), args.overlap.tokens(), w.tokens.len());
     out.seconds = t0.elapsed().as_secs_f64();
     out.digest = hasher.map(|h| h.finalize().iter().map(|b| format!("{b:02x}")).collect());
     Ok(out)
+}
+
+/// The restart rows of a window of `n` coded tokens: the session gets `n - 1` tokens after
+/// the start; the first context holds `n_ctx - 1` of them, each later context `n_ctx - 1 - k`
+/// new ones, and each restart runs `k + 1` rows without weights (ADR 0015).
+fn restart_rows(n_ctx: usize, k: usize, n: usize) -> usize {
+    let given = n.saturating_sub(1);
+    let first = n_ctx.saturating_sub(1);
+    let per = n_ctx.saturating_sub(1 + k).max(1);
+    if given <= first { 0 } else { (given - first).div_ceil(per) * (k + 1) }
 }
 
 fn main() -> AnyResult<()> {
@@ -219,12 +249,13 @@ fn main() -> AnyResult<()> {
     let windows = read_windows(&args.windows, args.limit)?;
     let steps: usize = windows.iter().map(|w| w.tokens.len()).sum();
     eprintln!(
-        "model {} ({}), {} windows, {steps} steps, {} threads, chunk {}{}, loaded in {:.1} s",
+        "model {} ({}), {} windows, {steps} steps, {} threads, chunk {}, overlap {}{}, loaded in {:.1} s",
         args.model,
         model.hash(),
         windows.len(),
         args.threads,
         args.chunk,
+        args.overlap.get(),
         if args.reference { ", reference session" } else { "" },
         t0.elapsed().as_secs_f64()
     );
@@ -258,14 +289,18 @@ fn main() -> AnyResult<()> {
     });
     let wall = t1.elapsed().as_secs_f64();
     println!("# model\t{}\t{}", args.model, model.hash());
-    println!("# label\ttokens\tbytes\tideal_bits\tzero_weight\ttable_bits\tseconds\tdigest");
+    println!("# overlap\t{}", args.overlap.get());
+    println!(
+        "# label\ttokens\tbytes\tideal_bits\tzero_weight\ttable_bits\tseconds\trestart_rows\tdigest"
+    );
     let mut total = Outcome::default();
     let mut combined = Sha256::new();
+    let mut freq_digest = Sha256::new();
     for (w, slot) in windows.iter().zip(slots) {
         let o =
             slot.into_inner().map_err(|_| "a worker panicked")?.ok_or("a window is missing")??;
         println!(
-            "{}\t{}\t{}\t{:.6}\t{}\t{:.6}\t{:.1}\t{}",
+            "{}\t{}\t{}\t{:.6}\t{}\t{:.6}\t{:.1}\t{}\t{}",
             w.label,
             w.tokens.len(),
             o.bytes,
@@ -273,8 +308,11 @@ fn main() -> AnyResult<()> {
             o.zero_weight,
             o.table_bits,
             o.seconds,
+            o.restart_rows,
             o.digest.as_deref().unwrap_or("-")
         );
+        freq_digest.update(&o.freqs);
+        total.restart_rows += o.restart_rows;
         total.bytes += o.bytes;
         total.ideal_bits += o.ideal_bits;
         total.zero_weight += o.zero_weight;
@@ -285,13 +323,18 @@ fn main() -> AnyResult<()> {
     }
     let combined: String = combined.finalize().iter().map(|b| format!("{b:02x}")).collect();
     println!(
-        "TOTAL\t{steps}\t{}\t{:.6}\t{}\t{:.6}\t{wall:.1}\t{}",
+        "TOTAL\t{steps}\t{}\t{:.6}\t{}\t{:.6}\t{wall:.1}\t{}\t{}",
         total.bytes,
         total.ideal_bits,
         total.zero_weight,
         total.table_bits,
+        total.restart_rows,
         if args.digest { combined.as_str() } else { "-" }
     );
+    if args.digest {
+        let f: String = freq_digest.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        println!("# table frequency digest {f}");
+    }
     println!(
         "# bits per byte: ideal {:.6}, table {:.6}; f64 bits of the totals: ideal {:016x}, table {:016x}",
         total.ideal_bits / total.bytes as f64,

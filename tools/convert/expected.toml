@@ -20,3 +20,30 @@ recipe = "max"
 stats_sha256 = "a5336d212921971c3dbed8747627ac97240ca7d010c1c12cc527d231ec0ea9a4"
 hsm_sha256 = "eb78b89a4f0f17c7245865aed22f86512a49e0272b7583a831c47e1a401418f8"
 hsm_size = 306368
+
+# hsm version 2 (ADR 0004 addendum B): i16 outputs at ln_f and the GELU tables.
+[[model]]
+model = "gpt2"
+weights = "248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707"
+recipe = "wide"
+stats_sha256 = "8f7731d98c363316488d515a523aa5b73123e59b35705bc744a2c55bf90d12c2"
+hsm_sha256 = "9aa394b11405116399aafa32813c32fa7be66d5189249c99154849239f547f56"
+hsm_size = 128024064
+
+# Route A: distilgpt2 fine-tuned on logs (docs/research/2026-10-19-route-a.md). The weights and
+# the statistics file are on devbox (~/taco-train), not in git.
+[[model]]
+model = "distil_logs"
+weights = "3d4d9cd2895383723baf16e8c50b98c23d232f268baeaf6bf2e99d32862f0c9a"
+recipe = "clip"
+stats_sha256 = "b1fff60029df6c45fd31bb7fdb5892f9a8698810f4c0fe93eb8661c5f582b65a"
+hsm_sha256 = "c0d382bd0ff56333303eba8c1382e87ae0a29f154cdd0c2d564de4a3350afa98"
+hsm_size = 83976576
+
+[[model]]
+model = "distil_logs"
+weights = "3d4d9cd2895383723baf16e8c50b98c23d232f268baeaf6bf2e99d32862f0c9a"
+recipe = "wide"
+stats_sha256 = "b1fff60029df6c45fd31bb7fdb5892f9a8698810f4c0fe93eb8661c5f582b65a"
+hsm_sha256 = "d12e5f34f8af34581a859c512e186e30e9b304c1af7efac0fb0e9d9559aacf07"
+hsm_size = 84369792

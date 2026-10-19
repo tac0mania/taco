@@ -1,4 +1,4 @@
-//! The `.hsm` model file, format version 1: the reader and the writer (plan §8).
+//! The `.hsm` model file, format versions 1 and 2: the reader and the writer (plan §8).
 //!
 //! The reader checks every part of the file before it gives a value to the caller. The writer
 //! is the reference for the layout: the tests and the Python converter make files that the
@@ -11,7 +11,7 @@
 //! | Offset | Length | Contents |
 //! |---|---|---|
 //! | 0 | 8 | magic `"HSHLMDL\0"` |
-//! | 8 | 4 | version, `u32`, 1 |
+//! | 8 | 4 | version, `u32`, 1 or 2 (see "Format version 2") |
 //! | 12 | 4 | `header_len`, `u32` |
 //! | 16 | `header_len` | the JSON header, UTF-8 |
 //! | `align64(16 + header_len)` | `vocabulary.length` | the vocabulary |
@@ -77,6 +77,8 @@
 //! | `model.constants.ln_j` | `u8` | LayerNorm `J`, at most 16 |
 //! | `model.constants.ln_eps` | `u64` | LayerNorm `eps`, 1 to 2^62 |
 //! | `model.constants.softmax_p` | `u8` | softmax `P`, at most 30 |
+//! | `model.constants.ln_f_bits` | `u8`, optional, version 2 only | 16: the final LayerNorm gives `i16` outputs; omit the field for `i8` |
+//! | `model.constants.ln_beta_frac` | `u8`, optional, version 2 only | 1 to 16: every LayerNorm beta has this many more bits and is added before the rounding; omit the field for 0 |
 //! | `vocabulary.offset`, `.length` | `u64` | the vocabulary section |
 //! | `merges.offset`, `.length` | `u64`, optional | the merges section; omit the field for no merges |
 //! | `tensors[].name` | string | unique |
@@ -88,6 +90,21 @@
 //! A rescale `(m, s)` (plan §7.2) is an `i32` tensor of multipliers with a `shift`. It has
 //! shape `[1]` for one multiplier, or one multiplier for each output row. The architecture
 //! module (`gpt2`) gives the names of the tensors that it needs.
+//!
+//! # Format version 2
+//!
+//! Version 2 (ADR 0004 addendum B) permits `i16` outputs at two activation sites and a finer
+//! LayerNorm beta, for models that lose too much with the rules of version 1. It adds exactly
+//! three things to version 1:
+//!
+//! 1. The optional header constant `model.constants.ln_f_bits`. Its only permitted value is 16.
+//! 2. The optional header constant `model.constants.ln_beta_frac`, from 1 to 16.
+//! 3. A GELU table (a tensor whose name ends with `.mlp.gelu`) with the dtype `i16`.
+//!
+//! All other rules are the rules of version 1. A file is version 2 if and only if it uses one
+//! of the three things ([`required_version`]). The reader refuses a file whose version is not
+//! the required version, and the writer writes the required version. Thus one model still has
+//! exactly one file, and every version 1 file keeps its bytes and its meaning.
 //!
 //! # The writer
 //!
@@ -109,8 +126,12 @@ pub use writer::HsmWriter;
 
 /// The magic bytes at the start of a `.hsm` file.
 pub const MAGIC: [u8; 8] = *b"HSHLMDL\0";
-/// The format version that this module reads and writes.
-pub const VERSION: u32 = 1;
+/// The newest format version that this module reads and writes.
+pub const VERSION: u32 = 2;
+/// Format version 1: `i8` outputs at every activation site.
+pub const VERSION_1: u32 = 1;
+/// Format version 2: version 1, and `i16` outputs at the GELU tables and the final LayerNorm.
+pub const VERSION_2: u32 = 2;
 /// The alignment of the vocabulary and of every tensor, in bytes.
 pub const ALIGN: u64 = 64;
 /// The length of the fixed part before the header: magic, version and header length.
@@ -132,4 +153,16 @@ pub(crate) fn is_valid_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.')
+}
+
+/// The format version that a file with these parts must have (see "Format version 2"): 2 if
+/// the header has a constant of version 2 (`has_v2_constant`) or a tensor `*.mlp.gelu` has the
+/// dtype `i16`, else 1. `tensors` gives the name and the dtype name of each tensor.
+#[must_use]
+pub fn required_version<'a>(
+    has_v2_constant: bool,
+    mut tensors: impl Iterator<Item = (&'a str, &'a str)>,
+) -> u32 {
+    let wide_gelu = tensors.any(|(name, dtype)| name.ends_with(".mlp.gelu") && dtype == "i16");
+    if has_v2_constant || wide_gelu { VERSION_2 } else { VERSION_1 }
 }

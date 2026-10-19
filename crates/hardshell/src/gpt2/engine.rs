@@ -40,6 +40,11 @@ pub(crate) struct Work {
     att: Vec<i8>,
     g: Vec<i8>,
     acc: Vec<i32>,
+    /// The `i16` GELU outputs and the `i16` final LayerNorm outputs of a model of hsm format
+    /// version 2 (ADR 0004 addendum B), and their `i64` accumulators. Empty for other models.
+    g16: Vec<i16>,
+    a16: Vec<i16>,
+    acc64: Vec<i64>,
     attn: AttnScratch,
     logits: Vec<i64>,
     weights: Vec<u64>,
@@ -52,6 +57,13 @@ impl Work {
         let d = model.dims;
         let (cap, slots) = (cap.max(1), slots.max(1));
         let acc_row = (3 * d.d_model).max(d.d_ff).max(d.vocab);
+        let wide_gelu = model.blocks.iter().any(|b| b.gelu.is_wide());
+        let wide_lnf = model.ln_f_bits == 16;
+        let acc64_row = match (wide_lnf, wide_gelu) {
+            (true, _) => d.vocab.max(d.d_model),
+            (false, true) => d.d_model,
+            (false, false) => 0,
+        };
         Self {
             cap,
             x: vec![0; cap * d.d_model],
@@ -60,6 +72,9 @@ impl Work {
             att: vec![0; cap * d.d_model],
             g: vec![0; cap * d.d_ff],
             acc: vec![0; cap * acc_row],
+            g16: vec![0; if wide_gelu { cap * d.d_ff } else { 0 }],
+            a16: vec![0; if wide_lnf { cap * d.d_model } else { 0 }],
+            acc64: vec![0; cap * acc64_row],
             attn: AttnScratch::new(model, cap),
             logits: vec![0; d.vocab],
             weights: vec![0; slots * d.vocab],
@@ -126,8 +141,36 @@ pub(crate) fn forward(
         }
         ops::linear(k, &block.c_proj, att, &mut work.acc, LinearOut::Residual(x))?;
         ops::norm(&block.ln_2, model.ln_consts, d, x, a)?;
-        ops::linear(k, &block.c_fc, a, &mut work.acc, LinearOut::Gelu(g, &block.gelu))?;
-        ops::linear(k, &block.mlp_proj, g, &mut work.acc, LinearOut::Residual(x))?;
+        if block.gelu.is_wide() {
+            // hsm format version 2: i16 GELU outputs (ADR 0004 addendum B).
+            let g16 = work.g16.get_mut(..n * f).ok_or(internal(n * f, 0))?;
+            let out = LinearOut::GeluWide(g16, &block.gelu);
+            ops::linear(k, &block.c_fc, a, &mut work.acc, out)?;
+            ops::linear_wide_residual(k, &block.mlp_proj, g16, &mut work.acc64, x)?;
+        } else {
+            ops::linear(k, &block.c_fc, a, &mut work.acc, LinearOut::Gelu(g, &block.gelu))?;
+            ops::linear(k, &block.mlp_proj, g, &mut work.acc, LinearOut::Residual(x))?;
+        }
+    }
+    if model.ln_f_bits == 16 {
+        // hsm format version 2: i16 outputs of the final LayerNorm (ADR 0004 addendum B). The
+        // same steps as below, with i16 rows and i64 accumulators.
+        let a16 = work.a16.get_mut(..n * d).ok_or(internal(n * d, 0))?;
+        let mut packed = 0;
+        for (row, xr) in rows.iter().zip(x.chunks_exact(d)) {
+            if row.out.is_some() {
+                let ar = a16.get_mut(packed * d..(packed + 1) * d).ok_or(internal(d, 0))?;
+                model.ln_f.apply_i16(model.ln_consts, xr, ar)?;
+                packed += 1;
+            }
+        }
+        if packed == 0 {
+            return Ok(());
+        }
+        let a16 = a16.get(..packed * d).ok_or(internal(packed * d, 0))?;
+        let slots = rows.iter().filter_map(|r| r.out);
+        let (acc, logits, weights) = (&mut work.acc64, &mut work.logits, &mut work.weights);
+        return ops::logits_wide(cx, a16, acc, logits, weights, slots);
     }
     // The final LayerNorm and the logits, only for the rows with an output slot. Their rows
     // of `a` are packed at the front, in row order.

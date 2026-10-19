@@ -206,3 +206,78 @@ the tokenizer (plan §8). Thus the merges go into the model file and not into a 
   tests made before this change still load.
 - For GPT-2, merge rank `i` makes token `256 + i` (measured: all 50,000 merges). The file
   stores 400,000 bytes of merges.
+
+## Addendum B: `i16` outputs and a finer LayerNorm beta (2026-10-19)
+
+Status: proposed (by the calib agent). Research note: `docs/research/2026-10-19-calibration.md`.
+
+### Context
+
+The log fine-tune of Route A (distilgpt2, `distil_logs.hsm`) loses much more in integers than
+GPT-2 does: +16.7 % against float on the tails of its training systems (measured, Route A note
+section 6). Fake quantisation on the val windows (24 windows of the training systems, no
+evaluation data) put the loss at two sites: the GELU outputs (+9.3 %) and the output of `ln_f`
+(+8.3 %). All other sites together gave +1.6 %, and the logit table 0.0 % (measured).
+
+An `i8` output with 127 levels cannot hold both the outlier channels and the typical channels
+of a confident model. The `clip` recipe (section 7) saturates the outliers. That helps GPT-2,
+but it removes information that the fine-tuned model uses. The best `i8` range rule that we
+found gave +7.3 % on the val windows (measured).
+
+With `i16` outputs at the two sites, the integer simulation still lost 3 % more than the fake
+quantisation. The cause is the two roundings of the LayerNorm (section 7, beta correction):
+HardShell rounds the normalised value, then adds a rounded beta. The beta correction removes the
+mean of that error only in part (measured, research note section 6).
+
+### Decision
+
+1. **Format version 2.** The `.hsm` format gets version 2. It adds three things to version 1:
+   - the optional header constant `model.constants.ln_f_bits`. Its only value is 16: the final
+     LayerNorm gives `i16` outputs (`-32767..=32767`).
+   - the optional header constant `model.constants.ln_beta_frac = F`, from 1 to 16. Every
+     LayerNorm beta is stored in units of `2^-F` output units, and step 4 of section 2 has one
+     rounding: `y = clamp(floor((t * m + beta * 2^(s-F) + 2^(s-1)) / 2^s))` with
+     `t = (x - mean) * inv * gamma` (`LayerNorm::with_beta_frac`, `int::rescale_wide_offset`).
+     The loader refuses `F > s`, `s > 120` and `s - F > 92`, so every product stays below
+     `2^127`.
+   - a GELU table (`h.{l}.mlp.gelu`) with the dtype `i16`: `i16` outputs.
+2. **One model, one file.** A file is version 2 if and only if it has one of the three things.
+   The reader refuses every other combination, and the writer writes the required version
+   (`hsm::required_version`). Every version 1 file keeps its bytes and its meaning, so
+   `gpt2.hsm` (`aaa03eb9…a5c2`) and all golden hashes do not change.
+3. **The arithmetic.** An `i16` activation enters a matrix product with `i8` weights. The
+   product uses `i64` accumulators (`kernels::matvec_i8_i16`, `Kernels::matmul_i8_i16`). Bound:
+   `|w * a| <= 2^7 * 2^15 = 2^22`, and `d_ff <= 2^16`, so `|acc| <= 2^38`. The fast kernel sums
+   blocks of 256 products in `i32` (at most `2^30`), then adds them in `i64`. The rescale is
+   `int::rescale` (exact for every `i64` input). The LayerNorm with `i16` outputs is the rule of
+   section 2 with the clamp at 32,767 (`LayerNorm::apply_i16`). No other step changes.
+4. **The recipe `wide`** (`tools/convert/recipe.py`). Every site uses its largest calibration
+   value (the first rule of section 7), `ln_f` and the GELU outputs are `i16`, and
+   `ln_beta_frac = 8`. With 32,767 levels, no channel saturates. The beta correction stays (its
+   error is now at most `2^-9` output units).
+5. **Which model uses which recipe.** The recipe is a converter choice for each model, with a
+   measurement on calibration or validation windows. `gpt2.hsm` keeps `clip` (version 1). A
+   model fine-tuned on the logs of known systems uses `wide`.
+
+### Consequences
+
+- The fine-tuned log model with `wide` (HardShell, 373 Route A windows, measured): the
+  integer loss against float is +0.7 % on the tails of the training systems (`clip`: +16.7 %),
+  −0.3 % on the held-out systems (`clip`: −2.3 %) and −0.0 % on all windows (`clip`: +6.6 %).
+  On the held-out systems `wide` is 2.0 % larger than `clip`, because `clip` was smaller than
+  float there.
+- GPT-2 with `wide` is worse than with `clip` (section 7 of the research note). Thus
+  `gpt2.hsm` stays version 1.
+- The model files (measured): `distil_logs_wide.hsm`, 84,369,792 bytes, SHA-256
+  `d12e5f34f8af34581a859c512e186e30e9b304c1af7efac0fb0e9d9559aacf07` (devbox);
+  `gpt2_wide.hsm`, 128,024,064 bytes, SHA-256
+  `9aa394b11405116399aafa32813c32fa7be66d5189249c99154849239f547f56` (the same on the Mac and
+  devbox). `tools/convert/expected.toml` has both entries, and the entry of `distil_logs.hsm`
+  (`clip`, `c0d382bd…fa98`).
+- The conformance vector of version 2: the tiny wide model of `tests/wide.rs` (all three rules
+  of version 2; model SHA-256 `201f9fd6…af04`, weights SHA-256 `64108429…2eb8`, the same on the
+  Mac and devbox).
+- The GELU tables of a wide file are two times larger: 128 KiB for each layer.
+- The `i16` matrix products have no SIMD kernel yet (`PERF` note in `kernels/fast.rs`).
+- The GPU backends (`hardshell-cuda`, `hardshell-gpu`) do not run version 2 yet. They must
+  refuse a model with `Model::is_wide()` until they implement it.

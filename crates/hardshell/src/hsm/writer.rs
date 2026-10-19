@@ -1,9 +1,9 @@
-//! The `.hsm` writer: the reference for the layout of format version 1.
+//! The `.hsm` writer: the reference for the layout of format versions 1 and 2.
 
-use super::header::{Header, ModelConfig, Section, TensorEntry};
+use super::header::{Header, ModelConfig, ModelJson, Section, TensorEntry, V2Constants};
 use super::merges;
 use super::reader::{HsmFile, TensorData, Vocabulary};
-use super::{MAGIC, PREAMBLE_LEN, VERSION, align64};
+use super::{MAGIC, PREAMBLE_LEN, align64, required_version};
 use crate::error::{Error, Result};
 use crate::types::TokenId;
 
@@ -15,6 +15,7 @@ use crate::types::TokenId;
 #[must_use]
 pub struct HsmWriter {
     config: ModelConfig,
+    v2: V2Constants,
     vocabulary: Vec<Vec<u8>>,
     merges: Vec<(TokenId, TokenId)>,
     tensors: Vec<(String, TensorData, Option<u8>)>,
@@ -23,7 +24,27 @@ pub struct HsmWriter {
 impl HsmWriter {
     /// Starts a file for this model description.
     pub fn new(config: ModelConfig) -> Self {
-        Self { config, vocabulary: Vec::new(), merges: Vec::new(), tensors: Vec::new() }
+        Self {
+            config,
+            v2: V2Constants::default(),
+            vocabulary: Vec::new(),
+            merges: Vec::new(),
+            tensors: Vec::new(),
+        }
+    }
+
+    /// Sets the output bits of the final LayerNorm: 8 (the default, no header field) or 16
+    /// (the header constant `ln_f_bits = 16`, format version 2). [`HsmWriter::finish`] refuses
+    /// every other value.
+    pub fn set_ln_f_bits(&mut self, bits: u8) {
+        self.v2.ln_f_bits = if bits == 8 { None } else { Some(bits) };
+    }
+
+    /// Sets the extra bits of every LayerNorm beta: 0 (the default, no header field) or 1 to 16
+    /// (the header constant `ln_beta_frac`, format version 2). The `*.b` tensors of the
+    /// LayerNorms must be in these units. [`HsmWriter::finish`] refuses a value above 16.
+    pub fn set_ln_beta_frac(&mut self, frac: u8) {
+        self.v2.ln_beta_frac = if frac == 0 { None } else { Some(frac) };
     }
 
     /// Sets the vocabulary: the bytes of each token, in token-id order.
@@ -44,6 +65,7 @@ impl HsmWriter {
     }
 
     /// Lays out and writes the file, then reads it back with [`HsmFile::parse`] to check it.
+    /// The version is the version that the parts require (`hsm::required_version`).
     ///
     /// Cost: one copy of every tensor into the output, and one full read of the output.
     ///
@@ -76,7 +98,9 @@ impl HsmWriter {
 
         let mut out = Vec::new();
         out.extend_from_slice(&MAGIC);
-        out.extend_from_slice(&VERSION.to_le_bytes());
+        let names = header.tensors.iter().map(|e| (e.name.as_str(), e.dtype.as_str()));
+        let version = required_version(self.v2.any(), names);
+        out.extend_from_slice(&version.to_le_bytes());
         out.extend_from_slice(&header_len_u32.to_le_bytes());
         out.extend_from_slice(&json);
         pad_to(&mut out, PREAMBLE_LEN + header_len, b' ')?;
@@ -124,7 +148,7 @@ impl HsmWriter {
             cursor = offset.checked_add(length).ok_or(too_large("layout"))?;
         }
         Ok(Header {
-            model: self.config.clone(),
+            model: ModelJson::new(&self.config, self.v2),
             vocabulary: Section { offset: vocab_offset, length: vocab_len },
             merges,
             tensors,

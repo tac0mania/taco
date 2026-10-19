@@ -27,6 +27,10 @@ from convert.hsmfile import HsmModel, gpt2_config
 from convert.model import FModel
 
 
+# The site kinds that can have an i16 output (hsm version 2, ADR 0004 addendum B).
+WIDE_KINDS = frozenset({"gelu", "ln_f"})
+
+
 @dataclass
 class Scales:
     """The real value of one unit of each integer activation, as exact fractions.
@@ -39,18 +43,29 @@ class Scales:
     res: Fraction
     site: dict[str, Fraction] = field(default_factory=dict)
 
+    wide: frozenset[str] = frozenset()
+
     @classmethod
     def from_ranges(cls, res: Fraction, ranges: dict[str, Fraction],
-                    gelu_bits: dict[int, int] | None = None) -> Scales:
-        """Scales from ranges. `gelu_bits[l]` is 8 or 16 (the default) for layer `l`."""
+                    gelu_bits: dict[int, int] | None = None,
+                    wide: frozenset[str] = frozenset()) -> Scales:
+        """Scales from ranges. `gelu_bits[l]` is 8 or 16 (the default) for layer `l`.
+
+        `wide` names the site kinds with an i16 output (`gelu`, `ln_f`; hsm version 2, ADR 0004
+        addendum B). Their scale is `range / 32767`.
+        """
+        if not wide <= WIDE_KINDS:
+            raise ValueError(f"only {sorted(WIDE_KINDS)} can be i16, not {sorted(wide)}")
         s = {}
         for k, r in ranges.items():
             qmax = nm.I8_MAX
             if k.endswith(".fc"):
                 layer = int(k.split(".")[1])
                 qmax = nm.I16_MAX if (gelu_bits or {}).get(layer, 16) == 16 else nm.I8_MAX
+            elif (k == "ln_f" and "ln_f" in wide) or (k.endswith(".gelu") and "gelu" in wide):
+                qmax = nm.I16_MAX
             s[k] = Fraction(r) / qmax
-        return cls(Fraction(res), s)
+        return cls(Fraction(res), s, frozenset(wide))
 
     def floats(self) -> tuple[float, dict[str, float]]:
         """The scales as floats, for measurement tools and records only (not the converter)."""
@@ -81,9 +96,13 @@ def _linear(out: HsmModel, prefix: str, w: np.ndarray, b: np.ndarray, s_in: Frac
     out.add(f"{prefix}.rescale", "i32", m, s)
 
 
-def _layernorm(out: HsmModel, prefix: str, g: np.ndarray, b: np.ndarray, s_out: Fraction
-               ) -> list[Fraction]:
+def _layernorm(out: HsmModel, prefix: str, g: np.ndarray, b: np.ndarray, s_out: Fraction,
+               frac: int = 0) -> list[Fraction]:
     """A LayerNorm. Returns the rounding error of beta, `R(b / s) * s - b`, exact.
+
+    With `frac > 0` (hsm version 2, header constant `ln_beta_frac`), beta is stored in units of
+    `s / 2^frac`, and HardShell adds it before the one rounding: the error is then at most
+    `2^-(frac+1)` output units.
 
     HardShell adds beta after the rescale (plan §7.3 step 4), so the output has two roundings.
     The beta rounding is the same at every position: a constant error of up to half a unit in
@@ -94,11 +113,12 @@ def _layernorm(out: HsmModel, prefix: str, g: np.ndarray, b: np.ndarray, s_out: 
     s_gamma = gs[0]
     out.add(f"{prefix}.g", "i16", gq.reshape(-1).astype(np.int16))
     bf = ex.fractions_of(b)
-    bq = [ex.rhe(x / s_out) for x in bf]
+    unit = s_out / (1 << frac)
+    bq = [ex.rhe(x / unit) for x in bf]
     out.add(f"{prefix}.b", "i32", _i32(bq, prefix + ".b"))
     m, s = ex.quant_mult(s_gamma / (Fraction(1 << (nm.LN_K - nm.LN_J)) * s_out))
     out.add(f"{prefix}.rescale", "i32", np.array([m]), s)
-    return [q * s_out - x for q, x in zip(bq, bf, strict=True)]
+    return [q * unit - x for q, x in zip(bq, bf, strict=True)]
 
 
 def ln_eps_units(s_res: Fraction) -> int:
@@ -110,12 +130,16 @@ def ln_eps_units(s_res: Fraction) -> int:
 
 
 def build(fm: FModel, sc: Scales, vocabulary: list[bytes], merges: list[tuple[int, int]],
-          gelu_bits: dict[int, int] | None = None, beta_correction: bool = True) -> HsmModel:
+          gelu_bits: dict[int, int] | None = None, beta_correction: bool = True,
+          ln_beta_frac: int = 0) -> HsmModel:
     """Make all tensors of the model file. Cost: one pass over the weights.
 
     `gelu_bits[l]` selects the GELU table of layer `l`: 16 (65,536 entries, the default) or 8
-    (256 entries). It must agree with the scales (`Scales.from_ranges`). `beta_correction`
-    removes the constant error of the LayerNorm beta rounding in the next linear layer.
+    (256 entries). It must agree with the scales (`Scales.from_ranges`). `sc.wide` selects the
+    i16 outputs of hsm version 2: an `i16` GELU table, and `ln_f_bits = 16` in the header.
+    `beta_correction` removes the constant error of the LayerNorm beta rounding in the next
+    linear layer. `ln_beta_frac > 0` (hsm version 2) stores each LayerNorm beta with that many
+    more bits, added before the one rounding of the LayerNorm.
     """
     d, f, nh = fm.d_model, fm.d_ff, fm.n_head
     hd = d // nh
@@ -124,6 +148,8 @@ def build(fm: FModel, sc: Scales, vocabulary: list[bytes], merges: list[tuple[in
         n_layer=len(fm.blocks), n_head=nh, d_model=d, d_ff=f, vocab_size=fm.vocab,
         n_ctx=fm.n_ctx, eot_token=fm.eot, ln_k=nm.LN_K, ln_j=nm.LN_J,
         ln_eps=ln_eps_units(sc.res), softmax_p=nm.SOFTMAX_P,
+        ln_f_bits=16 if "ln_f" in sc.wide else None,
+        ln_beta_frac=ln_beta_frac or None,
     )
     if len(vocabulary) != fm.vocab:
         raise ValueError("the vocabulary size is not the wte row count")
@@ -145,7 +171,7 @@ def build(fm: FModel, sc: Scales, vocabulary: list[bytes], merges: list[tuple[in
     for li, b in enumerate(fm.blocks):
         p = f"h.{li}"
         g = lambda name: sc.site[f"{p}.{name}"]  # noqa: E731
-        e1 = _layernorm(out, f"{p}.ln_1", b.ln1_g, b.ln1_b, g("ln_1"))
+        e1 = _layernorm(out, f"{p}.ln_1", b.ln1_g, b.ln1_b, g("ln_1"), ln_beta_frac)
         qkv_out = [g("q")] * d + [g("k")] * d + [g("v")] * d
         _linear(out, f"{p}.attn.c_attn", b.attn_w, b.attn_b, g("ln_1"), qkv_out,
                 e1 if beta_correction else None)
@@ -154,13 +180,17 @@ def build(fm: FModel, sc: Scales, vocabulary: list[bytes], merges: list[tuple[in
         mm, ss = ex.quant_mult(g("v") / (Fraction(1 << nm.SOFTMAX_P) * g("att")))
         out.add(f"{p}.attn.out.rescale", "i32", np.array([mm]), ss)
         _linear(out, f"{p}.attn.c_proj", b.proj_w, b.proj_b, g("att"), [sc.res] * d)
-        e2 = _layernorm(out, f"{p}.ln_2", b.ln2_g, b.ln2_b, g("ln_2"))
+        e2 = _layernorm(out, f"{p}.ln_2", b.ln2_g, b.ln2_b, g("ln_2"), ln_beta_frac)
         _linear(out, f"{p}.mlp.c_fc", b.fc_w, b.fc_b, g("ln_2"), [g("fc")] * f,
                 e2 if beta_correction else None)
         bits = (gelu_bits or {}).get(li, 16)
-        out.add(f"{p}.mlp.gelu", "i8", ex.gelu_table(bits, g("fc"), g("gelu")))
+        if "gelu" in sc.wide:
+            out.add(f"{p}.mlp.gelu", "i16",
+                    ex.gelu_table(bits, g("fc"), g("gelu"), out_max=nm.I16_MAX))
+        else:
+            out.add(f"{p}.mlp.gelu", "i8", ex.gelu_table(bits, g("fc"), g("gelu")))
         _linear(out, f"{p}.mlp.c_proj", b.mlp_w, b.mlp_b, g("gelu"), [sc.res] * d)
-    _layernorm(out, "ln_f", fm.lnf_g, fm.lnf_b, s_lnf)
+    _layernorm(out, "ln_f", fm.lnf_g, fm.lnf_b, s_lnf, ln_beta_frac)
     out.add("attn_exp", "i32",
             np.array(ex.exp_table(nm.ATTN_EXP_E, nm.TABLE_LEN, nm.DELTA_LOG2), dtype=np.int32))
     out.add("logits_exp", "u64",

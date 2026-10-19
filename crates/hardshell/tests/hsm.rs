@@ -126,8 +126,12 @@ fn reader_refuses_bad_magic_and_version() {
     f[0] = b'X';
     assert_eq!(HsmFile::parse(&f).unwrap_err(), Error::BadMagic);
     let mut f = sample_file();
+    f[8] = 3;
+    assert_eq!(HsmFile::parse(&f).unwrap_err(), Error::UnsupportedVersion { version: 3 });
+    // Version 2 exists (ADR 0004 addendum B), but this file has no part that needs it.
+    let mut f = sample_file();
     f[8] = 2;
-    assert_eq!(HsmFile::parse(&f).unwrap_err(), Error::UnsupportedVersion { version: 2 });
+    assert!(matches!(HsmFile::parse(&f), Err(Error::InvalidHeader { .. })));
 }
 
 #[test]

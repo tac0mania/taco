@@ -27,6 +27,13 @@
 //!    7. `x[r] = clamp(x[r] + rescale(mlp_proj.w[r] . g + mlp_proj.b[r], mlp_proj.m[r]), -R, R)`.
 //! 3. `a = ln_f(x)`.
 //! 4. `logit[v] = clamp(rescale(wte[v] . a, logit_m[v]), -2^40, 2^40)`.
+//!
+//! A model file of format version 2 (ADR 0004 addendum B) can widen two activations to `i16`
+//! (`-32767..=32767`): the output `g` of an `i16` GELU table (step 2.6), and the output `a` of
+//! `ln_f` with the header constant `ln_f_bits = 16` (step 3). Then the matrix product that
+//! reads it (step 2.7 or step 4) uses `i64` accumulators. With the header constant
+//! `ln_beta_frac`, every LayerNorm adds its beta before its one rounding
+//! (`LayerNorm::with_beta_frac`). All other steps do not change.
 //! 5. `weight[v] = logits_exp[clamp(max(logit) - logit[v], 0, len - 1)]` (plan §7.6).
 //!
 //! # Tensor names
@@ -57,7 +64,7 @@
 //! | `h.{l}.mlp.c_fc.w` | `i8` | `[f, d]` | MLP input projection |
 //! | `h.{l}.mlp.c_fc.b` | `i32` | `[f]` | bias |
 //! | `h.{l}.mlp.c_fc.rescale` | rescale | `[f]` | accumulator to GELU input units |
-//! | `h.{l}.mlp.gelu` | `i8` | `[256]` or `[65536]` | GELU table (plan §7.4) |
+//! | `h.{l}.mlp.gelu` | `i8` (or `i16`, version 2) | `[256]` or `[65536]` | GELU table (plan §7.4) |
 //! | `h.{l}.mlp.c_proj.w` | `i8` | `[d, f]` | MLP output projection |
 //! | `h.{l}.mlp.c_proj.b` | `i32` | `[d]` | bias |
 //! | `h.{l}.mlp.c_proj.rescale` | rescale | `[d]` | accumulator to residual units |
@@ -83,11 +90,14 @@
 //! A block starts with an empty context and the `<|endoftext|>` token: call
 //! [`Session::start_block`]. When the context is full (`n_ctx` tokens) and the caller gives one
 //! more token, the session starts again: it empties the context, runs `<|endoftext|>` at
-//! position 0, then runs the token at position 1. The encoder and the decoder do the same, so
-//! they stay in step.
+//! position 0, then the last `K` tokens of the block at the positions `1..=K` ([`Overlap`],
+//! ADR 0015), then the token at position `K + 1`. With the default `K = 0` this is the rule of
+//! ADR 0004 section 9. The encoder and the decoder use the same `K` (the container stores
+//! it), so they stay in step.
 
 mod attention;
 mod batch;
+mod context;
 mod engine;
 mod model;
 mod ops;
@@ -95,6 +105,7 @@ mod reference;
 mod session;
 
 pub use batch::{Batch, BatchInput};
+pub use context::Overlap;
 pub use model::Model;
 pub use reference::ReferenceSession;
 pub use session::{Session, SessionConfig, StepWeights};

@@ -15,6 +15,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use hardshell::TokenId;
+use hardshell::gpt2::Overlap;
 
 use crate::device::{bytes_u64, u32_bytes, u32_of};
 use crate::driver::{Arg, DevBuf, Graph};
@@ -24,6 +25,7 @@ use crate::model::CudaModel;
 use crate::ops::MatKernel;
 
 mod fused;
+mod plan;
 mod record;
 
 /// A question to the coder op for one input (see [`CudaBatch::run_coded`]).
@@ -108,6 +110,11 @@ pub struct CudaBatch<'m> {
     slots: usize,
     max_rows: usize,
     pos: Vec<usize>,
+    /// The context overlap of every slot (ADR 0015).
+    overlap: Overlap,
+    /// `[slots, n_ctx]`: the token at each position of the context of each slot, for the
+    /// overlap of a restart.
+    hist: Vec<TokenId>,
     /// `[slots, vocab]`: the weights of the last [`CudaBatch::step`] of each slot.
     host: Vec<u64>,
     b: Bufs,
@@ -257,6 +264,8 @@ impl<'m> CudaBatch<'m> {
             slots,
             max_rows,
             pos: vec![0; slots],
+            overlap: Overlap::NONE,
+            hist: vec![TokenId::new(0); slots * model.n_ctx()],
             host: vec![0; slots * model.vocab_size()],
             b,
             kv,
@@ -277,6 +286,35 @@ impl<'m> CudaBatch<'m> {
             self.op_level = op_level;
             self.graphs.borrow_mut().clear();
         }
+    }
+
+    /// Sets the context overlap of every slot (ADR 0015): a slot whose context is full starts
+    /// again with `<|endoftext|>` and its last `K` tokens, as `hardshell::gpt2::Session` does.
+    /// Call it before the first pass. The `K + 1` restart rows run in passes of at most
+    /// [`CudaBatch::max_rows`] rows.
+    ///
+    /// PERF: a restart row runs the full pass, also the logits, whose result is not used (est.
+    /// 31 % of the multiply-adds of a GPT-2 small row: `vocab * d` of about
+    /// `12 * 12 * d^2 + vocab * d`).
+    ///
+    /// # Errors
+    /// [`Error::Model`] with `InvalidOverlap` if `K > n_ctx - 2`.
+    pub fn set_overlap(&mut self, overlap: Overlap) -> Result<()> {
+        let n_ctx = self.model.n_ctx();
+        if overlap.tokens().saturating_add(2) > n_ctx {
+            return Err(Error::Model(hardshell::Error::InvalidOverlap {
+                overlap: overlap.get(),
+                n_ctx,
+            }));
+        }
+        self.overlap = overlap;
+        Ok(())
+    }
+
+    /// The context overlap of the slots (ADR 0015).
+    #[must_use]
+    pub fn overlap(&self) -> Overlap {
+        self.overlap
     }
 
     /// The number of slots.
@@ -344,7 +382,8 @@ impl<'m> CudaBatch<'m> {
     /// Runs the inputs and gives the weights of each input, in input order (`inputs.len()`
     /// times `vocab` values). A slot can occur many times: its tokens run at consecutive
     /// positions (prefill). A slot whose context is full starts again first, as on the CPU
-    /// (plan §7.7). Cost: one pass for each `max_rows` rows (and one more at a restart).
+    /// (plan §7.7, ADR 0015). Cost: one pass for each `max_rows` rows (and more at a restart:
+    /// `K + 1` more rows).
     ///
     /// # Errors
     /// [`Error::BadSlot`] if a slot is not valid; [`Error::Model`] with `TokenOutOfRange` if a
@@ -455,8 +494,8 @@ impl<'m> CudaBatch<'m> {
                 }));
             }
         }
-        let (passes, pos) = self.plan(inputs);
-        for pass in &passes {
+        let plan = self.plan(inputs);
+        for pass in &plan.passes {
             if let Out::Intervals(_) = out {
                 let mut words = Vec::with_capacity(4 * pass.len());
                 for row in pass {
@@ -469,47 +508,8 @@ impl<'m> CudaBatch<'m> {
             self.forward(pass, out, prof.as_deref_mut())?;
             self.collect(pass, out, sink)?;
         }
-        self.pos = pos;
+        self.commit(plan);
         Ok(())
-    }
-
-    /// Splits the inputs into passes of at most `max_rows` rows. A restart of a slot starts a
-    /// new pass if the slot already has rows in the current pass, because the restart writes
-    /// cache positions that those rows read.
-    fn plan(&self, inputs: &[(usize, TokenId)]) -> (Vec<Vec<Row>>, Vec<usize>) {
-        let n_ctx = self.model.n_ctx();
-        let eot = self.model.eot_token();
-        let mut pos = self.pos.clone();
-        let mut passes = Vec::new();
-        let mut cur: Vec<Row> = Vec::new();
-        let mut in_pass = vec![false; self.slots];
-        for (i, &(slot, token)) in inputs.iter().enumerate() {
-            let full = pos.get(slot).is_some_and(|&p| p >= n_ctx);
-            let restart_here = full && in_pass.get(slot).copied().unwrap_or(false);
-            if restart_here || cur.len() + usize::from(full) >= self.max_rows {
-                passes.push(std::mem::take(&mut cur));
-                in_pass.iter_mut().for_each(|x| *x = false);
-            }
-            if full {
-                // PLAN(§7.7): the context starts again with <|endoftext|> at position 0.
-                cur.push(Row { slot, token: eot, pos: 0, input: None });
-                if let Some(p) = pos.get_mut(slot) {
-                    *p = 1;
-                }
-            }
-            let p = pos.get(slot).copied().unwrap_or(0);
-            cur.push(Row { slot, token, pos: p, input: Some(i) });
-            if let Some(p) = pos.get_mut(slot) {
-                *p += 1;
-            }
-            if let Some(x) = in_pass.get_mut(slot) {
-                *x = true;
-            }
-        }
-        if !cur.is_empty() {
-            passes.push(cur);
-        }
-        (passes, pos)
     }
 
     /// Copies the results of a pass into `sink`.
