@@ -1,0 +1,30 @@
+#!/bin/sh
+# One command: folds and unfolds the sample file, checks the result, and prints the hash of
+# the .taco file. That hash is the same on every machine and every backend.
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+sample="$here/samples/sample.txt"
+work=$(mktemp -d "${TMPDIR:-/tmp}/taco-demo.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+if command -v sha256sum >/dev/null 2>&1; then hash() { sha256sum "$1" | cut -d' ' -f1; }
+else hash() { shasum -a 256 "$1" | cut -d' ' -f1; }; fi
+size() { wc -c < "$1" | tr -d ' '; }
+
+echo "Taco demo: fold and unfold $(size "$sample") bytes. This takes about 15 s to 1 minute."
+echo
+start=$(date +%s)
+"$here/taco" fold "$sample" -o "$work/sample.txt.taco" -f "$@"
+mid=$(date +%s)
+"$here/taco" unfold "$work/sample.txt.taco" -o "$work/sample.txt" -f "$@"
+end=$(date +%s)
+echo
+if cmp -s "$sample" "$work/sample.txt"; then
+  echo "PASS: the file came back byte for byte."
+else
+  echo "FAIL: the restored file is different. Please report this." >&2
+  exit 1
+fi
+echo "Original: $(size "$sample") bytes. Folded: $(size "$work/sample.txt.taco") bytes."
+echo "Fold: $((mid - start)) s. Unfold: $((end - mid)) s."
+echo "SHA-256 of the .taco file: $(hash "$work/sample.txt.taco")"
+echo "Compare it with the value in README.md. It must be the same on every machine."

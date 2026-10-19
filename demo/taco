@@ -1,0 +1,24 @@
+#!/bin/sh
+# Runs the taco program for this machine with the model file of this folder.
+# Use it as the command: ./taco fold notes.txt, ./taco unfold notes.txt.taco, ./taco --help.
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64) bin="$here/bin/macos-arm64/taco" ;;
+  Linux-x86_64) bin="$here/bin/linux-x86_64/taco" ;;
+  *)
+    echo "taco demo: this folder has no program for $(uname -s) $(uname -m)." >&2
+    echo "It has: macOS (Apple Silicon), Linux x86-64, Windows x86-64 (taco.cmd)." >&2
+    exit 1
+    ;;
+esac
+if [ ! -f "$here/gpt2.hsm" ]; then
+  echo "taco demo: the model file gpt2.hsm is not in $here." >&2
+  exit 1
+fi
+# NOTE: macOS marks downloaded files as quarantined and then refuses an unsigned program.
+# This removes the mark from the demo program only.
+if [ "$(uname -s)" = Darwin ]; then
+  xattr -d com.apple.quarantine "$bin" 2>/dev/null || true
+fi
+TACO_MODEL="$here/gpt2.hsm" exec "$bin" "$@"

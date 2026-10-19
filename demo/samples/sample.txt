@@ -1,0 +1,54 @@
+A Short Note on Keeping Things
+
+People have always tried to keep things. A farmer keeps seed for the next spring. A family
+keeps letters in a box under the bed. A town keeps its records in a stone building near the
+market, and a library keeps books that nobody has opened for fifty years. In each case the
+problem is the same: there is more to keep than there is room, and the room costs money.
+
+Compression is one answer to that problem. A compressor looks for patterns in data and writes
+the data again in a shorter form. When you need the data back, a decompressor reads the short
+form and rebuilds the original, byte for byte. Nothing is lost. The shorter form is not a
+summary or a copy with less detail; it is the same information, written more cleverly.
+
+The oldest tricks are simple. If a file contains the same word many times, write the word once
+and then write short references to it. If some letters appear more often than others, give the
+common letters short codes and the rare letters long codes. The letter "e" is common in
+English, so it should cost less than the letter "q". Most compressors that you use every day,
+such as zip, gzip and zstd, are clever combinations of these two ideas.
+
+A newer trick is prediction. Imagine that you read a sentence one word at a time, and before
+each word you try to guess the next one. After "Once upon a", you will guess "time", and you
+will almost always be right. A good guess costs almost nothing to store, because the reader can
+make the same guess. Only the surprises cost space. The better the guesses, the smaller the
+file.
+
+Language models are very good at this kind of guess. They have read a large amount of text,
+and they give a probability to every possible next piece of text. A coder then turns those
+probabilities into bits. Common, expected text becomes very short. Strange, unexpected text
+costs more, but it is never lost, because the coder can always write any piece of text, even
+one that the model thought was unlikely.
+
+There is one hard condition. The machine that rebuilds the file must make exactly the same
+guesses as the machine that made the short form. Not nearly the same: exactly the same, down to
+the last bit of every number. If one probability is a little different, the decoder can pick a
+different word, and from that point everything after it is wrong.
+
+This is harder than it sounds. Computers usually calculate with floating-point numbers, which
+round their results in small ways. Two different chips, or the same chip with a different
+order of additions, can give answers that differ in the last digit. For most programs that
+does not matter. For a compressor that depends on exact guesses, it matters a great deal.
+
+One way to remove the problem is to stop using floating-point numbers at all. Whole numbers,
+added and multiplied with written rules for overflow and rounding, give the same answer on
+every machine. Seven times three is twenty-one on a phone, a laptop and a large server. A model
+that uses only whole numbers makes the same guesses everywhere, so a file that one machine
+compresses can be rebuilt on any other machine.
+
+That is the idea behind this small demonstration. The file that you are reading was compressed
+and then rebuilt on your computer. If you run the same demonstration on a different computer,
+with a different processor or a different graphics card, the compressed file will be the same,
+bit for bit. The last line of the demonstration prints a fingerprint of that file so that you
+can check it yourself.
+
+Keeping things will always cost something. But it is good to know that, when the short form
+comes back, it comes back exactly as it was.
