@@ -12,4 +12,12 @@ for c in $KERNEL; do
     echo "error: crates/$c/src uses a float type (CLAUDE.md §1 rule 1)" >&2; status=1
   fi
 done
+# The GPU kernels are in the prediction path too: CUDA C++ and WGSL. Comment lines are skipped,
+# because a comment may say "no float".
+for f in crates/hardshell-cuda/kernels/*.cu crates/hardshell-gpu/src/shaders/*.wgsl; do
+  [ -f "$f" ] || continue
+  if grep -nE '\b(float|double|half|__half|__nv_bfloat16|f32|f16)\b' "$f" | grep -vE '^[0-9]+:[[:space:]]*(//|\*|/\*)'; then
+    echo "error: $f uses a float type (CLAUDE.md §1 rule 1)" >&2; status=1
+  fi
+done
 exit $status
