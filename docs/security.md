@@ -64,7 +64,7 @@ selects the model file with `--model`, and the hash only tells which model the c
 | Input | Missing limit | Effect | Finding |
 |---|---|---|---|
 | T1 | The CLI sets no `max_output_len`. `unfold` keeps all decoded blocks and then a copy, so it needs about 2 times the original length. | A container of 9.6 KB aborts the CLI with 450 MiB of address space (measured). Fixed (streaming output, commit d63e60a). | F1 |
-| T1 | The GPU decoder makes the state of every coded and mixed block before the first block runs. | A container of 120 KB used 11 GB of resident memory. The OOM killer stopped it (measured). | F2 |
+| T1 | The GPU decoder makes the state of every coded and mixed block before the first block runs. | A container of 120 KB used 11 GB of resident memory. The OOM killer stopped it (measured). Fixed: at most 12 mixed blocks decode at the same time, each state made when its block starts (commit 1493af3). | F2 |
 | T1 | No limit on the work of a coded block, other than its stated length. | A container of 112 bytes costs 20,000 model steps (measured), and up to 2^32 - 1 steps for each block. A block is at most 64 MiB (commit d63e60a). | F5 |
 | T1 | The block list of the parser uses about 40 bytes for each table entry of 5 bytes. | Memory of about 8 times the container length (est.). Linear, so acceptable. | F7 |
 | T3 | No limit on the KV cache relative to the model file. | A model file of a few MB can state `n_layer = 1,024` and `n_ctx = 65,536`. One session then reserves `2 * n_layer * n_ctx * d_model` bytes (1 GiB for `d_model = 8`, est.), for each lane and each thread. | F6 |
@@ -136,7 +136,7 @@ the reader. The harness was repaired and the 1,000,000 cases ran again.
   passes and is not ignored. The library test uses 16 zstd blocks of 64 MiB, because a reader
   now refuses a larger block.
 
-### F2: the GPU decoder makes the state of every block before it starts (high, the gpucli agent repairs it)
+### F2: the GPU decoder makes the state of every block before it starts (high, fixed)
 
 - **Input.** A container of 120 KB with 20,000 mixed blocks of 2 bytes (stored byte `0x01`,
   profile `logs`, coding part bit 0, mixer rule 1).
@@ -147,10 +147,11 @@ the reader. The harness was repaired and the 1,000,000 cases ran again.
   fails in less than 1 s, because a group has at most 8 blocks (measured).
 - **Where.** `crates/taco/src/unfold.rs` (`decode_on_gpu`), `crates/taco/src/gpu_unfold.rs`.
 - **Test.** `taco/tests/security_unfold.rs`, `many_mixed_blocks_on_a_gpu_use_bounded_memory`
-  (`#[ignore]`, Linux, needs a GPU and a free timing lock). The CPU test
+  (Linux, needs a GPU and a free timing lock). It passes and is not ignored. The CPU test
   `many_mixed_blocks_on_the_cpu_fail_fast` passes.
-- **Fix.** Make the `MixState` (or the full decoder) when a job enters a slot. The lead sent
-  F2 to the gpucli agent (2026-10-19).
+- **Fix.** Commit 1493af3 (2026-10-19) makes the mixer state when a job enters a GPU slot,
+  and at most 12 mixed blocks decode at the same time. The unfold of 20,000 mixed blocks
+  stays under 512 MiB (measured; 11 GB before).
 
 ### F3: the JSON error of the model reader copied the input (low, fixed)
 
