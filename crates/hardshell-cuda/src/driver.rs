@@ -26,8 +26,28 @@ const STREAM_NON_BLOCKING: c_uint = 1;
 /// `CU_STREAM_CAPTURE_MODE_THREAD_LOCAL`.
 const CAPTURE_THREAD_LOCAL: c_int = 1;
 
-/// The names of the driver library, in the order of the search.
-const LIBRARY_NAMES: [&str; 3] = ["libcuda.so.1", "libcuda.so", "nvcuda.dll"];
+/// The names of the driver library of this operating system, in the order of the search.
+#[cfg(windows)]
+const LIBRARY_NAMES: &[&str] = &["nvcuda.dll"];
+/// The names of the driver library of this operating system, in the order of the search.
+#[cfg(not(windows))]
+const LIBRARY_NAMES: &[&str] = &["libcuda.so.1", "libcuda.so"];
+
+/// The error when no name of `names` loads: it names the libraries of this system and the
+/// error of the first one (the usual name; the later names are fallbacks).
+fn no_library(names: &[&str], first_error: &str) -> Error {
+    Error::NoDevice {
+        reason: format!("no CUDA driver library ({}: {first_error})", names.join(", ")),
+    }
+}
+
+/// The error of a failed `cuInit` or `cuDeviceGetCount`: the driver loaded, but CUDA has no
+/// usable device. Examples: `CUDA_ERROR_NO_DEVICE` (100) with `CUDA_VISIBLE_DEVICES=""`,
+/// `CUDA_ERROR_INSUFFICIENT_DRIVER` (35), `CUDA_ERROR_STUB_LIBRARY` (34). The caller can use
+/// another backend, so it is [`Error::NoDevice`], not [`Error::Cuda`].
+fn no_usable_device(call: &str, code: CuResult, name: &str) -> Error {
+    Error::NoDevice { reason: format!("{call} gave {name} ({code})") }
+}
 
 const ATTR_CC_MAJOR: c_int = 75;
 const ATTR_CC_MINOR: c_int = 76;
@@ -94,16 +114,26 @@ unsafe fn sym<T: Copy>(lib: &libloading::Library, name: &str) -> Result<T> {
 
 impl Api {
     fn load() -> Result<Self> {
-        let mut last = String::new();
+        let mut first: Option<String> = None;
         for name in LIBRARY_NAMES {
             // SAFETY: loading the NVIDIA driver library runs its initialisers, which is the
             // documented way to use the driver API. No other code of ours runs in them.
             match unsafe { libloading::Library::new(name) } {
                 Ok(lib) => return Self::from_library(lib),
-                Err(e) => last = e.to_string(),
+                Err(e) => {
+                    first.get_or_insert_with(|| e.to_string());
+                }
             }
         }
-        Err(Error::NoDevice { reason: format!("no CUDA driver library ({last})") })
+        Err(no_library(LIBRARY_NAMES, first.as_deref().unwrap_or("not found")))
+    }
+
+    /// [`Api::check`] for the calls that find the devices: a failure means no usable device.
+    fn check_devices(&self, call: &'static str, r: CuResult) -> Result<()> {
+        match self.check(call, r) {
+            Err(Error::Cuda { call, code, name }) => Err(no_usable_device(call, code, &name)),
+            other => other,
+        }
     }
 
     fn from_library(lib: libloading::Library) -> Result<Self> {
@@ -249,9 +279,9 @@ impl Context {
         let api = Rc::new(Api::load()?);
         // SAFETY: plain driver calls with valid out-pointers to locals.
         unsafe {
-            api.check("cuInit", (api.init)(0))?;
+            api.check_devices("cuInit", (api.init)(0))?;
             let mut count = 0;
-            api.check("cuDeviceGetCount", (api.device_get_count)(&raw mut count))?;
+            api.check_devices("cuDeviceGetCount", (api.device_get_count)(&raw mut count))?;
             let ord = c_int::try_from(ordinal).unwrap_or(c_int::MAX);
             if ord >= count {
                 return Err(Error::NoDevice { reason: format!("{count} CUDA devices") });
@@ -509,5 +539,39 @@ impl Kernel {
     /// The name of the kernel in the module.
     pub(crate) fn name(&self) -> &'static str {
         self.name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_library_names_are_the_names_of_this_system() {
+        #[cfg(windows)]
+        assert_eq!(LIBRARY_NAMES, &["nvcuda.dll"]);
+        #[cfg(not(windows))]
+        {
+            assert_eq!(LIBRARY_NAMES.first(), Some(&"libcuda.so.1"));
+            assert!(LIBRARY_NAMES.iter().all(|n| !n.ends_with(".dll")));
+        }
+    }
+
+    #[test]
+    fn a_missing_library_names_the_library_of_this_system() {
+        let e = no_library(LIBRARY_NAMES, "cannot open shared object file");
+        let text = e.to_string();
+        assert!(matches!(e, Error::NoDevice { .. }));
+        assert!(text.contains(LIBRARY_NAMES[0]), "{text}");
+        #[cfg(not(windows))]
+        assert!(!text.contains("nvcuda"), "{text}");
+        assert!(text.contains("cannot open shared object file"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_device_query_is_no_device() {
+        let e = no_usable_device("cuInit", 100, "CUDA_ERROR_NO_DEVICE");
+        assert!(matches!(e, Error::NoDevice { .. }));
+        assert!(e.to_string().contains("CUDA_ERROR_NO_DEVICE (100)"), "{e}");
     }
 }
