@@ -6,7 +6,8 @@ Date: 2026-10-18. Status: accepted. Decided by: Rohit.
 
 devbox has Nanbeige4.2-3B (Q4_K_M GGUF, about 4.4B parameters, est.). It predicts text better
 than GPT-2, so it can make smaller files. But it is about 30 times larger. It needs RoPE,
-RMSNorm, SiLU and a solution for activation outliers. Its licence is not known. Its speed on
+RMSNorm, SiLU and a solution for activation outliers. Its licence was not known when this ADR was written (later read from its GGUF header:
+Apache-2.0, HANDOFF.md). Its speed on
 the CPU (about 1 token per second, est.) makes the cross-machine check on the 8 GB Mac slow.
 
 ## Decision

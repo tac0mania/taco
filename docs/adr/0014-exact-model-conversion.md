@@ -101,4 +101,6 @@ Proof (measured):
 - 4 of 124,337,664 GPT-2 weights are exact ties. Version 1 rounded them as `R` does, one of
   them by chance (research note, section 4).
 - The conversion of GPT-2 small takes 70.7 s on the Mac and 48.1 s on devbox (version 1:
-  16.9 s on the Mac).
+  16.9 s on the Mac). `docs/research/2026-10-18-integer-gpt2.md` gives 2.6 s for the
+  converter of 2026-10-18. This ADR did not measure that converter again, so the two numbers
+  are not comparable.

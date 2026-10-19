@@ -12,7 +12,7 @@ float converter of version 1, byte for byte.
 | `gpt2.hsm` on devbox (x86), exact converter | the same SHA-256 (measured) |
 | `gpt2.hsm` of version 1 (published) | the same SHA-256. No weight and no table entry changed. |
 | `conformance/tiny.hsm`, exact converter, Mac and devbox | SHA-256 `eb78b89a4f0f17c7245865aed22f86512a49e0272b7583a831c47e1a401418f8`, 306,368 bytes, the committed file (measured) |
-| `python -m convert.test_exact`, Mac and devbox | 12 of 12 pass (measured) |
+| `python -m convert.test_exact`, Mac and devbox | 12 of 12 pass (measured). The calibration work added 2 tests later: 14 of 14 (calibration note). |
 
 The file did not change, so the quality did not change. All old `.taco` files name the same
 model hash. A frozen reproducer of version 1 is not necessary.

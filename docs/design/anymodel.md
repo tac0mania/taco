@@ -1,5 +1,8 @@
 # Design: any model (a model graph and an automatic converter)
 
+NOTE (2026-10-19): this design first named the graph format "version 2". Model-file version 2
+is now the `wide` rules (ADR 0004 addendum B). The graph format is version 3.
+
 Status: draft 1, 2026-10-18. Author: the anymodel design agent. Owner: Rohit. This document
 obeys `docs/STYLE.md`. It changes no code. ADR 0009 (proposed) records the format decision.
 
@@ -24,7 +27,7 @@ The answers:
    and 3, Mistral, Qwen 2 and 3, Gemma 1 to 3, Phi 2 to 4, SmolLM and OLMo 2. Inside a
    family, a new checkpoint needs no code. A new family needs a short architecture map in Python (about 100
    lines, est.). Mixture-of-experts and state-space models need new operations (§3.5).
-2. **HardShell becomes an interpreter.** The `.hsm` file (format version 2) holds a graph of
+2. **HardShell becomes an interpreter.** The `.hsm` file (format version 3) holds a graph of
    operations (§5). Every element-wise activation becomes a look-up table in the file, so a
    new activation needs no engine code. Version 1 files (GPT-2) stay readable.
 3. **The converter searches the recipe itself.** It measures the loss on calibration windows
@@ -191,7 +194,7 @@ NOTE: `rope` with an `i8` input loses precision, because the rotation mixes two 
 different values. The recipe search (§6.6) can select `i16` for `q` and `k`. Then the score dot
 product is `i16 x i16` with an `i64` accumulator. HardShell needs that kernel.
 
-## §5 The model graph in the `.hsm` file (format version 2)
+## §5 The model graph in the `.hsm` file (format version 3)
 
 ### §5.1 Principles
 
@@ -280,7 +283,7 @@ The semantics of a window `w > 0`: at position `t`, the op reads the positions
 not memory addresses. The cache holds `k` after `rope`, as transformers does. The context
 restart of plan §7.7 empties all caches.
 
-A later option (not in version 2): a constant start prefix. Position 0 always holds the start
+A later option (not in version 3): a constant start prefix. Position 0 always holds the start
 token, so its `k` and `v` are the same in every block. The converter can calculate them in
 float and store them as tensors. Then the integer path never runs position 0. GPT-2 has its
 largest residual value at position 0 (3,055 against 463 elsewhere, measured), so this can
@@ -548,7 +551,7 @@ Estimates in agent days (one agent, one working day with tests and documents). A
 | Part | Work | Agent days |
 |---|---|---:|
 | A. Float survey | Phase 0 scripts with transformers: float bits per byte of 4 to 6 candidate models on the phase 0 corpus | 1 |
-| B. Format version 2 | ADR, header schema, reader, validator, writer (Rust and Python), version 1 lowering, golden-hash test | 4 to 6 |
+| B. Format version 3 | ADR, header schema, reader, validator, writer (Rust and Python), version 1 lowering, golden-hash test | 4 to 6 |
 | C. New ops | `rms` norm, groups, `table`, `mul`, `rope`, GQA, window, soft-caps, `i16` scores; property tests; tiny models of §5.5 | 4 to 6 |
 | D. Converter import | Hugging Face reader, 12 architecture maps, float graph, check against transformers, one layer at a time | 4 to 6 |
 | E. Search | Generic fake quantisation and integer simulation, sensitivity, search, report | 4 to 6 |
@@ -650,7 +653,7 @@ stay available at the same SHA-256. A gated model needs each user to accept the 
 ## §10 Fit with the plan
 
 - ADR 0005 says that version 1 uses GPT-2 only, and that other models are phase 6. This design
-  does not change that. The graph format is format version 2 of the model file.
+  does not change that. The graph format is format version 3 of the model file.
 - Plan §13 questions 1 and 2 (accuracy of integer softmax, LayerNorm and `i8`) get new forms
   for each family. The search of §6.6 answers them by measurement.
 - CLAUDE.md §1 rules 1, 2, 3, 7, 8 and 10 apply without change. Rule 9 ("measure before you
@@ -666,7 +669,7 @@ version 1.
 |---|---|---|---:|---|
 | M0 | Float survey (part A): float bits per byte of GPT-2, SmolLM2 360M and 1.7B, Llama 3.2 1B, Qwen3 1.7B, on the phase 0 corpus | A candidate model is at least 10 % smaller than GPT-2 on the 16 text files. If none is, stop here. | 1 | Now (devbox GPU, tools only) |
 | M1 | Automatic search on GPT-2 (part E for GPT-2, in `tools/convert`, version 1 file) | The search, with no manual input, gives at most the bits of `clip` on the calibration windows | 3 to 4 | Now, in parallel with phase 3 |
-| M2 | Format version 2 and the interpreter (part B), GPT-2 only | `tiny.hsm` and `gpt2.hsm` (version 1) give the golden hashes. The speed loss is at most 3 %. The Mac and devbox agree. | 4 to 6 | After the SIMD and CUDA kernels land (phase 4) |
+| M2 | Format version 3 and the interpreter (part B), GPT-2 only | `tiny.hsm` and `gpt2.hsm` (version 1) give the golden hashes. The speed loss is at most 3 %. The Mac and devbox agree. | 4 to 6 | After the SIMD and CUDA kernels land (phase 4) |
 | M3 | New ops and tiny models (part C), tokenizers (part F) | Every tiny model has the same hashes on both machines. Round trips of all plan §11.2 classes for each tokenizer kind. | 6 to 9 | After M2 |
 | M4 | Converter import for the llama family (part D), first model: the M0 winner at 1B or less | Float check passes. Integer loss against float is at most +2 % on held-out text, or QAT starts. | 4 to 6 | After M3 |
 | M5 | Other families (maps), QAT (part G), rotations (part H) as the measurements need | Each family: float check and loss gate | 2 to 10 | Phase 6 |

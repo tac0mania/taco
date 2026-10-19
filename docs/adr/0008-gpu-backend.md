@@ -134,5 +134,9 @@ interval.
   AMD GPU (the iGPU of devbox, through Mesa OpenGL on D3D12 in WSL2) crashes at the first
   compute dispatch. AMD needs a test on a native Vulkan driver (RADV or the AMD driver) before
   Taco can call AMD supported.
+  Update (2026-10-19, measured, `docs/research/2026-10-19-windows.md`): on native Windows, the
+  same AMD iGPU passes the GPU tests on Vulkan (AMD driver 21.30.40, 4 of 4) and on DX12 with
+  DXC (6 of 6). DX12 with FXC fails. The crash above is specific to Mesa OpenGL on D3D12 in
+  WSL2.
 - `taco-coder` needs an encode and a decode with an interval, not a table, to use the coder
   op. That is a change to `taco-coder` and `taco` (not part of this ADR).

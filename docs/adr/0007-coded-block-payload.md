@@ -91,7 +91,8 @@ question 3 asks for the measurement with GPT-2.
 | Case | Result |
 |---|---|
 | Golden vector: tiny test model (`crates/taco/tests/common`, SHA-256 `5ba63e7c69063caa1430de0df5a9b3ed76db63de1a779d5ecce25484c88de4ff`), 2,202 bytes, blocks of 512 (coded, coded, raw, raw, coded) | 1,837 bytes, SHA-256 `c3ff718b1c9682589836078b36d936836077744b03b1cc8af3a6ced0d5821b8a` (measured, Mac) |
-| GPT-2 (`tools/data/out/gpt2.hsm`, SHA-256 `49ea618d...1183`), 4,096 bytes of `lcet10.txt`, one block | 1,975 bytes, 3.857 bits per byte, 1,062 tokens, fold 16.2 s, unfold 15.2 s (measured, Mac, release build, one thread) |
+| GPT-2 (`tools/data/out/gpt2.hsm`, SHA-256 `49ea618d...1183`, an earlier conversion before the merges section of ADR 0004
+addendum A; the current `gpt2.hsm` is `aaa03eb9...a5c2`), 4,096 bytes of `lcet10.txt`, one block | 1,975 bytes, 3.857 bits per byte, 1,062 tokens, fold 16.2 s, unfold 15.2 s (measured, Mac, release build, one thread) |
 | The same input, blocks of 512 bytes | 2,074 bytes, 4.050 bits per byte, 6.1 s with 8 threads (measured) |
 | One bit flipped in each byte of a container of 315 bytes (315 cases) | 315 errors, 0 wrong outputs (measured) |
 | Bits 0, 3 and 7 flipped in each byte of the same container (945 cases, an earlier run of the test) | 943 errors, 2 outputs equal to the original, 0 wrong outputs (measured) |

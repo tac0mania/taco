@@ -1,7 +1,10 @@
-# ADR 0009: the model file holds a graph of integer ops (format version 2)
+# ADR 0009: the model file holds a graph of integer ops (format version 3)
 
 Date: 2026-10-18. Status: proposed (by the anymodel design agent). Plan: §3, §6, §7, §8, §11,
 §12 phase 6. Design: `docs/design/anymodel.md`.
+
+NOTE (2026-10-19): this ADR first named the graph format "version 2". Model-file version 2
+is now the `wide` rules (ADR 0004 addendum B, built). Thus the graph format is version 3.
 
 ## Context
 
@@ -21,7 +24,7 @@ proposes the model file format for the work after version 1.
 
 ## Decision
 
-1. **Format version 2 of the `.hsm` file holds a graph.** The JSON header gets the fields
+1. **Format version 3 of the `.hsm` file holds a graph.** The JSON header gets the fields
    `values`, `caches` and `graph`. The graph is an ordered list of ops. HardShell runs the ops
    in file order for each step. HardShell has no code for a model family.
 2. **The op set is fixed and small:** `embed`, `norm` (modes `layer` and `rms`, with a
@@ -63,7 +66,7 @@ proposes the model file format for the work after version 1.
   not one fused GPT-2 pass. Otherwise that work must change again.
 - The interpreter adds some cost for each op. The gate of design §11 phase M2 permits at most
   a 3 % speed loss on GPT-2 (est. limit; measure it).
-- Version 2 model files of 1B to 7B parameters are 1.2 GB to 7.2 GB (est.). The Mac (8 GB)
+- Version 3 model files of 1B to 7B parameters are 1.2 GB to 7.2 GB (est.). The Mac (8 GB)
   cannot run a 7B model, so the cross-machine check limits the size to about 3B (est.).
 - This ADR does not select a model. Design §11 phase M0 measures the float gain of candidate
   models first. If no candidate is at least 10 % smaller than GPT-2, the graph work stops.
