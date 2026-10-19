@@ -154,7 +154,11 @@ impl Vocabulary {
 
     /// Parses the vocabulary section: exactly `count` entries that fill `section`.
     fn parse(section: &[u8], count: u32) -> Result<Self> {
-        let mut ends = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+        // NOTE: each entry has at least 2 bytes, so the section bounds the capacity. A header
+        // with a large `vocab_size` and a short section cannot cause a large allocation
+        // (docs/security.md, finding F4).
+        let capacity = usize::try_from(count).unwrap_or(0).min(section.len() / 2);
+        let mut ends = Vec::with_capacity(capacity);
         let mut bytes = Vec::with_capacity(section.len());
         let mut pos = 0usize;
         for token in 0..count {
@@ -208,6 +212,24 @@ fn le_bytes<const N: usize>(b: &[u8]) -> [u8; N] {
         *d = *s;
     }
     a
+}
+
+/// The longest parser message in [`Error::HeaderJson`], in bytes.
+const MAX_JSON_MESSAGE: usize = 160;
+
+/// The parser message, cut to at most [`MAX_JSON_MESSAGE`] bytes on a character boundary.
+/// A serde message can quote a field name or a string of the file, so the cut keeps an error
+/// short for any file (docs/security.md, finding F3).
+fn short_message(message: &str) -> String {
+    if message.len() <= MAX_JSON_MESSAGE {
+        return message.to_owned();
+    }
+    let mut end = MAX_JSON_MESSAGE;
+    // INVARIANT: 0 is a character boundary, so the loop stops before `end` wraps.
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", message.get(..end).unwrap_or(""))
 }
 
 fn slice(bytes: &[u8], offset: u64, len: u64) -> Result<&[u8]> {
@@ -347,7 +369,7 @@ impl HsmFile {
         let header: Header = serde_json::from_str(text).map_err(|e| Error::HeaderJson {
             line: e.line(),
             column: e.column(),
-            message: e.to_string(),
+            message: short_message(&e.to_string()),
         })?;
         let (config, v2) = header.model.into_parts();
         check_config(&config)?;
