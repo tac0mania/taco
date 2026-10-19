@@ -391,6 +391,12 @@ of them changes that property, and files from the alpha stay readable.
 | Model download in `taco` (`docs/design/model-distribution.md`) | No manual model setup |
 | Other models with an automatic converter (`docs/design/anymodel.md`) | Designed |
 
+### Experiments that do not ship
+
+| Experiment | Result (measured) | State |
+|---|---|---|
+| A model fine-tuned on logs (distilgpt2, 6 layers, trained on 12 Loghub systems; "Route A") | On logs of the 12 trained systems: 53.2% smaller than GPT-2 (profile `logs`). On 4 unseen systems: 4.6% larger. Engine 1.5 times faster (30,319 against 20,472 tokens/s, smaller model) | Frozen: the alpha is about cross-machine bits, not ratio. Details: [`docs/core-architecture.md`](docs/core-architecture.md) §8.6 |
+
 ---
 
 ## Development
