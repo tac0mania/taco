@@ -150,6 +150,8 @@ check before commercial use; the business validation steps (customer conversatio
   - `bench-whole-gpu`: starts after `overlap-speed`. All 23 whole files (profile text, CUDA),
     then 6 logs and twitter.json (profile logs). Binary: the overlap tree (not committed).
     Output: `~/bench/whole-gpu/results.tsv` (the last line is DONE).
+- Owner decision (2026-10-19): English only. Non-English text is not a goal; do not build a
+  non-English fallback.
 - Next: read the results, resume the overlap work (note, block size, ADRs), commit it. Then
   the GPU mixer in fold/unfold. Owner decisions that are open: learn while reading (level 1),
   the small fast model (a change to ADR 0005).
