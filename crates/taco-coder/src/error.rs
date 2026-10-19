@@ -55,4 +55,27 @@ pub enum CoderError {
         /// The probability that the caller gave, in units of 1/4096.
         p1: u16,
     },
+    /// A coder interval that a caller gave is not inside the table total, or has the
+    /// frequency 0.
+    #[error("the interval [{start}, {start} + {freq}) is not valid in a total of {total}")]
+    InvalidInterval {
+        /// The start that the caller gave.
+        start: u64,
+        /// The frequency that the caller gave.
+        freq: u64,
+        /// The total of the table, `2^freq_bits`.
+        total: u64,
+    },
+    /// The interval that a caller gave to the decoder does not hold the decoder target. The
+    /// source of the interval (for example a GPU coder op) is wrong. The decoder state does
+    /// not change.
+    #[error("the decoder target {target} is not in the interval [{start}, {start} + {freq})")]
+    TargetNotInInterval {
+        /// The target of the decoder.
+        target: u64,
+        /// The start of the interval.
+        start: u64,
+        /// The frequency of the interval.
+        freq: u64,
+    },
 }

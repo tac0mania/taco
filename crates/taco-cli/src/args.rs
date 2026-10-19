@@ -7,8 +7,9 @@ use std::path::PathBuf;
 pub(crate) const USAGE: &str = "\
 usage:
   taco fold <input> [-o <output>] [--model <path.hsm>] [--profile text|logs|auto]
-            [--block-size <bytes>] [--threads <n>] [-f]
-  taco unfold <input.taco> [-o <output>] [--model <path.hsm>] [--threads <n>] [-f]
+            [--block-size <bytes>] [--backend auto|cuda|gpu|cpu] [--threads <n>] [-f]
+  taco unfold <input.taco> [-o <output>] [--model <path.hsm>] [--backend auto|cuda|gpu|cpu]
+              [--threads <n>] [-f]
 
   fold      compress <input> into <input>.taco
   unfold    restore <input.taco> into the input name without .taco
@@ -20,6 +21,10 @@ options:
                           the mixer) or auto (default: logs if a block gets smaller with
                           it, else text). unfold reads the profile from the file.
   --block-size <bytes>    the bytes in each block (fold only, default 16384)
+  --backend <name>        where the model runs: cuda (NVIDIA), gpu (wgpu: Metal, Vulkan,
+                          DX12, GL), cpu, or auto (default: the first of cuda, gpu, cpu that
+                          passes a self-test). The output is the same on every backend.
+                          fold with the profile logs or auto runs on the CPU.
   --threads <n>           worker threads (default: all CPUs); the output does not change
   -f, --force             replace an output file that exists
   -h, --help              show this text
@@ -51,6 +56,17 @@ pub(crate) enum ProfileArg {
     Auto,
 }
 
+/// The `--backend` of fold and unfold.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum BackendArg {
+    /// The default (ADR 0016).
+    #[default]
+    Auto,
+    Cuda,
+    Gpu,
+    Cpu,
+}
+
 /// One `fold` or `unfold` job, with all defaults applied except the model and the threads.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Job {
@@ -64,6 +80,8 @@ pub(crate) struct Job {
     pub(crate) force: bool,
     /// Fold only. The default is [`ProfileArg::Auto`].
     pub(crate) profile: ProfileArg,
+    /// The default is [`BackendArg::Auto`].
+    pub(crate) backend: BackendArg,
 }
 
 /// The default output name: `<input>.taco` for fold, the input without `.taco` for unfold.
@@ -101,6 +119,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
     let (mut input, mut output, mut model) = (None, None, None);
     let (mut block_size, mut threads, mut force) = (None, None, false);
     let mut profile = ProfileArg::default();
+    let mut backend = BackendArg::default();
     while let Some(a) = args.next() {
         match a.to_str() {
             Some("-h" | "--help") => return Ok(Command::Help),
@@ -115,6 +134,15 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
                     Some("logs") => ProfileArg::Logs,
                     Some("auto") => ProfileArg::Auto,
                     _ => return Err("--profile needs text, logs or auto".into()),
+                };
+            }
+            Some("--backend") => {
+                backend = match args.next().as_deref().and_then(std::ffi::OsStr::to_str) {
+                    Some("auto") => BackendArg::Auto,
+                    Some("cuda") => BackendArg::Cuda,
+                    Some("gpu") => BackendArg::Gpu,
+                    Some("cpu") => BackendArg::Cpu,
+                    _ => return Err("--backend needs auto, cuda, gpu or cpu".into()),
                 };
             }
             Some("--threads") => threads = Some(number("--threads", args.next())?),
@@ -146,6 +174,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
         threads,
         force,
         profile,
+        backend,
     }))
 }
 
@@ -207,6 +236,17 @@ mod tests {
         assert!(run(&["fold", "a", "--profile", "json"]).is_err());
         assert!(run(&["fold", "a", "--profile"]).is_err());
         assert!(run(&["unfold", "a.taco", "--profile", "logs"]).is_err());
+    }
+
+    #[test]
+    fn backend_parses_for_fold_and_unfold() {
+        assert_eq!(job(&["fold", "a"]).backend, BackendArg::Auto);
+        assert_eq!(job(&["fold", "a", "--backend", "cuda"]).backend, BackendArg::Cuda);
+        assert_eq!(job(&["unfold", "a.taco", "--backend", "gpu"]).backend, BackendArg::Gpu);
+        assert_eq!(job(&["unfold", "a.taco", "--backend", "cpu"]).backend, BackendArg::Cpu);
+        assert_eq!(job(&["fold", "a", "--backend", "auto"]).backend, BackendArg::Auto);
+        assert!(run(&["fold", "a", "--backend", "tpu"]).is_err());
+        assert!(run(&["fold", "a", "--backend"]).is_err());
     }
 
     #[test]

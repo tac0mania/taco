@@ -1389,6 +1389,8 @@ name = "taco"
 version = "0.1.0"
 dependencies = [
  "hardshell",
+ "hardshell-cuda",
+ "hardshell-gpu",
  "proptest",
  "serde_json",
  "sha2",

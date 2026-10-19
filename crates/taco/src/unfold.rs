@@ -3,9 +3,11 @@
 use hardshell::gpt2::{Batch, BatchInput, Model};
 use taco_format::{BlockKind, BlockRef, Container, FormatError, MixerRule};
 
+use crate::backend::{Backend, Engine};
 use crate::codec::BlockDecoder;
 use crate::container_hash;
 use crate::error::{Result, TacoError};
+use crate::gpu_unfold::{Job, decode_jobs};
 use crate::mix::MixState;
 use crate::parallel::{Threads, map_blocks};
 
@@ -82,6 +84,28 @@ impl UnfoldOptions {
 /// - [`TacoError::ChecksumMismatch`] if the restored bytes have a different SHA-256.
 /// - [`TacoError::WorkerFailed`] if a worker thread stopped without a result.
 pub fn unfold(model: Option<&Model>, container: &[u8], options: &UnfoldOptions) -> Result<Vec<u8>> {
+    unfold_with(&Engine::cpu(), model, container, options)
+}
+
+/// [`unfold`] on the backend of `engine` (ADR 0016). The output is the output of [`unfold`],
+/// on every backend. A container of any backend unfolds on every backend.
+///
+/// On a GPU, every coded and mixed block decodes in its own slot, and all slots step together
+/// (one token for each slot in each step). For a coded block the GPU coder op finds the token
+/// for the target value of the range decoder (24 bytes for each token come back). For a mixed
+/// block the GPU gives the full weights back (about 402 KB for each token of GPT-2 small), and
+/// the mixer and the decoder run on `options.threads` CPU threads. Raw and zstd blocks do not
+/// use the GPU.
+///
+/// # Errors
+///
+/// The errors of [`unfold`], and [`TacoError::Backend`] on a fault of the GPU.
+pub fn unfold_with(
+    engine: &Engine<'_>,
+    model: Option<&Model>,
+    container: &[u8],
+    options: &UnfoldOptions,
+) -> Result<Vec<u8>> {
     let parsed = Container::parse(container)?;
     let header = parsed.header();
     let model = match (header.needs_model(), model) {
@@ -105,24 +129,32 @@ pub fn unfold(model: Option<&Model>, container: &[u8], options: &UnfoldOptions) 
     }
     let blocks = parsed.blocks();
     let rule = header.coding_parts().mixer();
-    // Groups of up to MAX_LANES blocks decode in lockstep on one thread (the batch path of
-    // HardShell). The group size gives each thread at least one group when there are enough
-    // blocks. The output does not depend on it (each block is independent).
-    // NOTE: lanes come before threads. On the M2, 2 blocks of alice29 (32 KiB) unfold in 48.9 s
-    // on 1 thread with 2 lanes, and in 86.5 s on 2 threads with 1 lane each (measured).
-    let fill = blocks.len().min(MIN_LANES);
-    let group_size = blocks.len().div_ceil(options.threads.get()).max(fill).clamp(1, MAX_LANES);
-    let group_parts = map_blocks(
-        blocks.len().div_ceil(group_size),
-        options.threads,
-        || None,
-        |batch: &mut Option<Batch<'_>>, g| {
-            let end = ((g + 1) * group_size).min(blocks.len());
-            let group = blocks.get(g * group_size..end).unwrap_or(&[]);
-            decode_group(model, rule, batch, group_size, group)
-        },
-    )?;
-    let parts: Vec<Vec<u8>> = group_parts.into_iter().flatten().collect();
+    let parts: Vec<Vec<u8>> = match model {
+        Some(m) if engine.backend() != Backend::Cpu => {
+            decode_on_gpu(engine, m, rule, blocks, options.threads)?
+        }
+        _ => {
+            // Groups of up to MAX_LANES blocks decode in lockstep on one thread (the batch path of
+            // HardShell). The group size gives each thread at least one group when there are enough
+            // blocks. The output does not depend on it (each block is independent).
+            // NOTE: lanes come before threads. On the M2, 2 blocks of alice29 (32 KiB) unfold in 48.9 s
+            // on 1 thread with 2 lanes, and in 86.5 s on 2 threads with 1 lane each (measured).
+            let fill = blocks.len().min(MIN_LANES);
+            let group_size =
+                blocks.len().div_ceil(options.threads.get()).max(fill).clamp(1, MAX_LANES);
+            let group_parts = map_blocks(
+                blocks.len().div_ceil(group_size),
+                options.threads,
+                || None,
+                |batch: &mut Option<Batch<'_>>, g| {
+                    let end = ((g + 1) * group_size).min(blocks.len());
+                    let group = blocks.get(g * group_size..end).unwrap_or(&[]);
+                    decode_group(model, rule, batch, group_size, group)
+                },
+            )?;
+            group_parts.into_iter().flatten().collect()
+        }
+    };
     let total: usize = parts.iter().map(Vec::len).sum();
     let mut out = Vec::with_capacity(total);
     for p in &parts {
@@ -235,6 +267,78 @@ fn decode_group<'m>(
                 }
             }
         }
+    }
+    if let Some((_, e)) = errors.into_iter().min_by_key(|(i, _)| *i) {
+        return Err(e);
+    }
+    parts.into_iter().map(|p| p.ok_or(TacoError::WorkerFailed)).collect()
+}
+
+/// Decodes all blocks with the GPU of `engine`: raw and zstd blocks on the CPU threads, coded
+/// and mixed blocks in the slots of the GPU. The error is the error of the block with the
+/// lowest index, as on the CPU.
+fn decode_on_gpu(
+    engine: &Engine<'_>,
+    model: &Model,
+    rule: Option<MixerRule>,
+    blocks: &[BlockRef<'_>],
+    threads: Threads,
+) -> Result<Vec<Vec<u8>>> {
+    // The blocks without the model, on the threads; the others become jobs.
+    let direct = map_blocks(
+        blocks.len(),
+        threads,
+        || (),
+        |(), i| {
+            let Some(b) = blocks.get(i) else { return Ok(None) };
+            Ok(match b.kind() {
+                BlockKind::Raw => Some(Ok(b.stored().to_vec())),
+                BlockKind::Zstd => {
+                    let mut bytes = Vec::new();
+                    Some(b.decode_zstd_into(&mut bytes).map(|()| bytes).map_err(TacoError::Format))
+                }
+                _ => None,
+            })
+        },
+    )?;
+    let mut parts: Vec<Option<Vec<u8>>> = vec![None; blocks.len()];
+    let mut errors: Vec<(u32, TacoError)> = Vec::new();
+    let mut jobs = Vec::new();
+    for (part, (b, d)) in blocks.iter().zip(direct).enumerate() {
+        match (d, b.kind()) {
+            (Some(Ok(bytes)), _) => parts[part] = Some(bytes),
+            (Some(Err(e)), _) => errors.push((b.index(), e)),
+            (None, kind) => {
+                // NOTE: the parser refuses a mixed block without a rule version in the header.
+                let mix = match (kind, rule) {
+                    (BlockKind::Coded, _) => None,
+                    (BlockKind::Mixed, Some(r)) => Some(MixState::new(r)),
+                    _ => {
+                        errors.push((
+                            b.index(),
+                            TacoError::CorruptBlock {
+                                block: b.index(),
+                                reason: "the block kind needs a model or a newer reader",
+                            },
+                        ));
+                        continue;
+                    }
+                };
+                match BlockDecoder::new(model, b.stored(), b.index(), b.original_len(), mix) {
+                    Ok(decoder) => jobs.push(Job { part, index: b.index(), decoder }),
+                    Err(e) => errors.push((b.index(), e)),
+                }
+            }
+        }
+    }
+    if !jobs.is_empty() {
+        let (done, failed) = decode_jobs(engine, model, jobs, threads)?;
+        for (part, bytes) in done {
+            if let Some(p) = parts.get_mut(part) {
+                *p = Some(bytes);
+            }
+        }
+        errors.extend(failed);
     }
     if let Some((_, e)) = errors.into_iter().min_by_key(|(i, _)| *i) {
         return Err(e);

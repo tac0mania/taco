@@ -8,6 +8,9 @@ publish.workspace = true
 
 [dependencies]
 hardshell = { path = "../hardshell" }
+# ADR 0016: the GPU backends. Both build on every machine; they find the driver at run time.
+hardshell-cuda = { path = "../hardshell-cuda" }
+hardshell-gpu = { path = "../hardshell-gpu" }
 taco-coder = { path = "../taco-coder" }
 taco-format = { path = "../taco-format" }
 taco-match = { path = "../taco-match" }

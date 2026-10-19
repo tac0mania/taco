@@ -62,24 +62,29 @@
 // crates. This crate only calls it, and it has no floats either.
 #![deny(clippy::float_arithmetic)]
 
+mod backend;
 mod codec;
 mod error;
 mod fold;
+mod gpu_fold;
+mod gpu_unfold;
+mod lanes;
 mod mix;
 mod parallel;
 mod payload;
 pub mod tokenizer;
 mod unfold;
 
+pub use backend::{Backend, BackendChoice, BackendNote, Engine, with_engine};
 pub use codec::FREQ_BITS;
 pub use error::{Result, TacoError};
-pub use fold::{FoldOptions, FoldProfile, FoldStats, Folded, fold};
+pub use fold::{FoldOptions, FoldProfile, FoldStats, Folded, fold, fold_with};
 pub use hardshell::TokenId;
 pub use hardshell::gpt2::Model;
 pub use parallel::Threads;
 pub use taco_format::{BlockSize, Checksum, ModelHash, Profile};
 pub use tokenizer::{MergeFault, Tokenizer};
-pub use unfold::{UnfoldOptions, unfold};
+pub use unfold::{UnfoldOptions, unfold, unfold_with};
 
 /// The default number of input bytes in each block: 16 KiB. See the crate documentation.
 // NOTE: the compiler evaluates this constant. A panic here is a build error, not a run-time

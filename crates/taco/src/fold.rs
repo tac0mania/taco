@@ -6,8 +6,12 @@ use taco_format::{
     TABLE_ENTRY_LEN, compress_zstd,
 };
 
-use crate::codec::{encode_block, tokens_restore};
+use hardshell::TokenId;
+
+use crate::backend::{Backend, Engine};
+use crate::codec::{CodedBlock, encode_block, tokens_restore};
 use crate::error::{Result, TacoError};
+use crate::gpu_fold::{BlockWork, code_blocks};
 use crate::mix::MixState;
 use crate::parallel::{Threads, map_blocks};
 use crate::tokenizer::Tokenizer;
@@ -77,6 +81,14 @@ impl FoldOptions {
         self
     }
 
+    /// `true` if [`fold_with`] runs HardShell on a GPU engine with these options: the profile
+    /// `text`. The profiles `logs` and `auto` fold on the CPU on every engine, because the
+    /// mixer needs all weights of each token (ADR 0016 section 5).
+    #[must_use]
+    pub const fn uses_gpu(&self) -> bool {
+        matches!(self.profile, FoldProfile::Text)
+    }
+
     /// The same options with another profile.
     #[must_use]
     pub const fn with_profile(mut self, profile: FoldProfile) -> Self {
@@ -117,6 +129,8 @@ pub struct FoldStats {
     /// For the profile `text` this is `container_len`. The encoder knows it without a second
     /// run, because the coded candidate of each block is the same in both profiles.
     pub text_container_len: u64,
+    /// The backend that ran HardShell (ADR 0016). The container does not depend on it.
+    pub backend: Backend,
 }
 
 /// The result of [`fold`]: the container and numbers about it.
@@ -172,6 +186,34 @@ pub fn fold(
     input: &[u8],
     options: &FoldOptions,
 ) -> Result<Folded> {
+    fold_with(&Engine::cpu(), model, tokenizer, input, options)
+}
+
+/// [`fold`] on the backend of `engine` (ADR 0016). The container is the container of
+/// [`fold`], byte for byte, on every backend.
+///
+/// On a GPU with the profile `text`, the blocks are tokenized and compressed with zstd on
+/// `options.threads` threads first. Then HardShell runs the blocks on the GPU: the GPU coder op
+/// gives the coder interval of each token (24 bytes for each token come back), and the windows
+/// of the context (1,024 tokens for GPT-2) run in parallel slots. The model stops early for a
+/// block whose candidate reaches the stop length, as on the CPU, but the rows of a call that is
+/// already on the GPU still run. Memory: the tokens and the zstd frame of every block, and the
+/// payloads.
+///
+/// The profiles `logs` and `auto` run on the CPU on every engine (`FoldStats::backend` says
+/// so): their mixer needs all weights of each token, and on devbox the read back of the
+/// weights made the GPU slower than the CPU (ADR 0016 section 5).
+///
+/// # Errors
+///
+/// The errors of [`fold`], and [`TacoError::Backend`] on a fault of the GPU.
+pub fn fold_with(
+    engine: &Engine<'_>,
+    model: &Model,
+    tokenizer: &Tokenizer,
+    input: &[u8],
+    options: &FoldOptions,
+) -> Result<Folded> {
     if tokenizer.vocab_size() != model.vocab_size() {
         return Err(TacoError::TokenizerMismatch {
             tokenizer: tokenizer.vocab_size(),
@@ -183,28 +225,52 @@ pub fn fold(
         FoldProfile::Text => None,
         FoldProfile::Logs | FoldProfile::Auto => Some(MixerRule::V1),
     };
-    let coded = map_blocks(
-        chunks.len(),
-        options.threads,
-        || Session::with_config(model, SessionConfig::new().with_chunk(FOLD_CHUNK)),
-        |session, i| {
-            let index = u32::try_from(i)
-                .map_err(|_| TacoError::InputTooLarge { reason: "more than u32::MAX blocks" })?;
-            let data = chunks.get(i).copied().unwrap_or(&[]);
-            let tokens = tokenizer.encode(data);
-            if !tokens_restore(model, &tokens, data) {
-                return Err(TacoError::TokenizerRoundTrip { block: index });
-            }
-            // ADR 0011 §4.5: the zstd frame comes first, so the model can stop at its length.
-            let zstd = compress_zstd(data)?;
-            let mut mix = rule.map(MixState::new);
-            let coded = encode_block(session, &tokens, data.len().min(zstd.len()), mix.as_mut())?;
-            drop(mix);
-            let text = Block::choose_smallest(data.len(), coded.payload, Some(zstd));
-            let text_len = text.stored_len(data.len());
-            Ok((text.or_mixed(data.len(), coded.mixed), text_len, coded.tokens))
-        },
-    )?;
+    let prepare = |i: usize| -> Result<(Vec<TokenId>, Vec<u8>)> {
+        let index = u32::try_from(i)
+            .map_err(|_| TacoError::InputTooLarge { reason: "more than u32::MAX blocks" })?;
+        let data = chunks.get(i).copied().unwrap_or(&[]);
+        let tokens = tokenizer.encode(data);
+        if !tokens_restore(model, &tokens, data) {
+            return Err(TacoError::TokenizerRoundTrip { block: index });
+        }
+        // ADR 0011 §4.5: the zstd frame comes first, so the model can stop at its length.
+        Ok((tokens, compress_zstd(data)?))
+    };
+    let choose = |i: usize, coded: CodedBlock, zstd: Vec<u8>| {
+        let len = chunks.get(i).map_or(0, |d| d.len());
+        let text = Block::choose_smallest(len, coded.payload, Some(zstd));
+        let text_len = text.stored_len(len);
+        (text.or_mixed(len, coded.mixed), text_len, coded.tokens)
+    };
+    // NOTE: the profiles `logs` and `auto` run on the CPU on every engine. Their mixer needs all
+    // weights of each token, and the read back made the CUDA fold slower than the CPU fold:
+    // 128 KiB of `apache_access.log` took 162.8 s with CUDA and 141.4 s on 6 CPU threads
+    // (measured, devbox, ADR 0016 section 5).
+    let on_gpu = engine.backend() != Backend::Cpu && options.uses_gpu();
+    let coded = if !on_gpu {
+        map_blocks(
+            chunks.len(),
+            options.threads,
+            || Session::with_config(model, SessionConfig::new().with_chunk(FOLD_CHUNK)),
+            |session, i| {
+                let (tokens, zstd) = prepare(i)?;
+                let stop = chunks.get(i).map_or(0, |d| d.len()).min(zstd.len());
+                let coded = encode_block(session, &tokens, stop, rule.map(MixState::new))?;
+                Ok(choose(i, coded, zstd))
+            },
+        )?
+    } else {
+        let prepared = map_blocks(chunks.len(), options.threads, || (), |(), i| prepare(i))?;
+        let mut work = Vec::with_capacity(prepared.len());
+        let mut frames = Vec::with_capacity(prepared.len());
+        for (i, (tokens, zstd)) in prepared.into_iter().enumerate() {
+            let stop = chunks.get(i).map_or(0, |d| d.len()).min(zstd.len());
+            work.push(BlockWork::new(tokens, stop)?);
+            frames.push(zstd);
+        }
+        let coded = code_blocks(engine, model, work)?;
+        coded.into_iter().zip(frames).enumerate().map(|(i, (c, z))| choose(i, c, z)).collect()
+    };
     let to_u64 =
         |n: usize| u64::try_from(n).map_err(|_| TacoError::InputTooLarge { reason: "length" });
     let mut stats = FoldStats::default();
@@ -236,5 +302,6 @@ pub fn fold(
     stats.container_len = to_u64(container.len())?;
     stats.profile = profile;
     stats.text_container_len = text_len;
+    stats.backend = if on_gpu { engine.backend() } else { Backend::Cpu };
     Ok(Folded { container, stats })
 }

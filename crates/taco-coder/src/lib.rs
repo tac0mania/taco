@@ -84,6 +84,9 @@
 //!
 //! - [`Encoder::encode`]: one shift, two multiplications, no division.
 //! - [`Decoder::decode`]: one `u64` division and one binary search over `V` starts.
+//! - [`Encoder::encode_interval`], [`Decoder::target`] and [`Decoder::decode_interval`]: the
+//!   same operations with a [`CodeInterval`] from outside a table (a GPU coder op). They give
+//!   the same bytes and symbols as the table path (`tests/interval.rs`).
 //! - [`Encoder::encode_bit`] and [`Decoder::decode_bit`]: one shift and one multiplication.
 //! - [`FreqTable::from_weights`]: one `u128` division for each symbol.
 
@@ -94,12 +97,14 @@ mod decoder;
 mod encoder;
 mod error;
 pub mod freq;
+mod interval;
 mod types;
 
 pub use decoder::Decoder;
 pub use encoder::Encoder;
 pub use error::CoderError;
 pub use freq::{Freq, FreqBits, FreqTable};
+pub use interval::CodeInterval;
 pub use types::{Prob12, Symbol};
 
 /// The renormalisation bound: after each operation, `range >= 2^56`.

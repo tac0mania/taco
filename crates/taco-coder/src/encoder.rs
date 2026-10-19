@@ -3,7 +3,7 @@
 use core::iter::repeat_n;
 
 use crate::cast::{carry_bit, low_u64, top_byte};
-use crate::{CoderError, FreqTable, INITIAL_RANGE, Prob12, Symbol, TOP};
+use crate::{CodeInterval, CoderError, FreqTable, INITIAL_RANGE, Prob12, Symbol, TOP};
 
 /// The range encoder. It writes bytes to a `Vec<u8>` and returns them from [`Encoder::finish`].
 ///
@@ -70,16 +70,37 @@ impl Encoder {
                 symbols: table.symbol_count(),
             });
         };
+        self.encode_parts(iv.start, iv.freq, iv.is_last, table.freq_bits().get());
+        Ok(())
+    }
+
+    /// Encodes the symbol of `interval`. This gives the same bytes as [`Encoder::encode`] with
+    /// the table whose interval it is: a symbol is the last one of its table exactly when
+    /// `start + freq` is the total (see [`CodeInterval::is_last`]).
+    ///
+    /// Cost: as [`Encoder::encode`].
+    pub fn encode_interval(&mut self, interval: CodeInterval) {
+        self.encode_parts(
+            interval.start(),
+            interval.freq(),
+            interval.is_last(),
+            interval.freq_bits().get(),
+        );
+    }
+
+    /// The symbol step of ADR 0003 for the interval `[start, start + freq)` of a total of
+    /// `2^bits`.
+    #[inline]
+    fn encode_parts(&mut self, start: u64, freq: u64, is_last: bool, bits: u32) {
         // DETERMINISM: the total is 2^bits, so `range >> bits` is floor(range / total).
-        let r = self.range >> table.freq_bits().get();
+        let r = self.range >> bits;
         // INVARIANT: start < T and r * T <= range, so r * start < 2^64.
-        let offset = r * iv.start;
+        let offset = r * start;
         self.low += u128::from(offset);
         // The last symbol takes the rest of the range. The decoder uses the same rule.
         // INVARIANT: for other symbols, start + freq < T, so r * freq < range.
-        self.range = if iv.is_last { self.range - offset } else { r * iv.freq };
+        self.range = if is_last { self.range - offset } else { r * freq };
         self.renormalise();
-        Ok(())
     }
 
     /// Encodes one binary decision. `p1` is the probability that `bit` is `true`.

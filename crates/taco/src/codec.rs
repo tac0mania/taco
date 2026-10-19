@@ -25,7 +25,7 @@
 
 use hardshell::TokenId;
 use hardshell::gpt2::{Model, Session};
-use taco_coder::{Decoder, Encoder, FreqBits, FreqTable, Symbol};
+use taco_coder::{CodeInterval, Decoder, Encoder, FreqBits, FreqTable, Symbol};
 
 use crate::error::{Result, TacoError};
 use crate::mix::MixState;
@@ -90,10 +90,22 @@ impl Candidate {
     ) -> Result<()> {
         let table = FreqTable::from_weights(weights, freq_bits()?)?;
         self.encoder.encode(&table, Symbol::new(token.get()))?;
+        self.check_stop(prefix, stop);
+        Ok(())
+    }
+
+    /// Codes the interval of a token in the table of its weights (from a GPU coder op), and
+    /// stops the candidate at `stop` bytes. The bytes are the bytes of [`Candidate::encode`]
+    /// (a `taco-coder` test proves it).
+    fn encode_interval(&mut self, interval: CodeInterval, prefix: usize, stop: usize) {
+        self.encoder.encode_interval(interval);
+        self.check_stop(prefix, stop);
+    }
+
+    fn check_stop(&mut self, prefix: usize, stop: usize) {
         if prefix + self.encoder.bytes_written() >= stop {
             self.live = false;
         }
-        Ok(())
     }
 
     /// The payload: the varint of `count`, then the coder bytes. `None` if the candidate
@@ -111,23 +123,44 @@ impl Candidate {
 }
 
 /// The encoders of one block: GPT-2 alone, and the mixed form if the profile has the match
-/// model and the mixer.
-struct BlockEncoder<'a> {
+/// model and the mixer. The caller gives the tokens in order, each with the HardShell weights
+/// of its position ([`BlockEncoder::push`]) or, for GPT-2 alone, with its interval from a GPU
+/// coder op ([`BlockEncoder::push_interval`]).
+pub(crate) struct BlockEncoder {
     plain: Candidate,
-    mixed: Option<(Candidate, &'a mut MixState)>,
+    mixed: Option<(Candidate, MixState)>,
+    count: u64,
     prefix: usize,
     stop: usize,
 }
 
-impl BlockEncoder<'_> {
+impl BlockEncoder {
+    /// The encoders of a block of `count` tokens with the stop length `stop` (ADR 0007 §5.2).
+    /// `mix` is a new state (the block start) for the profile `logs`, else `None`.
+    pub(crate) fn new(count: u64, stop: usize, mix: Option<MixState>) -> Self {
+        Self {
+            plain: Candidate::new(stop),
+            mixed: mix.map(|m| (Candidate::new(stop), m)),
+            count,
+            prefix: varint_len(count),
+            stop,
+        }
+    }
+
+    /// `true` when every candidate has stopped, so the model can stop too. A block whose
+    /// varint alone reaches the stop length is stopped before the first token.
+    pub(crate) fn stopped(&self) -> bool {
+        let mixed_live = self.mixed.as_ref().is_some_and(|(c, _)| c.live);
+        self.prefix >= self.stop || (!self.plain.live && !mixed_live)
+    }
+
     /// Codes one token with the HardShell `weights` in each live candidate. Returns `true`
     /// when every candidate has stopped, so the model can stop too.
-    fn push(&mut self, weights: &[u64], token: TokenId) -> Result<bool> {
+    pub(crate) fn push(&mut self, weights: &[u64], token: TokenId) -> Result<bool> {
         let (prefix, stop) = (self.prefix, self.stop);
         if self.plain.live {
             self.plain.encode(weights, token, prefix, stop)?;
         }
-        let mut mixed_live = false;
         if let Some((cand, state)) = self.mixed.as_mut()
             && cand.live
         {
@@ -135,9 +168,28 @@ impl BlockEncoder<'_> {
             // update the mixer and the match model with the token.
             cand.encode(state.mix(weights)?, token, prefix, stop)?;
             state.observe(token);
-            mixed_live = cand.live;
         }
-        Ok(!self.plain.live && !mixed_live)
+        Ok(self.stopped())
+    }
+
+    /// Codes one token of GPT-2 alone with its `interval` in the table of its HardShell
+    /// weights. Returns `true` when the candidate has stopped. An encoder with the mixed
+    /// candidate needs the weights: use [`BlockEncoder::push`].
+    pub(crate) fn push_interval(&mut self, interval: CodeInterval) -> bool {
+        let (prefix, stop) = (self.prefix, self.stop);
+        if self.plain.live {
+            self.plain.encode_interval(interval, prefix, stop);
+        }
+        self.stopped()
+    }
+
+    /// The payloads of GPT-2 alone and of the mixed form, as [`encode_block`] gives them.
+    pub(crate) fn finish(self) -> CodedBlock {
+        if self.prefix >= self.stop {
+            return CodedBlock { payload: None, mixed: None, tokens: self.count };
+        }
+        let mixed = self.mixed.and_then(|(cand, _)| cand.finish(self.count));
+        CodedBlock { payload: self.plain.finish(self.count), mixed, tokens: self.count }
     }
 }
 
@@ -170,21 +222,15 @@ pub(crate) fn encode_block(
     session: &mut Session<'_>,
     tokens: &[TokenId],
     stop: usize,
-    mix: Option<&mut MixState>,
+    mix: Option<MixState>,
 ) -> Result<CodedBlock> {
     let count = u64::try_from(tokens.len())
         .map_err(|_| TacoError::InputTooLarge { reason: "token count" })?;
+    let mut enc = BlockEncoder::new(count, stop, mix);
     let stopped = Ok(CodedBlock { payload: None, mixed: None, tokens: count });
-    let prefix = varint_len(count);
-    if prefix >= stop {
+    if enc.stopped() {
         return stopped;
     }
-    let mut enc = BlockEncoder {
-        plain: Candidate::new(stop),
-        mixed: mix.map(|m| (Candidate::new(stop), m)),
-        prefix,
-        stop,
-    };
     let first = session.start_block()?;
     if let Some((&t0, rest)) = tokens.split_first() {
         if enc.push(first, t0)? {
@@ -202,8 +248,7 @@ pub(crate) fn encode_block(
             }
         }
     }
-    let mixed = enc.mixed.and_then(|(cand, _)| cand.finish(count));
-    Ok(CodedBlock { payload: enc.plain.finish(count), mixed, tokens: count })
+    Ok(enc.finish())
 }
 
 /// The decoder state of one coded or mixed block: the range decoder, the bytes so far, the
@@ -257,7 +302,6 @@ impl<'a> BlockDecoder<'a> {
     /// # Errors
     /// [`TacoError::CorruptBlock`] if the token has no bytes or the bytes are too long.
     pub(crate) fn next(&mut self, weights: &[u64]) -> Result<Option<TokenId>> {
-        let corrupt = |reason| TacoError::CorruptBlock { block: self.index, reason };
         let table = match self.mix.as_mut() {
             Some(state) => FreqTable::from_weights(state.mix(weights)?, freq_bits()?)?,
             None => FreqTable::from_weights(weights, freq_bits()?)?,
@@ -266,6 +310,50 @@ impl<'a> BlockDecoder<'a> {
         if let Some(state) = self.mix.as_mut() {
             state.observe(token);
         }
+        self.accept(token)
+    }
+
+    /// `true` if the block is mixed: [`BlockDecoder::next`] needs the HardShell weights. A
+    /// coded block can also decode with [`BlockDecoder::target`] and
+    /// [`BlockDecoder::next_interval`].
+    pub(crate) fn is_mixed(&self) -> bool {
+        self.mix.is_some()
+    }
+
+    /// The target value of the range decoder for the next token (ADR 0003 decoder step 2,
+    /// with `T = 2^32`). A GPU coder op finds the token whose interval holds it.
+    ///
+    /// # Errors
+    /// [`TacoError::Coder`] only on an internal fault (the constant `FREQ_BITS`).
+    pub(crate) fn target(&self) -> Result<u64> {
+        Ok(self.decoder.target(freq_bits()?))
+    }
+
+    /// Decodes the next token of a coded block from its symbol and interval, which a GPU
+    /// coder op found for [`BlockDecoder::target`]. The result is the result of
+    /// [`BlockDecoder::next`] with the HardShell weights.
+    ///
+    /// # Errors
+    /// [`TacoError::Coder`] if the interval does not hold the target (a fault of the coder
+    /// op), or if the block is mixed; [`TacoError::CorruptBlock`] as [`BlockDecoder::next`].
+    pub(crate) fn next_interval(
+        &mut self,
+        token: TokenId,
+        interval: CodeInterval,
+    ) -> Result<Option<TokenId>> {
+        if self.mix.is_some() {
+            return Err(TacoError::CorruptBlock {
+                block: self.index,
+                reason: "a mixed block needs the weights of each token",
+            });
+        }
+        self.decoder.decode_interval(interval)?;
+        self.accept(token)
+    }
+
+    /// Adds the bytes of a decoded token. Returns the token if the block has more tokens.
+    fn accept(&mut self, token: TokenId) -> Result<Option<TokenId>> {
+        let corrupt = |reason| TacoError::CorruptBlock { block: self.index, reason };
         let vocab = self.model.vocabulary();
         let bytes = vocab.token(token).ok_or(corrupt("a token is not in the vocabulary"))?;
         if token == self.model.eot_token() || bytes.is_empty() {
@@ -380,8 +468,8 @@ mod tests {
             kinds.push(selected.kind());
             // The same rule for the mixed candidate of the profile logs (ADR 0010 §5.7).
             let mix = || MixState::new(MixerRule::V1);
-            let full = encode_block(&mut session, &tokens, data.len(), Some(&mut mix())).unwrap();
-            let short = encode_block(&mut session, &tokens, stop, Some(&mut mix())).unwrap();
+            let full = encode_block(&mut session, &tokens, data.len(), Some(mix())).unwrap();
+            let short = encode_block(&mut session, &tokens, stop, Some(mix())).unwrap();
             let zstd_again = compress_zstd(data).unwrap();
             let pick = |c: super::CodedBlock| {
                 Block::choose_smallest(data.len(), c.payload, Some(zstd_again.clone()))

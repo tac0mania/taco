@@ -5,6 +5,7 @@
 
 use taco_format::{Checksum, ModelHash};
 
+use crate::backend::Backend;
 use crate::tokenizer::MergeFault;
 
 /// A fault in `fold`, `unfold` or the tokenizer.
@@ -98,6 +99,16 @@ pub enum TacoError {
     InputTooLarge {
         /// What is too large.
         reason: &'static str,
+    },
+    /// A GPU backend failed: the driver refused a call, the device has not enough memory, or
+    /// the device does not give the bits of the CPU (its self-test failed). The caller can use
+    /// another backend (ADR 0016).
+    #[error("backend {backend}: {reason}")]
+    Backend {
+        /// The backend.
+        backend: Backend,
+        /// What failed, as the driver or the self-test says it.
+        reason: String,
     },
     /// A worker thread stopped without a result.
     #[error("a worker thread stopped without a result")]

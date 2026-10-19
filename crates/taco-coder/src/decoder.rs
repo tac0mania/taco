@@ -1,7 +1,7 @@
 //! The range decoder: bytes in, symbols and binary decisions out.
 
 use crate::cast::u32_from_usize_bounded;
-use crate::{FreqTable, INITIAL_RANGE, Prob12, Symbol, TOP};
+use crate::{CodeInterval, CoderError, FreqBits, FreqTable, INITIAL_RANGE, Prob12, Symbol, TOP};
 
 /// The range decoder. It reads from a byte slice, and reads zero bytes after its end.
 ///
@@ -54,6 +54,46 @@ impl<'a> Decoder<'a> {
         self.renormalise();
         // INVARIANT: index < symbol_count <= 2^32.
         Symbol::new(u32_from_usize_bounded(index))
+    }
+
+    /// The first half of a decode with a table of the total `2^bits` that the decoder does not
+    /// hold (for example on a GPU): the target value `t = min(code / r, T - 1)` with
+    /// `r = range >> bits`. The symbol is the one whose interval holds `t`. The state does not
+    /// change. Then [`Decoder::decode_interval`] with that interval finishes the decode.
+    ///
+    /// Cost: one 64-bit division.
+    #[must_use]
+    pub fn target(&self, bits: FreqBits) -> u64 {
+        // INVARIANT: range >= 2^56 and bits <= 32, so r >= 2^24 and the division is defined.
+        let r = self.range >> bits.get();
+        (self.code / r).min(bits.total() - 1)
+    }
+
+    /// The second half of a decode: takes the interval of the decoded symbol. Together with
+    /// [`Decoder::target`], this gives the same state as [`Decoder::decode`] with the table of
+    /// the interval.
+    ///
+    /// # Errors
+    ///
+    /// [`CoderError::TargetNotInInterval`] if the interval does not hold the target of
+    /// [`Decoder::target`] for its total. The state does not change in that case.
+    pub fn decode_interval(&mut self, interval: CodeInterval) -> Result<(), CoderError> {
+        let bits = interval.freq_bits();
+        let target = self.target(bits);
+        if !interval.contains(target) {
+            return Err(CoderError::TargetNotInInterval {
+                target,
+                start: interval.start(),
+                freq: interval.freq(),
+            });
+        }
+        let r = self.range >> bits.get();
+        // INVARIANT: start <= target, so r * start <= r * target <= code.
+        let offset = r * interval.start();
+        self.code -= offset;
+        self.range = if interval.is_last() { self.range - offset } else { r * interval.freq() };
+        self.renormalise();
+        Ok(())
     }
 
     /// Decodes one binary decision. `p1` is the probability of `true`.
