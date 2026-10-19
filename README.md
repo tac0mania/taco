@@ -44,53 +44,64 @@ taco unfold notes.txt.taco   # restores notes.txt, byte for byte
 
 ## Try it
 
-You need no compiler, no Python and no download other than one zip. A GPU is optional.
+There are two ways. Both give the same `.taco` bytes.
 
-**1. Get the demo zip.** Download `taco-demo-0.1.0.zip` (about 120 MB) from the
-[Releases page](https://github.com/tac0mania/taco/releases) of this repository, or from the
-link that you received. It holds the programs for macOS (Apple Silicon), Linux (x86-64) and
-Windows (x86-64), and the model file.
+### A. Download the program (nothing to build)
 
-**2. Unpack it, and open a terminal in the unpacked folder.**
+1. Open the [Releases page](https://github.com/tac0mania/taco/releases) and download
+   `taco-demo-0.1.0.zip` (about 120 MB). It has the programs for macOS (Apple Silicon), Linux
+   (x86-64) and Windows (x86-64), the model file `gpt2.hsm`, and a one-command demo. If you want
+   only the program for one system, download `taco-0.1.0-<system>.tar.gz` (or `.zip` for
+   Windows); it does not include the model file.
+2. Unpack the zip and open a terminal in the unpacked folder (`taco-demo-0.1.0`).
+3. Run `./try` (macOS, Linux) or `try.cmd` (Windows).
 
-| System | Do this |
-|---|---|
-| macOS | Double-click the zip. Open the Terminal app. Type `cd ~/Downloads/taco-demo-0.1.0` and press Return. |
-| Linux | `unzip taco-demo-0.1.0.zip && cd taco-demo-0.1.0` |
-| Windows | Right-click the zip, select **Extract All**, then open the folder. Click the address bar, type `cmd`, and press Enter. |
-
-**3. Run the demo.**
-
-| System | Type |
-|---|---|
-| macOS, Linux | `./try` |
-| Windows | `try.cmd` |
-
-The demo folds and unfolds a short English text (3,672 bytes). It takes about 15 s to 1 minute.
-The end of the output looks like this:
+The demo folds and unfolds a short English text (3,672 bytes), checks it, and prints the SHA-256
+of the `.taco` file. It takes about 10 s to 1 minute. The end of the output:
 
 ```
 PASS: the file came back byte for byte.
 Original: 3672 bytes. Folded: 648 bytes.
-Fold: 6 s. Unfold: 9 s.
-SHA-256 of the .taco file: EXPECTED_SAMPLE_HASH
+SHA-256 of the .taco file: fc42949200a1aff66afe89f5edc3306bf920891e9b4bde0b0a4aa7c20a3259fc
 ```
 
-**4. Compare the hash.** The SHA-256 must be the value above, on every machine and every backend.
-Run the demo on a second computer (another processor, another GPU) and compare. This is the
-main property of Taco.
+**This hash is the same on every machine and every backend.** Run the demo on a second
+computer and compare. To fold your own files, use `./taco fold notes.txt` and
+`./taco unfold notes.txt.taco` in the same folder (Windows: `taco.cmd`). Details and
+troubleshooting: [`demo/README.md`](demo/README.md).
 
-**5. Try your own files** in the same terminal:
+### B. Build the same program yourself
+
+**You need:** [rustup](https://rustup.rs) (it installs Rust 1.99.0 from
+`rust-toolchain.toml`), [uv](https://docs.astral.sh/uv/) for the Python tools, a C compiler (for
+zstd), about 1.5 GB of disk and 8 GB of memory. A GPU is optional.
 
 ```bash
-./taco fold notes.txt            # Windows: taco.cmd fold notes.txt
-./taco unfold notes.txt.taco     # Windows: taco.cmd unfold notes.txt.taco
+git clone https://github.com/tac0mania/taco.git && cd taco
+uv run --project tools python -m baseline.fetch     # GPT-2 weights; the tool checks each SHA-256
+uv run --project tools python -m convert.gpt2       # makes tools/data/out/gpt2.hsm (about 1 minute)
+shasum -a 256 tools/data/out/gpt2.hsm               # must be aaa03eb96e9ad795...b51001ba5c2
+cargo build --release --locked -p taco-cli
+export TACO_MODEL="$PWD/tools/data/out/gpt2.hsm"
+./target/release/taco fold demo/samples/sample.txt -o /tmp/sample.taco
+shasum -a 256 /tmp/sample.taco                      # must be the hash in section A
+./target/release/taco unfold /tmp/sample.taco -o /tmp/sample.txt
+cmp demo/samples/sample.txt /tmp/sample.txt && echo "restored byte for byte"
 ```
+
+- The converter calculates with exact fractions, so your `gpt2.hsm` is the same file, byte for
+  byte, as the one in the release. If its hash is different, do not use it.
+- Your `.taco` file must have the hash of section A. Then your build and the release program
+  are compatible: each one unfolds the files of the other.
+- `scripts/release/build.sh <target>` makes the release archive itself. It builds with fixed
+  paths and times, so two builds of one commit on one machine gave the same binary, byte for
+  byte (measured on Linux). `BUILDINFO` in each archive records the commit and the SHA-256 of
+  the program.
 
 > [!CAUTION]
 > Taco is slow. With a GPU, it folds text at about 85 to 129 KB/s and unfolds at about 26 to
 > 31 KB/s. With the CPU only, it folds at about 0.3 to 2 KB/s and unfolds at about 0.1 to
-> 0.5 KB/s (measured). Start with a file of a few KB. More details and troubleshooting: [`demo/README.md`](demo/README.md).
+> 0.5 KB/s (measured). Start with a file of a few KB.
 
 ---
 
@@ -313,46 +324,7 @@ IEEE 754 floating point, entropy, range coding, transformers and quantisation fr
 
 ## Build from source
 
-**You need:** [rustup](https://rustup.rs) (it installs Rust 1.99.0 from
-`rust-toolchain.toml`), [uv](https://docs.astral.sh/uv/) for the Python tools, a C compiler (for
-zstd), about 1.5 GB of disk and 8 GB of memory. A GPU is optional.
-
-1. Get the code.
-
-   ```bash
-   git clone https://github.com/tac0mania/taco.git && cd taco
-   ```
-
-2. Download the GPT-2 weights. The tool checks the SHA-256 of each file.
-
-   ```bash
-   uv run --project tools python -m baseline.fetch
-   ```
-
-3. Make the integer model file (about 1 minute).
-
-   ```bash
-   uv run --project tools python -m convert.gpt2
-   ```
-
-4. Check the model hash.
-
-   ```bash
-   shasum -a 256 tools/data/out/gpt2.hsm
-   ```
-
-   It must be `aaa03eb96e9ad7957432168c8ac6b4a99ed55d57e637e4786a664b51001ba5c2`. If it is
-   different, do not use the file: its `.taco` files do not decode on other machines.
-
-5. Build and try.
-
-   ```bash
-   cargo build --release -p taco-cli
-   export TACO_MODEL="$PWD/tools/data/out/gpt2.hsm"
-   ./target/release/taco fold README.md -o /tmp/readme.taco
-   ./target/release/taco unfold /tmp/readme.taco -o /tmp/readme.md
-   cmp README.md /tmp/readme.md && echo "restored byte for byte"
-   ```
+See [Try it, B](#b-build-the-same-program-yourself).
 
 ---
 

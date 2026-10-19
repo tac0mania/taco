@@ -40,7 +40,7 @@ downloaded. The folder holds:
 
 The demo prints `PASS: the file came back byte for byte`, the sizes, the times, and the
 SHA-256 of the `.taco` file. On an Apple M2 with the CPU only, the sample (3,672 bytes)
-folds to 648 bytes in 6 s and unfolds in 9 s (measured).
+folds to 648 bytes in 3 s and unfolds in 6 s (measured).
 
 ## 2. Check the hash: the main point of Taco
 
@@ -48,7 +48,7 @@ The SHA-256 of the `.taco` file of the sample is the same on every machine and e
 backend (CPU, NVIDIA, AMD, Apple, Intel GPU):
 
 ```
-EXPECTED_SAMPLE_HASH
+fc42949200a1aff66afe89f5edc3306bf920891e9b4bde0b0a4aa7c20a3259fc
 ```
 
 Run the demo on two different computers. The hash is the same. Thus a file that one machine
