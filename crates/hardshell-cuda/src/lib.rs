@@ -12,6 +12,10 @@
 //! The mixed coder op gives the coder interval of the logs profile (ADR 0010) without a read
 //! back of the weights ([`CudaBatch::run_coded_mixed`]).
 //!
+//! Model-file version 1 and version 2 (ADR 0004 addendum B) run: an `i16` activation (an `i16`
+//! GELU table, `ln_f_bits = 16`) enters the i8 products as two i8 planes (`wide_dot` in
+//! `kernels/hardshell.cu`), and `ln_beta_frac` is the one rounding of the LayerNorm.
+//!
 //! The main types:
 //! - [`CudaDevice`]: one GPU with the kernels loaded.
 //! - [`CudaModel`]: a GPT-2 model file in GPU memory.
@@ -35,5 +39,5 @@ pub use error::{Error, Result};
 pub use kernels::{PTX_SOURCE_LINE, SOURCE as KERNEL_SOURCE, ptx};
 pub use mixed::{MixInput, MixStats, mixed_intervals_of_weights};
 pub use model::CudaModel;
-pub use ops::{MatKernel, matmul_gpu_ns, matmul_i8, matmul_i8_split, read_gpu_ns};
+pub use ops::{MatKernel, matmul_gpu_ns, matmul_i8, matmul_i8_i16, matmul_i8_split, read_gpu_ns};
 pub use session::{CudaSession, RESTART_ROWS};

@@ -1,11 +1,12 @@
-//! Single ops on the GPU, for tests and measurements: the i8 matrix product with each kernel.
+//! Single ops on the GPU, for tests and measurements: the i8 matrix product with each kernel,
+//! and the i8 x i16 product of model-file version 2.
 
 use hardshell::tensor::Matrix;
 
-use crate::device::{CudaDevice, bytes_i32, u32_of};
+use crate::device::{CudaDevice, bytes_i32, bytes_u64, i32_bytes, u32_of};
 use crate::driver::{Arg, DevBuf};
 use crate::error::{Error, Result};
-use crate::kernels::{pad_rows, stride_words};
+use crate::kernels::{pad_rows, planes_of, row_sums, stride_words};
 
 /// The kernel of a matrix product.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,6 +215,70 @@ pub fn matmul_i8_split(
     }
     // INVARIANT: each total is a dot product below 2^30 in magnitude.
     Ok(sum.into_iter().map(|v| i32::try_from(v).unwrap_or(i32::MAX)).collect())
+}
+
+/// `out[i][r] = w[r] . a[i]` for `m` rows of `i16` activations (`w.cols()` values in each row):
+/// the result of `hardshell::kernels::matvec_i8_i16` for each row (ADR 0004 addendum B). The
+/// GPU path of the model: the two i8 planes of each row (`plane_store`), one i8 product of `2m`
+/// rows with `kernel` and `splits` partials, and the exact sum of `wide_dot` (the `wide_sum`
+/// kernel). Cost: one upload, one product, one read back.
+///
+/// # Errors
+/// The errors of [`matmul_i8_split`].
+pub fn matmul_i8_i16(
+    dev: &CudaDevice,
+    w: &Matrix<i8>,
+    a: &[i16],
+    m: usize,
+    kernel: MatKernel,
+    splits: u32,
+) -> Result<Vec<i64>> {
+    if splits == 0 || splits > 16 || (kernel == MatKernel::Dp4a && splits != 1) {
+        return Err(Error::Unsupported { reason: "splits must be in 1..=16, and 1 for dp4a" });
+    }
+    let (n, k) = (w.rows(), w.cols());
+    if a.len() != m * k {
+        return Err(Error::LengthMismatch { expected: m * k, found: a.len() });
+    }
+    if k > hardshell::kernels::MAX_DOT_LEN_I32 {
+        return Err(Error::Model(hardshell::Error::DotTooLong {
+            len: k,
+            max: hardshell::kernels::MAX_DOT_LEN_I32,
+        }));
+    }
+    let kw = stride_words(k);
+    let wb = dev.upload(&pad_rows(w.data(), n, k, 4 * kw))?;
+    let ab = dev.upload(&pad_rows(&planes_of(a, m, k), 2 * m, k, 4 * kw))?;
+    let sums = dev.upload(&i32_bytes(&row_sums(w.data(), n, k)))?;
+    let bias = dev.zeroed(4 * n.max(1))?;
+    let ob = dev.zeroed(4 * 2 * m * n * splits as usize)?;
+    let out = dev.zeroed(8 * m * n)?;
+    let (n32, m32) = (u32_of(n, "too many rows")?, u32_of(m, "too many rows")?);
+    let mat = Mat {
+        w: &wb,
+        a: &ab,
+        out: &ob,
+        out_stride: n32,
+        n: n32,
+        kw: u32_of(kw, "rows too long")?,
+        m: 2 * m32,
+        splits,
+    };
+    launch_matmul(dev, kernel, &mat)?;
+    let args = [
+        Arg::Ptr(ob.ptr()),
+        Arg::Ptr(bias.ptr()),
+        Arg::Ptr(sums.ptr()),
+        Arg::Ptr(out.ptr()),
+        Arg::U32(n32),
+        Arg::U32(splits),
+        Arg::U32(2 * m32 * n32),
+    ];
+    dev.launch(&dev.k.wide_sum, (n32.div_ceil(128), m32), 128, &args)?;
+    let mut bytes = vec![0u8; 8 * m * n];
+    dev.ctx.read(&out, &mut bytes)?;
+    // NOTE: the u64 words are the two's complement of the i64 sums.
+    Ok(bytes_u64(&bytes).into_iter().map(u64::cast_signed).collect())
 }
 
 /// The GPU time of `reps` products `out = a * w^T` (`w`: `n x k`, `a`: `m x k`, zero values) with

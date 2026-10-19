@@ -222,7 +222,8 @@ const MIXED_GRAPH: u32 = 64;
 impl<'m> CudaBatch<'m> {
     /// Makes a batch of `slots` sessions with empty contexts, and work buffers for passes of
     /// up to `max_rows` rows. Cost: the KV cache (`2 * n_layer * n_ctx * d_model` bytes for each
-    /// slot) and about `20 * vocab` bytes for each row.
+    /// slot) and about `20 * vocab` bytes for each row (`24 * vocab` for a model of model-file
+    /// version 2, whose `acc` holds two operand rows for each row; est. from the buffer sizes).
     ///
     /// # Errors
     /// [`Error::Unsupported`] if `slots` or `max_rows` is 0; [`Error::Cuda`] if the device has
@@ -238,6 +239,13 @@ impl<'m> CudaBatch<'m> {
         // NOTE: a restart needs two rows (<|endoftext|> and the token) in one pass.
         let max_rows = max_rows.max(2);
         let (r, rp) = (max_rows, padded_rows(max_rows));
+        // NOTE: an i16 activation (model-file version 2) is two i8 operand rows (the planes of
+        // `wide_dot` in kernels/hardshell.cu): `a` (ln_f), `g` (GELU) and `acc` hold two times
+        // the rows for such a model.
+        let gelu_wide = model.layers.iter().any(|l| l.gelu_wide);
+        let rp_a = if model.ln_f_wide { padded_rows(2 * max_rows) } else { rp };
+        let rp_g = if gelu_wide { padded_rows(2 * max_rows) } else { rp };
+        let acc_rows = if gelu_wide || model.ln_f_wide { 2 * r } else { r };
         let accn = (3 * d.d).max(d.d_ff).max(d.vocab);
         let max_splits = (accn / (3 * d.d).max(d.d_ff).max(1)).clamp(1, 16);
         let tmpn = d.d.max(d.d_ff);
@@ -246,11 +254,11 @@ impl<'m> CudaBatch<'m> {
         let sizes = [
             16 * r,
             4 * r * us(d.d),
-            4 * rp * us(d.dw),
+            4 * rp_a * us(d.dw),
             r * 3 * us(d.d),
             4 * rp * us(d.dw),
-            4 * rp * us(d.fw),
-            4 * r * us(accn),
+            4 * rp_g * us(d.fw),
+            4 * acc_rows * us(accn),
             4 * r * us(tmpn),
             if ctx4 > ATTEND_SMEM_CTX { 12 * r * us(d.n_head) * us(ctx4) } else { 0 },
             8 * r * us(d.vocab),

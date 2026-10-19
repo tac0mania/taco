@@ -281,3 +281,7 @@ mean of that error only in part (measured, research note section 6).
 - The `i16` matrix products have no SIMD kernel yet (`PERF` note in `kernels/fast.rs`).
 - The GPU backends (`hardshell-cuda`, `hardshell-gpu`) do not run version 2 yet. They must
   refuse a model with `Model::is_wide()` until they implement it.
+  Update (2026-10-19): `hardshell-cuda` runs version 2. Its kernels give the CPU bits for
+  each rule alone and in combination, and for the real models `gpt2_wide.hsm` and
+  `distil_logs_wide.hsm` (measured; `crates/hardshell-cuda/tests/wide.rs`). `hardshell-gpu`
+  (wgpu) still refuses version 2.

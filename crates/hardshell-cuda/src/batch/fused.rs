@@ -16,9 +16,24 @@
 //!
 //! ADR 0013 permits a fused kernel only with a test that proves it equal to the op-level path:
 //! `tests/fused.rs` runs both paths on the same inputs and compares every weight and interval.
+//!
+//! The ops with `i16` activations (model-file version 2: an `i16` GELU table, `ln_f_bits = 16`)
+//! have no fused kernel: the fused path runs their op kernels (`gelu_table`, `mlp_out`, `add`,
+//! `norm_to`, the logits product with i64 logits). Only `ln_beta_frac` enters a fused kernel
+//! (`residual_norm`), with the expression of `layer_norm`.
+//!
+//! PERF: GPT-2 small with the recipe `wide` (`gpt2_wide.hsm`) against `gpt2.hsm` on the RTX
+//! 3060 at 45 W (measured 2026-10-19, `examples/gpt2.rs bench`): prefill 8 x 1,024 tokens
+//! 494 ms against 321 ms of GPU time. The extra time: the logits product of `2n` plane rows
+//! (+29 ms), the i64 logits instead of the compact logits (+36 ms `logits_scale_wide`, +13 ms
+//! coder op), the `mlp.c_proj` product of `2n` rows (+25 ms), and the op kernels instead of
+//! `linear_gelu` (+28 ms) and `residual_norm` (+15 ms). A fused kernel for each of the last two,
+//! and a compact epilogue that reads both planes of a row in one tile, would remove most of the
+//! time that is not the second plane (est.); each needs a test against the op-level path.
 
 use super::mixed::MixSrc;
-use super::{CODER_TILES, CudaBatch, LOGIT_TILE, NORM_THREADS, Out, Stamps, mark};
+use super::record::operand_rows;
+use super::{CODER_TILES, CudaBatch, LOGIT_TILE, LinOut, NORM_THREADS, Out, Stamps, mark};
 use crate::driver::{Arg, DevBuf};
 use crate::error::Result;
 use crate::model::{LayerW, LinearW, NormW};
@@ -59,12 +74,25 @@ impl CudaBatch<'_> {
             op("residual norm")?;
             let z = self.matmul(kernel, &l.c_fc, &b.a, n, true)?;
             op("matmul fc")?;
-            self.linear_gelu(l, n, z)?;
+            if l.gelu_wide {
+                let range = (-l.gelu_offset, l.gelu_offset - 1);
+                self.linear_out(&l.c_fc, LinOut::I32(&b.tmp, self.tmpn), range, n, z)?;
+                self.gelu_table(l, n)?;
+            } else {
+                self.linear_gelu(l, n, z)?;
+            }
             op("linear gelu")?;
-            let z = self.matmul(kernel, &l.mlp_proj, &b.g, n, true)?;
+            let z = self.matmul(kernel, &l.mlp_proj, &b.g, operand_rows(l.gelu_wide, n), true)?;
             op("matmul mlp")?;
             let next = model.layers.get(i + 1).map_or(&model.ln_f, |x| &x.ln_1);
-            self.residual_norm(&l.mlp_proj, next, n, z)?;
+            let next_wide = i + 1 == model.layers.len() && model.ln_f_wide;
+            if l.gelu_wide || next_wide {
+                self.mlp_out(l, n, z)?;
+                self.add(n)?;
+                self.norm_to(next, n, next_wide)?;
+            } else {
+                self.residual_norm(&l.mlp_proj, next, n, z)?;
+            }
             op("residual norm")?;
         }
         if let Out::Intervals(_) | Out::Mixed(_) = out
@@ -80,7 +108,7 @@ impl CudaBatch<'_> {
             }
             return Ok(());
         }
-        self.matmul(kernel, &model.wte, &b.a, n, false)?;
+        self.logits_product(kernel, n)?;
         op("matmul logits")?;
         self.logits_scale(n)?;
         op("logits")?;
@@ -133,9 +161,13 @@ impl CudaBatch<'_> {
     }
 
     /// The logits kernel with the compact epilogue for `kernel` products, if the pass can use
-    /// it (the conditions of [`CudaBatch::compact_logits`]).
+    /// it (the conditions of [`CudaBatch::compact_logits`]). A model with `ln_f_bits = 16` has
+    /// no compact epilogue (its logits come from an i8 x i16 product, `logits_scale_wide`).
     pub(super) fn compact_kernel(&self, kernel: MatKernel) -> Option<&crate::driver::Kernel> {
         let m = self.model;
+        if m.ln_f_wide {
+            return None;
+        }
         let k = &m.dev.k;
         let f = match kernel {
             MatKernel::TensorCore64 => &k.gemm_tc64_logits,
@@ -227,6 +259,7 @@ impl CudaBatch<'_> {
                 Arg::U64(eps),
                 Arg::I32(nw.m),
                 Arg::U32(nw.s),
+                Arg::U32(m.beta_frac),
             ],
         )
     }

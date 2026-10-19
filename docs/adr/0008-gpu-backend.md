@@ -138,5 +138,10 @@ interval.
   same AMD iGPU passes the GPU tests on Vulkan (AMD driver 21.30.40, 4 of 4) and on DX12 with
   DXC (6 of 6). DX12 with FXC fails. The crash above is specific to Mesa OpenGL on D3D12 in
   WSL2.
+- Model-file version 2 (the `wide` rules, ADR 0004 addendum B): `hardshell-cuda` runs it
+  since 2026-10-19. It splits each `i16` activation into two `i8` parts and reuses the `i8`
+  products, then joins the parts exactly in `i64`. Speed on the RTX 3060 (measured, 45 W):
+  prefill is 40 to 48 % slower than version 1 and full-window decode 19 to 24 % slower.
+  `hardshell-gpu` refuses version 2.
 - `taco-coder` needs an encode and a decode with an interval, not a table, to use the coder
   op. That is a change to `taco-coder` and `taco` (not part of this ADR).

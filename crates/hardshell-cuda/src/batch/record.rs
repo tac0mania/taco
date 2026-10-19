@@ -6,7 +6,7 @@ use super::{
     ATTEND_GROUP_ROWS, ATTEND_THREADS, CudaBatch, LinOut, NORM_THREADS, Out, Row, Stamps, mark,
 };
 use crate::driver::{Arg, DevBuf};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::model::{LayerW, LinearW, NormW};
 use crate::ops::{Mat, MatKernel, launch_matmul, plan_product};
 
@@ -92,32 +92,18 @@ impl CudaBatch<'_> {
                 z,
             )?;
             op("linear out")?;
-            dev.launch(
-                &k.table_lookup,
-                (d.d_ff.div_ceil(128), n),
-                128,
-                &[
-                    ptr(&b.tmp),
-                    ptr(&l.gelu),
-                    ptr(&b.g),
-                    Arg::U32(d.d_ff),
-                    Arg::U32(tmpn),
-                    Arg::U32(4 * d.fw),
-                    Arg::I32(l.gelu_offset),
-                    Arg::I32(l.gelu_len),
-                ],
-            )?;
+            self.gelu_table(l, n)?;
             op("table")?;
-            let z = self.matmul(kernel, &l.mlp_proj, &b.g, n, true)?;
+            let z = self.matmul(kernel, &l.mlp_proj, &b.g, operand_rows(l.gelu_wide, n), true)?;
             op("matmul mlp")?;
-            self.linear_out(&l.mlp_proj, LinOut::I32(&b.tmp, tmpn), (i32::MIN, i32::MAX), n, z)?;
+            self.mlp_out(l, n, z)?;
             op("linear out")?;
             self.add(n)?;
             op("add")?;
         }
-        self.norm(&model.ln_f, n)?;
+        self.norm_to(&model.ln_f, n, model.ln_f_wide)?;
         op("norm")?;
-        self.matmul(kernel, &model.wte, &b.a, n, false)?;
+        self.logits_product(kernel, n)?;
         op("matmul logits")?;
         self.logits_scale(n)?;
         op("logits")?;
@@ -251,9 +237,102 @@ impl CudaBatch<'_> {
         )
     }
 
+    /// The table op (GELU) of layer `l` on the `c_fc` output in `tmp`, into `g`: `i8` outputs, or
+    /// for an `i16` table the two planes of each row (rows `0..n` and `n..2n` of `g`).
+    pub(super) fn gelu_table(&self, l: &LayerW, n: u32) -> Result<()> {
+        let model = self.model;
+        let (dev, d, b) = (model.dev, model.dims, &self.b);
+        let f = if l.gelu_wide { &dev.k.table_wide } else { &dev.k.table_lookup };
+        dev.launch(
+            f,
+            (d.d_ff.div_ceil(128), n),
+            128,
+            &[
+                Arg::Ptr(b.tmp.ptr()),
+                Arg::Ptr(l.gelu.ptr()),
+                Arg::Ptr(b.g.ptr()),
+                Arg::U32(d.d_ff),
+                Arg::U32(self.tmpn),
+                Arg::U32(4 * d.fw),
+                Arg::I32(l.gelu_offset),
+                Arg::I32(l.gelu_len),
+            ],
+        )
+    }
+
+    /// The output op of `mlp.c_proj` of layer `l` into `tmp` (i32, the range of the residual
+    /// add): `linear_out`, or `linear_out_wide` after an i8 x i16 product.
+    pub(super) fn mlp_out(&self, l: &LayerW, n: u32, splits: u32) -> Result<()> {
+        let lin = &l.mlp_proj;
+        let range = (i32::MIN, i32::MAX);
+        match (&lin.wsum, l.gelu_wide) {
+            (_, false) => {
+                self.linear_out(lin, LinOut::I32(&self.b.tmp, self.tmpn), range, n, splits)
+            }
+            (Some(wsum), true) => {
+                let m = self.model;
+                m.dev.launch(
+                    &m.dev.k.linear_out_wide,
+                    (lin.rows.div_ceil(128), n),
+                    128,
+                    &[
+                        Arg::Ptr(self.b.acc.ptr()),
+                        Arg::Ptr(lin.b.ptr()),
+                        Arg::Ptr(lin.m.ptr()),
+                        Arg::Ptr(wsum.ptr()),
+                        Arg::Ptr(self.b.tmp.ptr()),
+                        Arg::U32(lin.rows),
+                        Arg::U32(self.tmpn),
+                        Arg::U32(lin.shift),
+                        Arg::I32(range.0),
+                        Arg::I32(range.1),
+                        Arg::U32(splits),
+                        Arg::U32(2 * n * lin.rows),
+                    ],
+                )
+            }
+            (None, true) => {
+                Err(Error::Unsupported { reason: "an i16 GELU layer needs its row sums" })
+            }
+        }
+    }
+
+    /// The logits product of a pass of `n` rows into `acc`, on the kernel of the pass (one
+    /// split; the compact logits need the kernel of the pass). With `ln_f_bits = 16` the
+    /// product has the `2n` plane rows of `ln_f`, on the kernel for `2n` rows.
+    pub(super) fn logits_product(&self, kernel: MatKernel, n: u32) -> Result<u32> {
+        let model = self.model;
+        if model.ln_f_wide {
+            let rows = operand_rows(true, n);
+            return self.matmul(
+                MatKernel::for_rows(rows as usize),
+                &model.wte,
+                &self.b.a,
+                rows,
+                false,
+            );
+        }
+        self.matmul(kernel, &model.wte, &self.b.a, n, false)
+    }
+
     pub(super) fn logits_scale(&self, n: u32) -> Result<()> {
         let model = self.model;
         let (dev, d, b) = (model.dev, model.dims, &self.b);
+        if let Some(wsum) = model.wte.wsum.as_ref().filter(|_| model.ln_f_wide) {
+            return dev.launch(
+                &dev.k.logits_scale_wide,
+                (d.vocab.div_ceil(128), n),
+                128,
+                &[
+                    Arg::Ptr(b.acc.ptr()),
+                    Arg::Ptr(model.wte.m.ptr()),
+                    Arg::Ptr(wsum.ptr()),
+                    Arg::Ptr(b.logit.ptr()),
+                    Arg::U32(d.vocab),
+                    Arg::U32(model.wte.shift),
+                ],
+            );
+        }
         dev.launch(
             &dev.k.logits_scale,
             (d.vocab.div_ceil(128), n),
@@ -304,7 +383,14 @@ impl CudaBatch<'_> {
         )
     }
 
+    /// The norm op of `n` rows of `x` into `a`, with `i8` outputs.
     pub(super) fn norm(&self, nw: &NormW, n: u32) -> Result<()> {
+        self.norm_to(nw, n, false)
+    }
+
+    /// The norm op of `n` rows of `x` into `a`: `i8` outputs, or with `wide` (`ln_f_bits = 16`)
+    /// `i16` outputs as the two planes of each row (rows `0..n` and `n..2n` of `a`).
+    pub(super) fn norm_to(&self, nw: &NormW, n: u32, wide: bool) -> Result<()> {
         let m = self.model;
         let (k, j, eps) = m.ln;
         m.dev.launch(
@@ -323,6 +409,8 @@ impl CudaBatch<'_> {
                 Arg::U64(eps),
                 Arg::I32(nw.m),
                 Arg::U32(nw.s),
+                Arg::U32(m.beta_frac),
+                Arg::U32(u32::from(wide)),
             ],
         )
     }
@@ -331,7 +419,9 @@ impl CudaBatch<'_> {
     /// split-K partials `n * lin.rows` values apart. Gives the number of partials.
     ///
     /// INVARIANT: at most 16 partials of `n * lin.rows <= max_rows * max(3d, d_ff)` values fit
-    /// in `acc` (`max_rows * max(3d, d_ff, vocab)` values); `new` checks it.
+    /// in `acc` (`max_rows * max(3d, d_ff, vocab)` values); `new` checks it. An i8 x i16
+    /// product has `n = 2 * rows` (the planes) and `lin.rows = d`; `acc` then has two times the
+    /// rows, and `max_splits <= max(3d, d_ff, vocab) / d` keeps the partials in it.
     pub(super) fn matmul(
         &self,
         kernel: MatKernel,
@@ -411,4 +501,10 @@ impl CudaBatch<'_> {
             ],
         )
     }
+}
+
+/// The operand rows of a product whose input has `n` rows: `2n` for an `i16` input (the two
+/// planes of each row, `wide_dot` in kernels/hardshell.cu), else `n`.
+pub(super) fn operand_rows(wide: bool, n: u32) -> u32 {
+    if wide { 2 * n } else { n }
 }

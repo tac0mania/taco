@@ -9,7 +9,6 @@ publish.workspace = true
 [dependencies]
 hardshell = { path = "../hardshell" }
 thiserror.workspace = true
-# NOTE: crate-local version spec. The lead moves it to [workspace.dependencies] at commit time.
 libloading.workspace = true
 
 [dev-dependencies]

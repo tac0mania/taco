@@ -12,6 +12,7 @@
 
 typedef signed char i8;
 typedef unsigned char u8;
+typedef short i16;
 typedef unsigned short u16;
 typedef int i32;
 typedef unsigned int u32;
@@ -532,11 +533,44 @@ __device__ __forceinline__ u128 warp_sum_u128(u128 v) {
     return ((u128)hi << 64) | (u128)lo;
 }
 
+// The value of step 4 of the norm before the output clamp, for the product
+// pr = centred * inv * gamma * m. frac 0 (model-file version 1): shift_round(pr, s, 126) + beta, two
+// roundings. frac F > 0 (version 2, ln_beta_frac, ADR 0004 addendum B): beta is in units of 2^-F
+// output units and enters before the one rounding, shift_round(pr + beta * 2^(s - F), s, 126):
+// hardshell::int::rescale_wide_offset.
+// INVARIANT: |pr| < 2^126 (see norm_row). For F > 0 the loader checked 1 <= F <= s <= 120 and
+// s - F <= 92, so |beta * 2^(s - F)| < 2^123, and |pr + c| + 2^(s - 1) < 2^127: no step overflows.
+__device__ __forceinline__ i128 norm_value(i128 pr, i32 beta, u32 s, u32 frac) {
+    if (frac == 0) return shift_round(pr, s, 126) + (i128)beta;
+    return shift_round(pr + (i128)beta * ((i128)1 << (s - frac)), s, 126);
+}
+
+// Stores the i16 activation v (-32768..32767) of column c as two i8 planes (the operand form of the
+// i8 x i16 product, wide_dot): hi = floor(v / 256) and lo = (v mod 256) - 128, so that
+// v = 256 * hi + lo + 128. Both are in -128..127.
+__device__ __forceinline__ void plane_store(i8* __restrict__ hi, i8* __restrict__ lo, u64 c, i32 v) {
+    // INVARIANT: -32768 <= v <= 32767, so 0 <= u < 2^16 and both bytes are in 0..255.
+    const u32 u = (u32)(v + 32768);
+    hi[c] = (i8)((i32)(u >> 8) - 128);
+    lo[c] = (i8)((i32)(u & 255u) - 128);
+}
+
+// The output of the norm for column c: an i8 activation (clamp to -127..127) into orow, or, with
+// lorow set (ln_f_bits = 16), an i16 activation (clamp to -32767..32767, LayerNorm::apply_i16) as two
+// planes: hi into orow, lo into lorow (plane_store).
+__device__ __forceinline__ void norm_store(i8* __restrict__ orow, i8* __restrict__ lorow, u32 c, i128 y) {
+    if (lorow == nullptr) {
+        orow[c] = (i8)clamp_act_i8(y);
+        return;
+    }
+    plane_store(orow, lorow, c, (i32)clamp_wide(y, -32767, 32767));
+}
+
 // The `norm` op in mode `layer` (hardshell::layernorm) for one row `xr` of n values, by a block of
 // NORM_T threads. Thread t reads only the columns t, t + NORM_T, ..., so a caller that wrote these
 // columns of xr in the same thread needs no barrier before the call.
 __device__ void norm_row(const i32* __restrict__ xr, const i32* __restrict__ gamma, const i32* __restrict__ beta, i8* __restrict__ orow,
-                         u32 n, u32 k, u32 j, u64 eps, i32 m, u32 s) {
+                         i8* __restrict__ lorow, u32 n, u32 k, u32 j, u64 eps, i32 m, u32 s, u32 frac) {
     __shared__ i64 red64[NORM_W];
     __shared__ u128 red128[NORM_W];
     __shared__ i128 inv_s;
@@ -578,7 +612,7 @@ __device__ void norm_row(const i32* __restrict__ xr, const i32* __restrict__ gam
         const i128 centred = (i128)((i64)xr[c] - mean);
         // INVARIANT: |centred * inv * gamma| < 2^95 and |m| <= 2^31: the product is below 2^126.
         const i128 pr = centred * inv * (i128)gamma[c] * (i128)m;
-        orow[c] = (i8)clamp_act_i8(shift_round(pr, s, 126) + (i128)beta[c]);
+        norm_store(orow, lorow, c, norm_value(pr, beta[c], s, frac));
     }
 }
 
@@ -591,7 +625,7 @@ __device__ void norm_row(const i32* __restrict__ xr, const i32* __restrict__ gam
 // is centred * inv * (gamma * m): the same integer (integer products are associative), with
 // |gamma * m| < 2^62 in i64 and |centred * inv| < 2^79 (|centred| < 2^31, inv < 2^48).
 __device__ void norm_regs(const i32 (&v)[NORM_V], const i32* __restrict__ gamma, const i32* __restrict__ beta, i8* __restrict__ orow,
-                          u32 n, u32 k, u32 j, u64 eps, i32 m, u32 s) {
+                          i8* __restrict__ lorow, u32 n, u32 k, u32 j, u64 eps, i32 m, u32 s, u32 frac) {
     __shared__ i64 red64[NORM_W];
     __shared__ u128 red128[NORM_W];
     __shared__ i128 inv_s;
@@ -639,24 +673,30 @@ __device__ void norm_regs(const i32 (&v)[NORM_V], const i32* __restrict__ gamma,
             const i128 ci = (i128)((i64)v[i] - mean) * (i128)inv;
             // INVARIANT: |gamma * m| < 2^62, and the product is below 2^126 (see norm_row).
             const i128 pr = ci * (i128)((i64)gamma[c] * (i64)m);
-            orow[c] = (i8)clamp_act_i8(shift_round(pr, s, 126) + (i128)beta[c]);
+            norm_store(orow, lorow, c, norm_value(pr, beta[c], s, frac));
         }
     }
 }
 
-// The `norm` op in mode `layer`. One block of NORM_T for each row.
+// The `norm` op in mode `layer`. One block of NORM_T for each row. `frac` is ln_beta_frac (norm_value).
+// With wide = 0 the output is i8 (row r at out + r * out_stride). With wide = 1 (ln_f_bits = 16) it
+// is i16 in two planes (plane_store): the hi plane of row r at row r of `out`, the lo plane at row
+// gridDim.x + r, so the planes of a pass of n rows are the 2n operand rows of one i8 product.
 extern "C" __global__ void __launch_bounds__(NORM_T) layer_norm(const i32* __restrict__ x, const i32* __restrict__ gamma, const i32* __restrict__ beta,
-                                                                i8* __restrict__ out, u32 n, u32 out_stride, u32 k, u32 j, u64 eps, i32 m, u32 s) {
+                                                                i8* __restrict__ out, u32 n, u32 out_stride, u32 k, u32 j, u64 eps, i32 m, u32 s,
+                                                                u32 frac, u32 wide) {
     const u32 row = blockIdx.x, t = threadIdx.x;
     const i32* xr = x + (u64)row * n;
+    i8* orow = out + (u64)row * out_stride;
+    i8* lorow = wide ? out + ((u64)gridDim.x + row) * out_stride : nullptr;
     if (n <= NORM_T * NORM_V) {
         i32 v[NORM_V];
 #pragma unroll
         for (u32 i = 0; i < NORM_V; i++) v[i] = t + i * NORM_T < n ? xr[t + i * NORM_T] : 0;
-        norm_regs(v, gamma, beta, out + (u64)row * out_stride, n, k, j, eps, m, s);
+        norm_regs(v, gamma, beta, orow, lorow, n, k, j, eps, m, s, frac);
         return;
     }
-    norm_row(xr, gamma, beta, out + (u64)row * out_stride, n, k, j, eps, m, s);
+    norm_row(xr, gamma, beta, orow, lorow, n, k, j, eps, m, s, frac);
 }
 
 // The sum of the split-K partials and the bias: the exact value of linear_out before the rescale.
@@ -676,7 +716,7 @@ extern "C" __global__ void __launch_bounds__(NORM_T) residual_norm(const i32* __
                                                                    const i32* __restrict__ mult, u32 shift, u32 splits, u32 split_stride,
                                                                    i32* __restrict__ x, const i32* __restrict__ gamma, const i32* __restrict__ beta,
                                                                    i8* __restrict__ out, u32 n, u32 out_stride, u32 k, u32 j, u64 eps, i32 nm,
-                                                                   u32 ns) {
+                                                                   u32 ns, u32 frac) {
     const u32 t = threadIdx.x, row = blockIdx.x;
     i32* xr = x + (u64)row * n;
     if (n <= NORM_T * NORM_V) {
@@ -692,7 +732,7 @@ extern "C" __global__ void __launch_bounds__(NORM_T) residual_norm(const i32* __
                 xr[c] = v[i];
             }
         }
-        norm_regs(v, gamma, beta, out + (u64)row * out_stride, n, k, j, eps, nm, ns);
+        norm_regs(v, gamma, beta, out + (u64)row * out_stride, nullptr, n, k, j, eps, nm, ns, frac);
         return;
     }
     for (u32 c = t; c < n; c += NORM_T) {
@@ -700,7 +740,7 @@ extern "C" __global__ void __launch_bounds__(NORM_T) residual_norm(const i32* __
         const i64 y = rescale_clamp(v, mult[c], shift, -2147483648LL, 2147483647LL);
         xr[c] = (i32)clamp_wide((i128)((i64)xr[c] + y), -RES, RES);
     }
-    norm_row(xr, gamma, beta, out + (u64)row * out_stride, n, k, j, eps, nm, ns);
+    norm_row(xr, gamma, beta, out + (u64)row * out_stride, nullptr, n, k, j, eps, nm, ns, frac);
 }
 
 // The output part of the `linear` op: y = clamp(rescale(acc + b, m[r], s), lo, hi), as i8
@@ -750,6 +790,67 @@ extern "C" __global__ void linear_gelu(const i32* __restrict__ acc, const i32* _
     const i32 tlo = -offset, thi = len - 1 - offset;
     y = y < tlo ? tlo : (y > thi ? thi : y);
     out[(u64)row * out_stride + r] = tab[y + offset];
+}
+
+// ---------------------------------------------------------------- i16 activations (model-file version 2)
+
+// The i8 x i16 product of ADR 0004 addendum B (hardshell::kernels::matvec_i8_i16) with the i8
+// products above. The producer of an i16 activation row writes it as two i8 planes (plane_store):
+// v = 256 * hi + lo + 128. For a pass of n rows, the hi planes are the operand rows 0..n and the
+// lo planes the rows n..2n of one i8 product with 2n rows. Then for weight row r
+//   dot(w_r, v) = 256 * dot(w_r, hi) + dot(w_r, lo) + 128 * wsum[r],   wsum[r] = sum_k w_r[k],
+// an identity of integers. The model loader calculates wsum exactly (the padding of w is 0).
+//
+// INVARIANT: the planes are in -128..127 and |w| <= 128, so the i8 product keeps its bound (each
+// partial sum at most 2^30, see gemm_tiled). |wsum| <= K * 2^7 <= 2^23 and |dot(w, v)| <= K * 2^22
+// <= 2^38 (K <= 2^16), so every step below is exact in i64.
+__device__ __forceinline__ i64 wide_dot(const i32* __restrict__ acc, const i32* __restrict__ wsum, u32 r, u32 row, u32 rows,
+                                        u32 acc_stride, u32 splits, u32 split_stride) {
+    i64 hi = 0, lo = 0;
+    for (u32 z = 0; z < splits; z++) {
+        const i32* p = acc + (u64)z * split_stride;
+        hi += (i64)p[(u64)row * acc_stride + r];
+        lo += (i64)p[((u64)rows + row) * acc_stride + r];
+    }
+    return 256 * hi + lo + 128 * (i64)wsum[r];
+}
+
+// The `linear` op with an i16 input (mlp.c_proj of a model with an i16 GELU table): the output
+// part y = clamp(rescale(dot + b, m[r], s), lo, hi), i32 output, as linear_out. Before the residual
+// add the range is the i32 range (see the batch module). Grid: (ceil(n / 128), rows); the product
+// has 2 * rows rows (wide_dot).
+// INVARIANT: |dot + b| < 2^39 and |m| <= 2^31, so |(dot + b) * m| < 2^70 (the bound of rescale).
+extern "C" __global__ void linear_out_wide(const i32* __restrict__ acc, const i32* __restrict__ bias, const i32* __restrict__ mult,
+                                           const i32* __restrict__ wsum, i32* __restrict__ out, u32 n, u32 out_stride, u32 shift, i32 lo,
+                                           i32 hi, u32 splits, u32 split_stride) {
+    const u32 r = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
+    if (r >= n) return;
+    const i64 v = (i64)bias[r] + wide_dot(acc, wsum, r, row, gridDim.y, n, splits, split_stride);
+    out[(u64)row * out_stride + r] = (i32)clamp_wide(rescale(v, mult[r], shift), lo, hi);
+}
+
+// The `table` op with i16 outputs (an i16 GELU table): y = t[clamp(x, -offset, len - 1 - offset) +
+// offset], stored as two planes (plane_store): the hi plane of row r at row r of `out`, the lo
+// plane at row gridDim.y + r. Grid: (ceil(n / 128), rows).
+extern "C" __global__ void table_wide(const i32* __restrict__ in, const i16* __restrict__ tab, i8* __restrict__ out, u32 n,
+                                      u32 in_stride, u32 out_stride, i32 offset, i32 len) {
+    const u32 c = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
+    if (c >= n) return;
+    i32 v = in[(u64)row * in_stride + c];
+    // INVARIANT: offset <= 2^15 and len <= 2^16.
+    const i32 lo = -offset, hi = len - 1 - offset;
+    v = v < lo ? lo : (v > hi ? hi : v);
+    plane_store(out + (u64)row * out_stride, out + ((u64)gridDim.y + row) * out_stride, c, (i32)tab[v + offset]);
+}
+
+// The exact i8 x i16 product with the bias, dot + b as i64 (no rescale): the value that
+// linear_out_wide and logits_scale_wide rescale. For the tests of the product (ops.rs).
+// Grid: (ceil(n / 128), rows).
+extern "C" __global__ void wide_sum(const i32* __restrict__ acc, const i32* __restrict__ bias, const i32* __restrict__ wsum,
+                                    i64* __restrict__ out, u32 n, u32 splits, u32 split_stride) {
+    const u32 r = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
+    if (r >= n) return;
+    out[(u64)row * n + r] = (i64)bias[r] + wide_dot(acc, wsum, r, row, gridDim.y, n, splits, split_stride);
 }
 
 // ---------------------------------------------------------------- attention
@@ -1275,6 +1376,17 @@ extern "C" __global__ void logits_scale(const i32* __restrict__ acc, const i32* 
     if (v >= vocab) return;
     logit[(u64)row * vocab + v] =
         clamp_wide(rescale(acc[(u64)row * acc_stride + v], mult[v], shift), -LIMIT40, LIMIT40);
+}
+
+// The logits with an i16 final LayerNorm (ln_f_bits = 16): logit = clamp(rescale(dot, m[v], s),
+// -2^40, 2^40) with dot the i8 x i16 product of wte and the planes of ln_f (wide_dot, one split).
+// Grid: (ceil(vocab / 128), rows). INVARIANT: |dot| < 2^39, so |dot * m| < 2^70.
+extern "C" __global__ void logits_scale_wide(const i32* __restrict__ acc, const i32* __restrict__ mult, const i32* __restrict__ wsum,
+                                             i64* __restrict__ logit, u32 vocab, u32 shift) {
+    const u32 v = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
+    if (v >= vocab) return;
+    const i64 dot = wide_dot(acc, wsum, v, row, gridDim.y, vocab, 1, 0);
+    logit[(u64)row * vocab + v] = clamp_wide(rescale(dot, mult[v], shift), -LIMIT40, LIMIT40);
 }
 
 // weight = logits_exp[min(max - logit, len - 1)]. One block of 256 for each row.

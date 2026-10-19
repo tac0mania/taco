@@ -14,7 +14,7 @@
 mod common;
 mod support;
 
-use common::builder::{build, tiny_dims};
+use common::builder::{build, build_wide, tiny_dims};
 use hardshell::TokenId;
 use hardshell::gpt2::{Model, Overlap, Session, SessionConfig};
 use hardshell_cuda::{
@@ -109,8 +109,21 @@ struct Want {
 /// the actual token updates the mixer. With `dual`, every query encodes a token and the batch
 /// gives both intervals (`run_coded_dual`).
 fn batch_against_cpu(slots: usize, calls: usize, op_level: bool, overlap: u16, dual: bool) {
+    batch_against_cpu_of(false, slots, calls, op_level, overlap, dual);
+}
+
+/// [`batch_against_cpu`] on the tiny model of model-file version 1, or with `wide` of version 2
+/// (ADR 0004 addendum B: i16 GELU and ln_f outputs, ln_beta_frac).
+fn batch_against_cpu_of(
+    wide: bool,
+    slots: usize,
+    calls: usize,
+    op_level: bool,
+    overlap: u16,
+    dual: bool,
+) {
     let Some(dev) = device("batch_against_cpu") else { return };
-    let b = build(tiny_dims(), 51, 64);
+    let b = if wide { build_wide(tiny_dims(), 51, 64) } else { build(tiny_dims(), 51, 64) };
     let cpu = Model::load(&b.bytes).unwrap();
     let gpu = CudaModel::load(&dev, &b.bytes).unwrap();
     let cfg = SessionConfig::new().with_overlap(Overlap::new(overlap));
@@ -206,7 +219,7 @@ fn batch_against_cpu(slots: usize, calls: usize, op_level: bool, overlap: u16, d
             calls_seen.push(i);
             want.q
         };
-        let what = format!("call {call} bits {bits} op_level {op_level} dual {dual}");
+        let what = format!("call {call} bits {bits} op_level {op_level} dual {dual} wide {wide}");
         if dual {
             let tokens: Vec<TokenId> = queries
                 .iter()
@@ -267,6 +280,18 @@ fn dual_intervals_equal_the_cpu_tables_on_the_fused_paths() {
 fn mixed_intervals_equal_the_cpu_mixer_with_a_context_overlap() {
     batch_against_cpu(3, 70, false, 9, false);
     batch_against_cpu(3, 40, false, 9, true);
+}
+
+#[test]
+fn mixed_and_dual_intervals_on_a_wide_model_equal_the_cpu() {
+    // Model-file version 2: the op-level path, the fused path with dp4a products (4 slots) and
+    // with tensor-core products (40 slots; i64 logits, no compact logits), and an overlap.
+    batch_against_cpu_of(true, 4, 30, true, 0, false);
+    batch_against_cpu_of(true, 4, 45, false, 0, false);
+    batch_against_cpu_of(true, 40, 15, false, 0, false);
+    batch_against_cpu_of(true, 4, 30, false, 0, true);
+    batch_against_cpu_of(true, 40, 10, false, 0, true);
+    batch_against_cpu_of(true, 3, 50, false, 9, false);
 }
 
 #[test]

@@ -57,6 +57,10 @@ pub(crate) struct Kernels {
     pub(crate) residual_norm: Kernel,
     pub(crate) linear_gelu: Kernel,
     pub(crate) linear_qkv: Kernel,
+    pub(crate) linear_out_wide: Kernel,
+    pub(crate) table_wide: Kernel,
+    pub(crate) wide_sum: Kernel,
+    pub(crate) logits_scale_wide: Kernel,
     pub(crate) stamp: Kernel,
     pub(crate) read_bandwidth: Kernel,
 }
@@ -92,6 +96,10 @@ impl Kernels {
             residual_norm: ctx.function("residual_norm")?,
             linear_gelu: ctx.function("linear_gelu")?,
             linear_qkv: ctx.function("linear_qkv")?,
+            linear_out_wide: ctx.function("linear_out_wide")?,
+            table_wide: ctx.function("table_wide")?,
+            wide_sum: ctx.function("wide_sum")?,
+            logits_scale_wide: ctx.function("logits_scale_wide")?,
             stamp: ctx.function("stamp")?,
             read_bandwidth: ctx.function("read_bandwidth")?,
         })
@@ -130,6 +138,10 @@ impl Kernels {
             &self.residual_norm,
             &self.linear_gelu,
             &self.linear_qkv,
+            &self.linear_out_wide,
+            &self.table_wide,
+            &self.wide_sum,
+            &self.logits_scale_wide,
             &self.stamp,
             &self.read_bandwidth,
         ]
@@ -153,6 +165,30 @@ pub(crate) fn pad_rows(data: &[i8], rows: usize, cols: usize, stride: usize) -> 
         for (d, s) in dst.iter_mut().zip(src) {
             *d = s.to_le_bytes()[0];
         }
+    }
+    out
+}
+
+/// The sum of each row of an `i8 [rows, cols]` matrix: the `wsum` of the i8 x i16 product
+/// (`wide_dot` in `kernels/hardshell.cu`). Cost: one pass over the matrix.
+///
+/// INVARIANT: `cols <= 2^16` (`MAX_DOT_LEN_I32`, checked by the CPU loader), so each sum is at
+/// most `2^23` in magnitude and fits in `i32`.
+pub(crate) fn row_sums(data: &[i8], rows: usize, cols: usize) -> Vec<i32> {
+    data.chunks(cols.max(1)).take(rows).map(|r| r.iter().map(|&x| i32::from(x)).sum()).collect()
+}
+
+/// The i8 operand rows of `m` rows of `i16` activations (`k` values in each row): the hi planes
+/// (rows `0..m`), then the lo planes (rows `m..2m`), with `v = 256 * hi + lo + 128`. This is the
+/// rule of `plane_store` in `kernels/hardshell.cu`, for the tests of the product.
+pub(crate) fn planes_of(a: &[i16], m: usize, k: usize) -> Vec<i8> {
+    let mut out = vec![0i8; 2 * m * k];
+    let (hi, lo) = out.split_at_mut(m * k);
+    for ((h, l), &v) in hi.iter_mut().zip(lo.iter_mut()).zip(a) {
+        let [low, high] = v.to_le_bytes();
+        // NOTE: high is the two's complement byte of floor(v / 256), and low is v mod 256.
+        *h = high.cast_signed();
+        *l = low.wrapping_sub(128).cast_signed();
     }
     out
 }

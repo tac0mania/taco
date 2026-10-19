@@ -1,13 +1,16 @@
-//! The i8 matrix product on the GPU (tensor cores and dp4a) against `hardshell::kernels`, and
-//! checks of the embedded PTX that run without a GPU.
+//! The i8 matrix product on the GPU (tensor cores and dp4a) and the i8 x i16 product of
+//! model-file version 2 against `hardshell::kernels`, and checks of the embedded PTX that run
+//! without a GPU.
 
-#![allow(clippy::unwrap_used, clippy::print_stderr)]
+#![allow(clippy::unwrap_used, clippy::print_stderr, clippy::cast_possible_truncation)]
 
 mod support;
 
-use hardshell::kernels::matvec_i8;
+use hardshell::kernels::{matvec_i8, matvec_i8_i16};
 use hardshell::tensor::Matrix;
-use hardshell_cuda::{KERNEL_SOURCE, MatKernel, PTX_SOURCE_LINE, matmul_i8, matmul_i8_split, ptx};
+use hardshell_cuda::{
+    KERNEL_SOURCE, MatKernel, PTX_SOURCE_LINE, matmul_i8, matmul_i8_i16, matmul_i8_split, ptx,
+};
 use sha2::{Digest, Sha256};
 use support::{Rng, device};
 
@@ -69,6 +72,72 @@ fn matmul_is_exact_at_the_accumulator_bound() {
         }
         for kernel in [MatKernel::TensorCore, MatKernel::TensorCore64, MatKernel::TensorCore128] {
             let got = matmul_i8_split(&dev, &w, &a, 2, kernel, 5).unwrap();
+            assert_eq!(got, want, "{wv} {av} split {kernel:?}");
+        }
+    }
+}
+
+fn cpu_matmul_wide(w: &Matrix<i8>, a: &[i16], m: usize) -> Vec<i64> {
+    let mut out = vec![0i64; m * w.rows()];
+    for (row, o) in a.chunks(w.cols()).zip(out.chunks_mut(w.rows())) {
+        matvec_i8_i16(w, row, o).unwrap();
+    }
+    out
+}
+
+fn i16_value(r: &mut Rng) -> i16 {
+    // Edges more often than uniform: -32768, -32767, -1, 0, 255, 256, 32767.
+    match r.below(8) {
+        0 => [-32768i16, -32767, -1, 0, 255, 256, -256, 32767][r.below(8) as usize],
+        _ => (r.next() as u16).cast_signed(),
+    }
+}
+
+#[test]
+fn matmul_i8_i16_equals_hardshell_kernels() {
+    let Some(dev) = device("matmul_i8_i16_equals_hardshell_kernels") else { return };
+    let mut r = Rng::new(0x07ac_16a1);
+    let shapes = [
+        (1usize, 1usize, 1usize),
+        (5, 3, 2),
+        (70, 97, 9),
+        (300, 768, 3),
+        (129, 200, 64),
+        (31, 3072, 8),
+        (768, 3072, 33),
+        (2, 4100, 130),
+        (1000, 64, 257),
+    ];
+    for (n, k, m) in shapes {
+        let w = Matrix::new(n, k, (0..n * k).map(|_| r.i8()).collect()).unwrap();
+        let a: Vec<i16> = (0..m * k).map(|_| i16_value(&mut r)).collect();
+        let want = cpu_matmul_wide(&w, &a, m);
+        for kernel in KERNELS {
+            let got = matmul_i8_i16(&dev, &w, &a, m, kernel, 1).unwrap();
+            assert_eq!(got, want, "n {n} k {k} m {m} {kernel:?}");
+        }
+        for kernel in [MatKernel::TensorCore, MatKernel::TensorCore64, MatKernel::TensorCore128] {
+            let got = matmul_i8_i16(&dev, &w, &a, m, kernel, 3).unwrap();
+            assert_eq!(got, want, "n {n} k {k} m {m} {kernel:?} split 3");
+        }
+    }
+}
+
+#[test]
+fn matmul_i8_i16_is_exact_at_the_accumulator_bound() {
+    // |w * a| = 2^22 in every product of a row of 2^16 values: sums of 2^38 in magnitude.
+    let Some(dev) = device("matmul_i8_i16_is_exact_at_the_accumulator_bound") else { return };
+    let k = hardshell::kernels::MAX_DOT_LEN_I32;
+    for (wv, av) in [(-128i8, -32768i16), (127, -32768), (-128, 32767), (127, 32767), (-1, -1)] {
+        let w = Matrix::new(3, k, vec![wv; 3 * k]).unwrap();
+        let a = vec![av; 2 * k];
+        let want = cpu_matmul_wide(&w, &a, 2);
+        for kernel in KERNELS {
+            let got = matmul_i8_i16(&dev, &w, &a, 2, kernel, 1).unwrap();
+            assert_eq!(got, want, "{wv} {av} {kernel:?}");
+        }
+        for kernel in [MatKernel::TensorCore, MatKernel::TensorCore64, MatKernel::TensorCore128] {
+            let got = matmul_i8_i16(&dev, &w, &a, 2, kernel, 5).unwrap();
             assert_eq!(got, want, "{wv} {av} split {kernel:?}");
         }
     }

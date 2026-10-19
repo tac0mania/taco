@@ -9,7 +9,7 @@
 mod common;
 mod support;
 
-use common::builder::{build, tiny_dims};
+use common::builder::{build, build_wide, tiny_dims};
 use common::reference::Dims;
 use hardshell::TokenId;
 use hardshell_cuda::{CoderQuery, CudaBatch, CudaModel};
@@ -17,8 +17,13 @@ use support::device;
 
 /// Runs `calls` random calls on two batches (op-level and fused) of the same model.
 fn paths_agree(dims: Dims, seed: u64, slots: usize, calls: usize, max_rows: usize) {
+    paths_agree_of(false, dims, seed, slots, calls, max_rows);
+}
+
+/// [`paths_agree`] on a model of model-file version 1, or with `wide` of version 2.
+fn paths_agree_of(wide: bool, dims: Dims, seed: u64, slots: usize, calls: usize, max_rows: usize) {
     let Some(dev) = device("paths_agree") else { return };
-    let b = build(dims, seed, 64);
+    let b = if wide { build_wide(dims, seed, 64) } else { build(dims, seed, 64) };
     let gpu = CudaModel::load(&dev, &b.bytes).unwrap();
     let mut op = CudaBatch::new(&gpu, slots, max_rows).unwrap();
     op.set_op_level(true);
@@ -88,5 +93,20 @@ fn fused_path_equals_the_op_level_path_for_other_shapes() {
     ];
     for (i, dims) in shapes.into_iter().enumerate() {
         paths_agree(dims, 60 + i as u64, 5, 40, 12);
+    }
+}
+
+#[test]
+fn fused_path_equals_the_op_level_path_on_wide_models() {
+    // Model-file version 2: ln_beta_frac in residual_norm, and the op kernels of the i16 ops on
+    // the fused path. Small passes, passes of up to 200 rows, and other shapes.
+    paths_agree_of(true, tiny_dims(), 53, 6, 80, 10);
+    paths_agree_of(true, tiny_dims(), 54, 64, 20, 200);
+    let shapes = [
+        Dims { n_layer: 1, n_head: 2, d_model: 64, d_ff: 128, vocab: 300, n_ctx: 30 },
+        Dims { n_layer: 1, n_head: 1, d_model: 256, d_ff: 512, vocab: 1000, n_ctx: 40 },
+    ];
+    for (i, dims) in shapes.into_iter().enumerate() {
+        paths_agree_of(true, dims, 80 + i as u64, 5, 30, 12);
     }
 }
