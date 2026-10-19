@@ -58,12 +58,33 @@ back byte for byte.
 On 16 text files of the quality corpus (32 KiB each), float GPT-2 with the Taco coder gives 1.99
 bits per byte; bzip2 gives 2.36, xz 2.51 and zstd 2.52.
 
+The sizes do not include the model file (`gpt2.hsm`, 127 MB). Both machines must have the same
+model file. This is the usual method for compressors with a language model, but it means that
+Taco saves storage and transfer only when the model file is already on both machines.
+
+**Against other compressors with a language model.** On the whole `alice29.txt` (152,089
+bytes), Taco gives 38,939 bytes (2.05 bits per byte, measured). `ts_zip` gives 21,713 bytes
+(1.14 bits per byte, published), 44% smaller. `ts_zip` uses a larger and newer model (RWKV,
+169M parameters, against GPT-2 small, 124M), and the profile `text` of Taco codes blocks of
+16 KiB with no context from the block before. The `ts_zip` page also states that its result
+does not depend on the GPU or the CPU. Thus Taco is not the only compressor with a language
+model whose files decompress on other machines (`docs/research/2026-10-19-benchmark.md` §8).
+What Taco adds is the combination: an open specification with integer operations only, an
+exact and repeatable model conversion, conformance vectors, and CPU, CUDA and portable GPU
+implementations (AMD, Apple, Intel, NVIDIA) that tests show give the same bits.
+
 ### Integer model against the float model
 
 | Model | Bits per byte (first 1,024 tokens of 16 held-out text files) |
 |---|---:|
 | GPT-2 small, float | 1.867 |
 | GPT-2 small, integer (`gpt2.hsm`) | 1.871 (+0.2%) |
+
+The +0.2% is the total of 42,256 bytes of text. Single files change from −9.0% to +6.6%
+(`xargs.1`). The conversion recipe (`clip`) saturates large activations, and this changes the
+predictions: against a float model with the same saturation, the integer model is 2.3% larger
+(measured). Thus +0.2% is a result on these files, not a bound for other data
+(`docs/research/2026-10-18-integer-gpt2.md` §6).
 
 ### Same bits on different machines
 
@@ -120,16 +141,27 @@ measured unless they are labelled "est.".
 - **No floating-point arithmetic in compression or decompression.** The engine, the coder and
   the mixer use integers only. The GPU kernels (CUDA C++ and WGSL) use integers only too.
   `scripts/check-no-floats.sh` refuses a float type in all of them, and CI runs it on each push.
-- **Integer results do not depend on the machine.** `7 x 3 = 21` on every CPU and GPU. An
+- **Integer results do not depend on the machine, when each operation is fully specified.**
+  Integers alone are not sufficient. Taco also needs these conditions, and it makes them rules
+  (`CLAUDE.md` §1): every sum has an accumulator wide enough for its largest value, with the
+  bound written in the code (`INVARIANT:`), or it wraps on overflow in a defined way; every
+  rounding and every clamp has one written rule in one place (ADR 0004); signed division uses
+  floor-division helpers. When these conditions hold, `7 x 3 = 21` on every CPU and GPU, and an
   integer sum has the same result in every order, so a GPU can add in parallel in any order.
-  Every rounding step is an integer operation with one defined result (ADR 0004). A compiler,
-  an optimisation level, a CPU type or a GPU driver cannot change these results.
+  A compiler, an optimisation level, a CPU type or a GPU driver then has no freedom to change a
+  result. Tests check the conditions (conformance vectors, the cross-machine check, fuzzing),
+  but tests cannot prove that the code obeys them everywhere.
 - **The model file is the same on every machine.** The converter reads each float32 weight
   exactly as `mantissa x 2^exponent` and calculates with exact fractions (ADR 0014). It runs
   one time, before publication. The Mac and Linux make the same `gpt2.hsm`, byte for byte.
 - **A wrong result is never silent.** Each `.taco` file stores the SHA-256 of the original
-  data. `taco unfold` checks it. If a result is wrong, `taco unfold` stops with an error, and
-  you can decompress the file again with `--backend cpu` or on a different machine.
+  data. `taco unfold` checks it. If a result is wrong, `taco unfold` stops with an error.
+- **The checksum finds an error. It cannot repair one.** If the error is in the decoder (for
+  example a GPU fault during `taco unfold`), decompress the file again with `--backend cpu` or
+  on a different machine. If the error happened during `taco fold` (a bug or a hardware fault
+  on the machine that folded), the `.taco` file is damaged, and no decoder can restore it.
+  Thus keep the original until you have unfolded the `.taco` file one time, if possible on a
+  different machine or with `--backend cpu`.
 
 ### What can still go wrong
 
@@ -188,15 +220,24 @@ not call them supported before a test passes.
 - **The CPU alone is very slow** (about 0.3 to 2 KB/s). A GPU is strongly recommended.
 - **Small files decompress slowly.** One block decodes one token after the other, so a file
   cannot decompress faster than its largest block: about 10 to 13 s for a 16 KiB block on the
-  RTX 3060 (est. from the measured `cp.html` and `textwrap.py` times). Speculative decoding is
-  in progress.
+  RTX 3060 (est. from the measured `cp.html` and `textwrap.py` times). Speculative decoding
+  comes after the beta ([Planned speed-ups](#planned-speed-ups-after-the-beta)).
 - **English only.** GPT-2 is an English model. On German and French, Taco is larger than PPMd;
   on Chinese it is larger than gzip (measured). Binary data is stored with zstd or raw.
 - **Logs:** the profile `logs` is smaller than xz, but paq8px is still smaller (measured).
-- **Memory:** `taco` reads the whole file into memory today. Streaming is in progress.
-- **Untrusted input:** fuzzing and limits are in progress. Do not unfold `.taco` files from
-  sources that you do not trust yet.
-- **The file format is not frozen.** A later version can need a new `.taco` reader.
+- **Memory:** `taco fold` and `taco unfold` stream the data (ADR 0018). A 200 MB file folded
+  with 254 MiB of memory and unfolded with 38 MiB (measured).
+- **Untrusted input:** the readers were fuzzed with millions of damaged inputs and 0 failures
+  (measured). `docs/security.md` lists the findings and their state. One is still open: a model
+  file can state a very large KV cache (F6). Do not load `.hsm` model files from sources that
+  you do not trust.
+- **The file format (container version 2) is frozen.** Later versions of Taco read the files
+  that this version makes.
+- **Mixer rule 2 (the skip rule) is reserved, not used.** The format accepts it, but this
+  version does not write it, and its decoder refuses it. It comes after the beta.
+- **The wide model files (model-file version 2)** run on the CPU and with CUDA. The portable
+  GPU backend does not run them yet. The default model, `gpt2.hsm`, is version 1 and runs
+  everywhere.
 - **The model file** (`gpt2.hsm`, 127 MB) is not distributed yet. Make it with the steps in
   [Local setup](#5-local-setup).
 
