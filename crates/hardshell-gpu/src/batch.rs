@@ -13,9 +13,10 @@
 mod context;
 mod plan;
 mod record;
+mod rows;
 
 use hardshell::TokenId;
-use hardshell::gpt2::Overlap;
+use hardshell::gpt2::{Overlap, StreamState};
 
 use crate::device::bytes_to_words;
 use crate::error::{Error, Result};
@@ -60,11 +61,18 @@ pub struct GpuBatch<'m> {
     pos: Vec<usize>,
     /// The tokens of the context of each slot, for the overlap of a restart.
     hist: Vec<History>,
+    /// The inputs of each slot, for a truncation (ADR 0017, `hardshell::gpt2::StreamState`).
+    streams: Vec<StreamState>,
+    /// The history of the full context of each slot before its last restart (empty before the
+    /// first restart), for a truncation before the restart.
+    prev: Vec<Vec<TokenId>>,
     /// `[slots, vocab]` weights of the last step of each slot.
     host: Vec<u64>,
     plan: Plan,
     /// The words of the coder intervals of the last `step_coded`.
     last_intervals: Vec<u32>,
+    /// The words of the weights of the last pass of [`GpuBatch::run_rows`].
+    last_rows: Vec<u32>,
 }
 
 impl std::fmt::Debug for GpuBatch<'_> {
@@ -103,6 +111,23 @@ impl<'m> GpuBatch<'m> {
     /// [`Error::Model`] with `InvalidOverlap` if `K > n_ctx - 2`; the errors of
     /// [`GpuBatch::new`].
     pub fn with_overlap(model: &'m GpuModel, slots: usize, overlap: Overlap) -> Result<Self> {
+        let rows = if overlap.is_none() { slots.max(1) } else { slots.max(RESTART_ROWS) };
+        Self::with_rows(model, slots, overlap, rows)
+    }
+
+    /// The same as [`GpuBatch::with_overlap`], with work buffers for passes of up to
+    /// `max_rows` rows (at least the rows of [`GpuBatch::with_overlap`]): room for the draft
+    /// rows of many slots in one pass of [`GpuBatch::run_rows`] (ADR 0017). Cost: about
+    /// 1.1 MB of GPU memory for each row of GPT-2 small (est. from the buffer sizes).
+    ///
+    /// # Errors
+    /// The errors of [`GpuBatch::with_overlap`].
+    pub fn with_rows(
+        model: &'m GpuModel,
+        slots: usize,
+        overlap: Overlap,
+        max_rows: usize,
+    ) -> Result<Self> {
         let n_ctx = model.n_ctx();
         if overlap.tokens().saturating_add(2) > n_ctx {
             return Err(Error::Model(hardshell::Error::InvalidOverlap {
@@ -110,7 +135,8 @@ impl<'m> GpuBatch<'m> {
                 n_ctx,
             }));
         }
-        let max_rows = if overlap.is_none() { slots.max(1) } else { slots.max(RESTART_ROWS) };
+        let least = if overlap.is_none() { slots.max(1) } else { slots.max(RESTART_ROWS) };
+        let max_rows = max_rows.max(least);
         let plan = Plan::new(model, slots, max_rows)?;
         Ok(Self {
             model,
@@ -119,9 +145,12 @@ impl<'m> GpuBatch<'m> {
             overlap,
             pos: vec![0; slots],
             hist: (0..slots).map(|_| History::new(n_ctx)).collect(),
+            streams: vec![StreamState::new(); slots],
+            prev: vec![Vec::new(); slots],
             host: vec![0; slots * model.vocab_size()],
             plan,
             last_intervals: Vec::new(),
+            last_rows: Vec::new(),
         })
     }
 
@@ -161,6 +190,9 @@ impl<'m> GpuBatch<'m> {
     pub fn reset(&mut self, slot: usize) {
         if let Some(p) = self.pos.get_mut(slot) {
             *p = 0;
+        }
+        if let Some(s) = self.streams.get_mut(slot) {
+            s.clear();
         }
     }
 
@@ -237,13 +269,21 @@ impl<'m> GpuBatch<'m> {
         // The histories and positions change only after all passes, so an error changes no
         // slot: a slot that restarted runs its restart again at the next step.
         for &s in &restarted {
-            if let Some(h) = self.hist.get_mut(s) {
+            if let (Some(h), Some(prev), Some(st)) =
+                (self.hist.get_mut(s), self.prev.get_mut(s), self.streams.get_mut(s))
+            {
+                prev.clear();
+                prev.extend_from_slice(h.tokens());
                 h.restart(k, eot);
+                st.restart(k);
             }
         }
         for &(s, t, p) in &rows {
-            if let (Some(h), Some(q)) = (self.hist.get_mut(s), self.pos.get_mut(s)) {
+            if let (Some(h), Some(q), Some(st)) =
+                (self.hist.get_mut(s), self.pos.get_mut(s), self.streams.get_mut(s))
+            {
                 h.set(p, t);
+                st.input(p);
                 *q = p + 1;
             }
         }
@@ -411,6 +451,19 @@ impl<'m> GpuBatch<'m> {
             }
             Mode::Wait => {
                 dev.finish_and_wait(enc)?;
+                Ok(None)
+            }
+            Mode::Rows => {
+                let bytes = (rows.len() * model.vocab_size() * 8) as u64;
+                let mut out = Vec::new();
+                dev.finish_and_read(
+                    enc,
+                    &self.plan.io.weights,
+                    &self.plan.io.staging,
+                    bytes,
+                    &mut out,
+                )?;
+                self.last_rows = bytes_to_words(&out);
                 Ok(None)
             }
             Mode::Read => {

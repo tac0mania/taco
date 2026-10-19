@@ -35,11 +35,16 @@
 //! Every output weight is in `1..2^62`. `|x| <= 4095`, `|err| < 2^16` and `lr <= 255`, so a
 //! weight change is less than `2^36` before the shift. `|dot| < 3 * 2^22 * 2^12 < 2^36`.
 //!
+//! Mixer rule version 2 (ADR 0017) adds the skip rule of module `skip`: with
+//! [`MixerParams::V2`], the caller calls [`Mixer::skip`] first at each position, and calls
+//! [`Mixer::mix`] (or [`Mixer::mix_stats`]) only if it gives `None`.
+//!
 //! DETERMINISM: integer operations only. The shifts of signed values are arithmetic shifts
 //! (floor), as the rescale rule of plan §7.2. No `/` or `%` on a signed value.
 
 use crate::error::MatchError;
 use crate::logistic::{Logistic, P_ONE, X_MAX};
+use crate::skip::{Adaptive, SkipCode, SkipParams};
 use crate::types::{MatchLen, Prediction, TokenId};
 
 /// The number of confidence buckets.
@@ -49,7 +54,7 @@ const SETS: usize = 2 * BUCKETS;
 /// The limit of the update count of a weight set.
 const COUNT_LIMIT: u32 = 1 << 20;
 /// The number of bits of the adaptive hit probability.
-const HIT_BITS: u32 = 22;
+pub(crate) const HIT_BITS: u32 = 22;
 /// The limit of each mixer weight: `±2^22` (±64.0).
 const W_LIMIT: i64 = 1 << 22;
 /// The bias input.
@@ -64,6 +69,8 @@ pub struct MixerParams {
     hit_limit: u16,
     wg_init: i32,
     wm_init: i32,
+    /// The skip rule (mixer rule version 2), or `None` (rule version 1).
+    skip: Option<SkipParams>,
 }
 
 impl MixerParams {
@@ -76,7 +83,25 @@ impl MixerParams {
         hit_limit: 255,
         wg_init: 1 << 16,
         wm_init: 1 << 16,
+        skip: None,
     };
+
+    /// The constants of mixer rule version 2 (ADR 0017): the constants of rule version 1 and
+    /// the skip rule with [`SkipParams::V2`].
+    pub const V2: Self = Self::V1.with_skip(SkipParams::V2);
+
+    /// The same constants with the skip rule `skip` (module `skip`).
+    #[must_use]
+    pub const fn with_skip(mut self, skip: SkipParams) -> Self {
+        self.skip = Some(skip);
+        self
+    }
+
+    /// The skip rule, or `None` for a rule without it (rule version 1).
+    #[must_use]
+    pub const fn skip(&self) -> Option<SkipParams> {
+        self.skip
+    }
 
     /// Makes and checks the constants. The learning rate of a weight set with `n` earlier
     /// updates is `max(lr_min, lr * lr_decay / (n + lr_decay))`, or `lr` if `lr_decay` is 0.
@@ -104,7 +129,7 @@ impl MixerParams {
         if i64::from(wg_init).abs() > lim || i64::from(wm_init).abs() > lim {
             return Err(MatchError::InvalidParams { reason: "a start weight is outside 2^22" });
         }
-        Ok(Self { lr, lr_min, lr_decay, hit_limit, wg_init, wm_init })
+        Ok(Self { lr, lr_min, lr_decay, hit_limit, wg_init, wm_init, skip: None })
     }
 
     /// The learning rate of a weight set after `n` updates.
@@ -129,47 +154,95 @@ struct Pending {
     xs: [i32; 3],
 }
 
+/// What [`Mixer::update`] changes after the last call. `ctx` is the entry of the context
+/// table of the skip rule (`None` without a skip rule).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Next {
+    /// A mixed position: the weight set, the hit probability of the bucket, the context entry.
+    Mixed { pend: Pending, ctx: Option<usize> },
+    /// A skipped position: the hit probability of the bucket and the context entry.
+    Skipped { token: TokenId, bucket: usize, ctx: usize },
+}
+
+/// One change of the state, kept while a speculative run is open ([`Mixer::checkpoint`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Undo {
+    Bucket { b: usize, old: Adaptive },
+    Set { set: usize, weights: [i32; 3], updates: u32 },
+    Ctx { idx: usize, old: Adaptive },
+}
+
+/// A point of a speculative run: [`Mixer::rollback`] gives the state of this point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checkpoint {
+    mark: usize,
+    pending: Option<Next>,
+    epoch: u64,
+}
+
 /// The mixer state of one block.
 #[derive(Clone, Debug)]
 pub struct Mixer {
     params: MixerParams,
     tables: Logistic,
-    hit: [u32; BUCKETS],
-    count: [u16; BUCKETS],
+    buckets: [Adaptive; BUCKETS],
     weights: [[i32; 3]; SETS],
     updates: [u32; SETS],
-    pending: Option<Pending>,
+    /// The context table of the skip rule: one hit probability for each slot of
+    /// (predicted token, bucket). Empty without a skip rule.
+    ctx: Vec<Adaptive>,
+    pending: Option<Next>,
+    /// The changes since the first [`Mixer::checkpoint`] of an open speculative run.
+    journal: Option<Vec<Undo>>,
+    /// Counts the ends of speculative runs, so an old checkpoint is refused.
+    epoch: u64,
 }
 
 impl Mixer {
     /// Makes a mixer in its start state. Cost: it calculates the logistic tables (about
-    /// 4,096 `u128` divisions and 144 KiB).
+    /// 4,096 `u128` divisions and 144 KiB); with a skip rule, also the context table (8 bytes
+    /// for each entry: 512 KiB for [`SkipParams::V2`]).
     #[must_use]
     pub fn new(params: MixerParams) -> Self {
+        let ctx = params.skip.map_or(0, |s| s.table_len());
         let mut m = Self {
             params,
             tables: Logistic::new(),
-            hit: [0; BUCKETS],
-            count: [0; BUCKETS],
+            buckets: [Adaptive::START; BUCKETS],
             weights: [[0; 3]; SETS],
             updates: [0; SETS],
+            ctx: vec![Adaptive::START; ctx],
             pending: None,
+            journal: None,
+            epoch: 0,
         };
         m.reset();
         m
     }
 
     /// Puts the mixer into its start state for a new block. After `reset`, the mixer gives
-    /// the same outputs as a new mixer.
+    /// the same outputs as a new mixer. It ends an open speculative run. Cost: one pass over
+    /// the context table.
     pub fn reset(&mut self) {
-        self.hit = [1 << (HIT_BITS - 1); BUCKETS];
-        self.count = [0; BUCKETS];
+        self.buckets = [Adaptive::START; BUCKETS];
         self.weights = [[self.params.wg_init, self.params.wm_init, 0]; SETS];
         self.updates = [0; SETS];
+        self.ctx.fill(Adaptive::START);
         self.pending = None;
+        self.journal = None;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// The constants of this mixer.
+    #[must_use]
+    pub const fn params(&self) -> &MixerParams {
+        &self.params
     }
 
     /// Changes the GPT-2 weights into the final weights (rules 1 to 6).
+    ///
+    /// With a skip rule (rule version 2), call [`Mixer::skip`] first, and `mix` only if it
+    /// gives `None`.
     ///
     /// Cost: two passes over the weights, with one `u128` multiplication for each weight when
     /// there is a prediction.
@@ -225,7 +298,7 @@ impl Mixer {
     ///
     /// This is the host step of the mixed coder op of a GPU (`hardshell-cuda`,
     /// `MIXED-INTEGRATION.md` section 3): the GPU gives the statistics, and the mixer state
-    /// stays on the host. [`Mixer::mix`] uses it, so one code path sets the state. Cost: O(1).
+    /// stays on the host. Cost: O(1).
     pub fn mix_stats(
         &mut self,
         total: u128,
@@ -236,18 +309,115 @@ impl Mixer {
         self.pending = None;
         let pred = prediction?;
         let q = self.probability(u128::from(predicted), total, pred.length, agree);
-        self.pending = Some(Pending { token: pred.token, ..q });
+        let ctx = self.params.skip.map(|s| s.slot(pred.token, q.bucket));
+        self.pending = Some(Next::Mixed { pend: Pending { token: pred.token, ..q }, ctx });
         Some(q.q)
     }
 
-    /// Updates the state with the actual token (rule 7). It does nothing if the last call
-    /// of [`Mixer::mix`] had no prediction.
+    /// The skip rule (mixer rule version 2, module `skip`): gives the [`SkipCode`] of this
+    /// position if the rule codes it without the GPT-2 weights, and then remembers the
+    /// position for [`Mixer::update`]. Gives `None` (and remembers nothing) without a
+    /// prediction, for a mixer without a skip rule, or if the rule does not skip; then the
+    /// caller calls [`Mixer::mix`] or [`Mixer::mix_stats`]. The decision depends only on the
+    /// state, which depends only on earlier tokens. Cost: O(1).
+    pub fn skip(&mut self, prediction: Option<Prediction>) -> Option<SkipCode> {
+        self.pending = None;
+        let pred = prediction?;
+        let rule = self.params.skip?;
+        let b = bucket(pred.length);
+        let idx = rule.slot(pred.token, b);
+        let e = self.ctx.get(idx).copied().unwrap_or(Adaptive::START);
+        if !rule.skips(b, e.count, e.hit) {
+            return None;
+        }
+        let q = (e.hit >> (HIT_BITS - 16)).clamp(1, P_ONE - 1);
+        self.pending = Some(Next::Skipped { token: pred.token, bucket: b, ctx: idx });
+        Some(SkipCode { token: pred.token, q })
+    }
+
+    /// Opens a speculative run (or continues the open one) and gives the current point. While
+    /// a run is open, the mixer keeps a list of its changes, so [`Mixer::rollback`] can give
+    /// the state of any point of the run. [`Mixer::commit`] ends the run.
+    ///
+    /// The decoder of a GPU uses it: the mixer must give `q` for the draft rows of a pass
+    /// before the tokens are known, so it updates with the draft tokens and goes back to the
+    /// first wrong row (ADR 0017). Cost: O(1); about 24 bytes for each later change.
+    pub fn checkpoint(&mut self) -> Checkpoint {
+        let journal = self.journal.get_or_insert_with(Vec::new);
+        Checkpoint { mark: journal.len(), pending: self.pending, epoch: self.epoch }
+    }
+
+    /// Gives the state of the point `cp` of the open speculative run: the run stays open, so
+    /// a later rollback to an earlier point of the run is possible. Cost: one step for each
+    /// change since the point.
+    ///
+    /// # Errors
+    ///
+    /// [`MatchError::StaleCheckpoint`] if `cp` is not a point of the open run (the run ended,
+    /// or the mixer was reset). The state does not change.
+    pub fn rollback(&mut self, cp: &Checkpoint) -> Result<(), MatchError> {
+        let open = self.journal.as_ref().is_some_and(|j| j.len() >= cp.mark);
+        if cp.epoch != self.epoch || !open {
+            return Err(MatchError::StaleCheckpoint);
+        }
+        let undo: Vec<Undo> = match self.journal.as_mut() {
+            Some(j) => j.drain(cp.mark..).rev().collect(),
+            None => Vec::new(),
+        };
+        for u in undo {
+            match u {
+                Undo::Bucket { b, old } => {
+                    if let Some(e) = self.buckets.get_mut(b) {
+                        *e = old;
+                    }
+                }
+                Undo::Set { set, weights, updates } => {
+                    if let Some(w) = self.weights.get_mut(set) {
+                        *w = weights;
+                    }
+                    if let Some(n) = self.updates.get_mut(set) {
+                        *n = updates;
+                    }
+                }
+                Undo::Ctx { idx, old } => {
+                    if let Some(e) = self.ctx.get_mut(idx) {
+                        *e = old;
+                    }
+                }
+            }
+        }
+        self.pending = cp.pending;
+        Ok(())
+    }
+
+    /// Ends the open speculative run and keeps the current state. Every checkpoint of the run
+    /// becomes stale.
+    pub fn commit(&mut self) {
+        self.journal = None;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Updates the state with the actual token (rule 7, or rule 4 of the skip rule). It does
+    /// nothing if the last call of [`Mixer::mix`], [`Mixer::mix_stats`] or [`Mixer::skip`]
+    /// had no prediction (or `skip` gave `None` and no `mix` followed).
     pub fn update(&mut self, actual: TokenId) {
-        let Some(pend) = self.pending.take() else { return };
+        let (pend, ctx) = match self.pending.take() {
+            None => return,
+            Some(Next::Skipped { token, bucket, ctx }) => {
+                let y = actual == token;
+                self.update_bucket(bucket, y);
+                self.update_ctx(ctx, y);
+                return;
+            }
+            Some(Next::Mixed { pend, ctx }) => (pend, ctx),
+        };
         let y = actual == pend.token;
         let err = if y { i64::from(P_ONE) } else { 0 } - i64::from(pend.q);
         let n = self.updates.get(pend.set).copied().unwrap_or(0);
         let lr = self.params.rate(n);
+        if let (Some(j), Some(&w)) = (self.journal.as_mut(), self.weights.get(pend.set)) {
+            j.push(Undo::Set { set: pend.set, weights: w, updates: n });
+        }
         if let Some(u) = self.updates.get_mut(pend.set) {
             *u = (n + 1).min(COUNT_LIMIT);
         }
@@ -260,15 +430,32 @@ impl Mixer {
                 *w = i32::try_from(v).unwrap_or(0);
             }
         }
-        let b = pend.bucket.min(BUCKETS - 1);
-        let n = u32::from(self.count[b]);
-        let h = self.hit[b];
-        let den = 2 * n + 3;
-        // INVARIANT: h <= 2^22, so the products are below 2^23 and h stays in 0..=2^22.
-        self.hit[b] = if y { h + (((1 << HIT_BITS) - h) * 2) / den } else { h - (h * 2) / den };
-        let next = (n + 1).min(u32::from(self.params.hit_limit));
-        // INVARIANT: next <= hit_limit <= u16::MAX.
-        self.count[b] = u16::try_from(next).unwrap_or(u16::MAX);
+        self.update_bucket(pend.bucket, y);
+        if let Some(idx) = ctx {
+            self.update_ctx(idx, y);
+        }
+    }
+
+    /// The hit probability and the count of bucket `b` after a prediction with the result `y`.
+    fn update_bucket(&mut self, b: usize, y: bool) {
+        let limit = self.params.hit_limit;
+        if let Some(e) = self.buckets.get_mut(b) {
+            if let Some(j) = self.journal.as_mut() {
+                j.push(Undo::Bucket { b, old: *e });
+            }
+            e.update(y, limit);
+        }
+    }
+
+    /// The entry `idx` of the context table after a prediction with the result `y`.
+    fn update_ctx(&mut self, idx: usize, y: bool) {
+        let limit = self.params.hit_limit;
+        if let Some(e) = self.ctx.get_mut(idx) {
+            if let Some(j) = self.journal.as_mut() {
+                j.push(Undo::Ctx { idx, old: *e });
+            }
+            e.update(y, limit);
+        }
     }
 
     /// Rules 2 to 5: the final probability of the predicted token.
@@ -277,8 +464,8 @@ impl Mixer {
         // INVARIANT: pg <= 2^16 because wp <= total; the clamp gives 1..=65535.
         let pg = u32::try_from(pg).unwrap_or(P_ONE).clamp(1, P_ONE - 1);
         let b = bucket(length);
-        let xs =
-            [self.tables.stretch(pg), self.tables.stretch(self.hit[b] >> (HIT_BITS - 16)), BIAS];
+        let hit = self.buckets[b].hit;
+        let xs = [self.tables.stretch(pg), self.tables.stretch(hit >> (HIT_BITS - 16)), BIAS];
         let set = 2 * b + usize::from(agree);
         let wv = self.weights[set];
         let dot: i64 = wv.iter().zip(xs.iter()).map(|(&w, &x)| i64::from(w) * i64::from(x)).sum();
@@ -342,5 +529,17 @@ impl Mixer {
     /// `agree` says that the predicted token is the GPT-2 token with the largest weight.
     pub fn peek(&self, wp: u64, total: u128, length: MatchLen, agree: bool) -> u32 {
         self.probability(u128::from(wp), total, length, agree).q
+    }
+}
+
+/// The constants of a mixer rule version of the container (byte 0 of the coding parameters,
+/// ADR 0010 section 5): version 1 (ADR 0010) and version 2 (ADR 0017, the skip rule). `None`
+/// for another version: the reader refuses it.
+#[must_use]
+pub fn rule_constants(version: u8) -> Option<(crate::MatchParams, MixerParams)> {
+    match version {
+        1 => Some((crate::MatchParams::V1, MixerParams::V1)),
+        2 => Some((crate::MatchParams::V1, MixerParams::V2)),
+        _ => None,
     }
 }

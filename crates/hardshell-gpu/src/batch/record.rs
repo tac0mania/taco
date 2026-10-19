@@ -14,6 +14,8 @@ pub(super) enum Mode {
     Wait,
     /// Read the weights back.
     Read,
+    /// Read the weights of each row back, in row order ([`super::GpuBatch::run_rows`]).
+    Rows,
     /// Read the weights and the timestamps back.
     Profile,
     /// Run the coder op and read only the intervals back.

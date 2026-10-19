@@ -13,7 +13,7 @@ mod common;
 
 use common::{SplitMix64, run_block, synthetic_log, weights};
 use sha2::{Digest, Sha256};
-use taco_match::{MatchModel, MatchParams, Mixer, MixerParams};
+use taco_match::{MatchModel, MatchParams, Mixer, MixerParams, SkipParams, TokenId};
 
 const SEED: u64 = 20_261_018;
 
@@ -55,4 +55,57 @@ fn small_tables_match_the_python_mirror() {
     let (p, w) = hashes(MatchParams::new(&[8, 4, 2, 1], 6, 16, 40).unwrap());
     assert_eq!(p, "f2e7ff6ecc83ea8e47192c7c7e1f17118d23c93ba4c48da99be9401ddce31e51");
     assert_eq!(w, "f37ecdd0307952da684e90a350488d056b8d2b498fb1ac603168dd74baf5d51b");
+}
+
+/// The decisions of mixer rule version 2 (ADR 0017) on the synthetic log: for each position,
+/// 0 (no prediction), 1 and `q` (mixed), or 2 and `q_s` (skipped), as `u8` and `u32` LE.
+fn skip_hashes(params: MixerParams) -> (usize, String) {
+    let tokens = synthetic_log(SEED, 4000);
+    let mut model = MatchModel::new(MatchParams::V1);
+    let mut mixer = Mixer::new(params);
+    let mut rng = SplitMix64(SEED ^ 0xA5A5);
+    let mut h = Sha256::new();
+    let mut skipped = 0;
+    for &t in &tokens {
+        let pred = model.predict();
+        let w = weights(&mut rng, t);
+        let (kind, q) = match pred {
+            None => (0u8, 0u32),
+            Some(p) => match mixer.skip(Some(p)) {
+                Some(code) => {
+                    skipped += 1;
+                    (2, code.q)
+                }
+                None => {
+                    let total: u128 = w.iter().map(|&x| u128::from(x)).sum();
+                    let mut top = 0;
+                    for (i, &x) in w.iter().enumerate() {
+                        if x > w[top] {
+                            top = i;
+                        }
+                    }
+                    let pi = p.token.get() as usize;
+                    (1, mixer.mix_stats(total, w[pi], top == pi, Some(p)).unwrap())
+                }
+            },
+        };
+        h.update([kind]);
+        h.update(q.to_le_bytes());
+        mixer.update(TokenId::new(t));
+        model.observe(TokenId::new(t));
+    }
+    (skipped, hex(&h.finalize()))
+}
+
+#[test]
+fn rule_two_decisions_match_the_python_mirror() {
+    // `python -m logs.skip vectors` (tools/logs/skip.py) gave the same values (measured,
+    // devbox, 2026-10-19).
+    let (n, d) = skip_hashes(MixerParams::V2);
+    assert_eq!(n, 239);
+    assert_eq!(d, "f6f7755bc8649d13bd2548b92408bfa41ab29ae42c0ec3dc22c74587f99f930f");
+    let small = MixerParams::V1.with_skip(SkipParams::new(1 << 21, 1, 2, 6).unwrap());
+    let (n, d) = skip_hashes(small);
+    assert_eq!(n, 453);
+    assert_eq!(d, "8781e1040993e54e93078988dbd392a867a00d2f9d2bab2294d764241f38f212");
 }

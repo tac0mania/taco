@@ -64,6 +64,21 @@ impl<'m> CudaSession<'m> {
         self.step(self.eot)
     }
 
+    /// The length of the stream: the inputs since the last reset (the start is one input).
+    #[must_use]
+    pub fn stream_len(&self) -> usize {
+        self.batch.stream_len(0)
+    }
+
+    /// Truncates the stream to its first `len` inputs, as
+    /// `hardshell::gpt2::Session::truncate` (ADR 0017).
+    ///
+    /// # Errors
+    /// The errors of [`CudaBatch::truncate`].
+    pub fn truncate(&mut self, len: usize) -> Result<()> {
+        self.batch.truncate(0, len)
+    }
+
     /// Adds `token` to the context and gives the weights for the next token, as
     /// `hardshell::gpt2::Session::step` does.
     ///

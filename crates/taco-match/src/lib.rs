@@ -29,9 +29,11 @@ mod error;
 mod logistic;
 mod matcher;
 mod mixer;
+mod skip;
 mod types;
 
 pub use error::MatchError;
 pub use matcher::{MAX_ORDER, MAX_ORDERS, MatchModel, MatchParams};
-pub use mixer::{BUCKETS, Mixer, MixerParams, bucket};
+pub use mixer::{BUCKETS, Checkpoint, Mixer, MixerParams, bucket, rule_constants};
+pub use skip::{SkipCode, SkipParams, skip_miss_weights};
 pub use types::{MatchLen, Prediction, TokenId};

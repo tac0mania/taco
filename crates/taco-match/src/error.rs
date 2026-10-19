@@ -24,4 +24,7 @@ pub enum MatchError {
     /// The caller gave no weights.
     #[error("the weights are empty")]
     EmptyWeights,
+    /// A rollback to a checkpoint of a speculative run that ended (or of another run).
+    #[error("the checkpoint is not a point of the open speculative run")]
+    StaleCheckpoint,
 }

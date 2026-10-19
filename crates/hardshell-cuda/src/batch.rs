@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use hardshell::TokenId;
-use hardshell::gpt2::Overlap;
+use hardshell::gpt2::{Overlap, StreamState};
 
 use crate::device::{bytes_u64, u32_bytes, u32_of};
 use crate::driver::{Arg, DevBuf, Graph};
@@ -28,6 +28,7 @@ mod fused;
 mod mixed;
 mod plan;
 mod record;
+mod stream;
 
 pub(crate) use mixed::Mixing;
 
@@ -142,6 +143,11 @@ pub struct CudaBatch<'m> {
     /// `[slots, n_ctx]`: the token at each position of the context of each slot, for the
     /// overlap of a restart.
     hist: Vec<TokenId>,
+    /// The inputs of each slot, for a truncation (ADR 0017, `hardshell::gpt2::StreamState`).
+    streams: Vec<StreamState>,
+    /// The history of the full context of each slot before its last restart (empty before
+    /// the first restart), for a truncation before the restart.
+    prev: Vec<Vec<TokenId>>,
     /// `[slots, vocab]`: the weights of the last [`CudaBatch::step`] of each slot.
     host: Vec<u64>,
     b: Bufs,
@@ -310,6 +316,8 @@ impl<'m> CudaBatch<'m> {
             pos: vec![0; slots],
             overlap: Overlap::NONE,
             hist: vec![TokenId::new(0); slots * model.n_ctx()],
+            streams: vec![StreamState::new(); slots],
+            prev: vec![Vec::new(); slots],
             host: vec![0; slots * model.vocab_size()],
             b,
             kv,
@@ -389,6 +397,9 @@ impl<'m> CudaBatch<'m> {
     pub fn reset(&mut self, slot: usize) {
         if let Some(p) = self.pos.get_mut(slot) {
             *p = 0;
+        }
+        if let Some(s) = self.streams.get_mut(slot) {
+            s.clear();
         }
     }
 

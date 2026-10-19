@@ -103,12 +103,14 @@ mod model;
 mod ops;
 mod reference;
 mod session;
+mod stream;
 
 pub use batch::{Batch, BatchInput};
 pub use context::Overlap;
 pub use model::Model;
 pub use reference::ReferenceSession;
 pub use session::{Session, SessionConfig, StepWeights};
+pub use stream::{StreamState, Truncation};
 
 /// The residual limit `R = 2^30 - 1` (ADR 0004 section 1).
 pub const RESIDUAL_LIMIT: i32 = (1 << 30) - 1;

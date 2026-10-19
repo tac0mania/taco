@@ -43,6 +43,18 @@ impl History {
         }
     }
 
+    /// The tokens of all positions.
+    pub(super) fn tokens(&self) -> &[TokenId] {
+        &self.toks
+    }
+
+    /// Replaces the tokens of all positions (a history of the same context length).
+    pub(super) fn set_tokens(&mut self, toks: &[TokenId]) {
+        if toks.len() == self.toks.len() {
+            self.toks.copy_from_slice(toks);
+        }
+    }
+
     /// Pushes the `k + 1` rows of a restart of the full context of `slot` with the overlap
     /// `k`: `eot` at position 0, then the tokens at the positions `n_ctx - k .. n_ctx` at the
     /// positions `1..=k`. The history does not change; [`History::restart`] changes it after

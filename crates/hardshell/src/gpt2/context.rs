@@ -111,6 +111,18 @@ impl History {
         self.toks.get(pos).copied().unwrap_or(0)
     }
 
+    /// The tokens of all positions.
+    pub(crate) fn tokens(&self) -> &[usize] {
+        &self.toks
+    }
+
+    /// Replaces the tokens of all positions (a history of the same context length).
+    pub(crate) fn set_tokens(&mut self, toks: &[usize]) {
+        if toks.len() == self.toks.len() {
+            self.toks.copy_from_slice(toks);
+        }
+    }
+
     /// Restarts a full context with an overlap of `k` tokens: moves the tokens at the
     /// positions `n_ctx - k .. n_ctx` to the positions `1..=k`, puts `eot` at position 0, and
     /// pushes one row without weights for each of the positions `0..=k` of `lane`. Gives the

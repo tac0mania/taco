@@ -7,8 +7,9 @@
 
 use super::Model;
 use super::attention::KvCache;
-use super::context::{self, History, Overlap, RESTART_ROWS};
+use super::context::{self, Overlap, RESTART_ROWS};
 use super::engine::{self, Row, Work};
+use super::stream::Stream;
 use crate::error::{Error, Result};
 use crate::kernels::Kernels;
 use crate::types::TokenId;
@@ -78,8 +79,9 @@ pub struct Session<'m> {
     chunk: usize,
     /// The number of tokens in the context.
     pos: usize,
-    /// The tokens of the context, for the overlap of a restart.
-    hist: History,
+    /// The inputs: the tokens of the context (for the overlap of a restart), the length, and the
+    /// context before the last restart (for a truncation).
+    stream: Stream,
     /// One KV cache: the engine indexes caches by lane, and a session has lane 0 only.
     cache: [KvCache; 1],
     work: Work,
@@ -116,7 +118,7 @@ impl<'m> Session<'m> {
             overlap: config.overlap,
             chunk,
             pos: 0,
-            hist: History::new(model.n_ctx()),
+            stream: Stream::new(model.n_ctx()),
             cache: [KvCache::new(model)],
             work: Work::new(model, rows, chunk),
             rows: Vec::with_capacity(2 * chunk),
@@ -126,6 +128,45 @@ impl<'m> Session<'m> {
     /// Empties the context. Cost: no memory is written; old cache entries are not read again.
     pub fn reset(&mut self) {
         self.pos = 0;
+        self.stream.clear();
+    }
+
+    /// The length of the stream: the number of inputs since the last reset. The
+    /// `<|endoftext|>` row of [`Session::start_block`] is one input, and each token is one
+    /// input. The rows of a context restart are not inputs.
+    #[must_use]
+    pub fn stream_len(&self) -> usize {
+        self.stream.len()
+    }
+
+    /// The number of tokens that the session can take before its next context restart. A
+    /// draft of at most this many tokens never needs a rebuild at a [`Session::truncate`].
+    #[must_use]
+    pub fn room(&self) -> usize {
+        self.stream.room(self.pos, self.overlap.tokens())
+    }
+
+    /// Truncates the stream to its first `len` inputs (speculative decoding, ADR 0017): after
+    /// the call, the session gives the weights of a session that ran only these inputs, bit for
+    /// bit. The decoder runs a draft with [`Session::step_many`], then truncates the inputs
+    /// after the first token that differs from the draft.
+    ///
+    /// Cost: none inside the current context. A length before the last context restart runs
+    /// the rows of the old context that the new context wrote again, without the logits (module
+    /// `stream`; at most `K + 1 + d` rows for a draft of `d` tokens).
+    ///
+    /// # Errors
+    /// [`Error::BadTruncate`] if `len` is more than [`Session::stream_len`] or before the
+    /// context restart before the last one. The session does not change.
+    pub fn truncate(&mut self, len: usize) -> Result<()> {
+        self.rows.clear();
+        let cut = self.stream.plan_truncate(len, self.pos, 0, &mut self.rows)?;
+        for group in self.rows.chunks(self.work.cap()) {
+            engine::forward(self.kernels, self.model, &mut self.cache, group, &mut self.work)?;
+        }
+        self.stream.commit_truncate(&cut);
+        self.pos = cut.pos;
+        Ok(())
     }
 
     /// The number of tokens in the context.
@@ -161,7 +202,7 @@ impl<'m> Session<'m> {
         self.reset();
         context::checked(self.model, self.overlap)?;
         let eot = self.model.check_token(self.model.eot_token())?;
-        self.hist.set(0, eot);
+        self.stream.input(0, eot);
         self.rows.clear();
         self.rows.push(Row { lane: 0, pos: 0, tok: eot, out: Some(0) });
         engine::forward(self.kernels, self.model, &mut self.cache, &self.rows, &mut self.work)?;
@@ -193,6 +234,9 @@ impl<'m> Session<'m> {
     ///
     /// Cost: the multiply-adds of one `step` for each token, but each weight of the model is
     /// read from memory once for all the tokens of the call.
+    ///
+    /// This is also the draft pass of speculative decoding (ADR 0017): the known token and the
+    /// draft tokens in one call, then [`Session::truncate`] after the first wrong token.
     ///
     /// # Errors
     /// [`Error::LengthMismatch`] if `tokens` has more than [`Session::chunk`] tokens;
@@ -228,9 +272,9 @@ impl<'m> Session<'m> {
                 // PLAN(§7.7): the context starts again with <|endoftext|> and the last `k`
                 // tokens (ADR 0015). Their weights are not used, so the rows have no output
                 // slot.
-                pos = self.hist.restart(k, eot, 0, &mut self.rows);
+                pos = self.stream.restart(k, eot, 0, &mut self.rows);
             }
-            self.hist.set(pos, tok);
+            self.stream.input(pos, tok);
             self.rows.push(Row { lane: 0, pos, tok, out: Some(i) });
             pos += 1;
         }
@@ -256,6 +300,11 @@ pub struct StepWeights<'a> {
 }
 
 impl<'a> StepWeights<'a> {
+    /// The rows of `data`, `vocab` weights each.
+    pub(crate) fn new(data: &'a [u64], vocab: usize) -> Self {
+        Self { data, vocab }
+    }
+
     /// The number of rows: the number of tokens of the call.
     #[must_use]
     pub fn len(&self) -> usize {

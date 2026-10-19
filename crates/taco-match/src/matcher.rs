@@ -200,102 +200,216 @@ impl MatchModel {
         out.into_iter().map(TokenId::new).collect()
     }
 
-    /// Adds the token that the coder coded (rule 3 of the module documentation).
+    /// The predictions of the next `k` positions if each prediction is correct: item 0 is
+    /// [`MatchModel::predict`], and item `j` is the prediction that `predict` gives after
+    /// [`MatchModel::observe`] of the tokens of items `0..j`. It stops at the first position
+    /// without a prediction. It does not change the model (speculative decoding, ADR 0017).
     ///
-    /// Cost: one hash pass over the last `orders[0]` tokens, and, while the match is shorter
-    /// than the largest order, at most one verification of `verify_max` tokens for each order.
-    pub fn observe(&mut self, token: TokenId) {
-        let t = token.get();
-        if self.len > 0 {
-            if self.history.get(self.ptr) == Some(&t) {
-                self.ptr += 1;
-                self.len = (self.len + 1).min(self.params.max_len);
-            } else {
-                self.len = 0;
-            }
-        }
-        // NOTE: a position must fit in a table entry (`position + 1` in a u32). After 2^32 - 2
-        // tokens (more than a block can hold, ADR 0006) the model stops: no new entries.
-        if self.history.len() >= usize::try_from(u32::MAX - 1).unwrap_or(usize::MAX) {
-            self.len = 0;
-            return;
-        }
-        self.history.push(t);
-        let i = self.history.len();
-        let slots = self.slots(i);
-        let top = u32::from(self.params.orders[0]);
-        if self.len < top {
-            self.look_up(i, &slots);
-        }
-        let size = 1usize << self.params.hash_bits;
-        // INVARIANT: i < u32::MAX - 1 (checked above), so i + 1 fits in a u32.
-        let entry = u32::try_from(i + 1).unwrap_or(0);
-        for (o, slot) in slots.iter().enumerate() {
-            if let Some(slot) = *slot
-                && let Some(e) = self.tables.get_mut(o * size + slot)
-            {
-                *e = entry;
-            }
-        }
-    }
-
-    /// The slot of each order at position `i`, or `None` if `i` is less than the order.
-    fn slots(&self, i: usize) -> [Option<usize>; MAX_ORDERS] {
-        let mut out = [None; MAX_ORDERS];
-        let orders = self.params.orders();
-        let mut acc: u64 = 0;
-        let mut bk: u64 = 1;
-        let mut next = orders.len();
-        // Orders are decreasing, so walk them from the shortest: index next - 1.
-        for k in 1..=usize::from(orders[0]) {
-            if k > i {
-                break;
-            }
-            let tok = u64::from(self.history[i - k]);
-            acc = acc.wrapping_add((tok + 1).wrapping_mul(bk));
-            bk = bk.wrapping_mul(HASH_B);
-            while next > 0 && usize::from(orders[next - 1]) == k {
-                let x = (acc ^ (acc >> 32)).wrapping_mul(HASH_MIX);
-                let slot = x >> (64 - u32::from(self.params.hash_bits));
-                // INVARIANT: slot < 2^hash_bits <= 2^26, so it fits in a usize.
-                out[next - 1] = usize::try_from(slot).ok();
-                next -= 1;
+    /// The tokens are the draft of the decoder, and the predictions are the exact inputs of the
+    /// mixer at the draft positions: a correct token can make a longer match replace the
+    /// current match (rule 3.3), so the tokens can differ from [`MatchModel::draft`].
+    ///
+    /// Cost: the cost of `k - 1` calls of `observe`, with the table writes in a small list
+    /// (one look-up of the list for each table read, at most `orders * k` entries).
+    #[must_use]
+    pub fn speculate(&self, k: usize) -> Vec<Prediction> {
+        let mut out = Vec::with_capacity(k);
+        let mut store = Overlay {
+            history: &self.history,
+            tables: &self.tables,
+            ext: Vec::new(),
+            writes: Vec::new(),
+        };
+        let (mut ptr, mut len) = (self.ptr, self.len);
+        while out.len() < k {
+            let Some(length) = MatchLen::new(len) else { break };
+            let Some(token) = store.hist(ptr) else { break };
+            out.push(Prediction { token: TokenId::new(token), length });
+            if out.len() < k {
+                step(&self.params, &mut store, &mut ptr, &mut len, token);
             }
         }
         out
     }
 
-    /// Rule 3.3: the longest verified match at position `i`.
-    fn look_up(&mut self, i: usize, slots: &[Option<usize>; MAX_ORDERS]) {
-        let size = 1usize << self.params.hash_bits;
-        for (o, &order) in self.params.orders().iter().enumerate() {
-            let order32 = u32::from(order);
-            if order32 <= self.len {
-                break;
-            }
-            let Some(slot) = slots[o] else { continue };
-            let entry = self.tables.get(o * size + slot).copied().unwrap_or(0);
-            if entry == 0 {
-                continue;
-            }
-            let c = usize::try_from(entry - 1).unwrap_or(usize::MAX);
-            let v = self.common_suffix(c, i);
-            if v >= order32 {
-                self.ptr = c;
-                self.len = v;
-                return;
-            }
+    /// Adds the token that the coder coded (rule 3 of the module documentation).
+    ///
+    /// Cost: one hash pass over the last `orders[0]` tokens, and, while the match is shorter
+    /// than the largest order, at most one verification of `verify_max` tokens for each order.
+    pub fn observe(&mut self, token: TokenId) {
+        let mut store = Owned { history: &mut self.history, tables: &mut self.tables };
+        step(&self.params, &mut store, &mut self.ptr, &mut self.len, token.get());
+    }
+}
+
+/// The history and the tables that rule 3 reads and writes.
+trait Store {
+    /// The number of tokens in the history.
+    fn len(&self) -> usize;
+    /// The token at position `i`, or `None` if `i >= len()`.
+    fn hist(&self, i: usize) -> Option<u32>;
+    /// Appends a token to the history.
+    fn push(&mut self, t: u32);
+    /// The table entry `idx` (0 for an empty entry).
+    fn entry(&self, idx: usize) -> u32;
+    /// Writes the table entry `idx`.
+    fn set_entry(&mut self, idx: usize, v: u32);
+}
+
+/// The store of the model itself ([`MatchModel::observe`]).
+struct Owned<'a> {
+    history: &'a mut Vec<u32>,
+    tables: &'a mut Vec<u32>,
+}
+
+impl Store for Owned<'_> {
+    fn len(&self) -> usize {
+        self.history.len()
+    }
+    fn hist(&self, i: usize) -> Option<u32> {
+        self.history.get(i).copied()
+    }
+    fn push(&mut self, t: u32) {
+        self.history.push(t);
+    }
+    fn entry(&self, idx: usize) -> u32 {
+        self.tables.get(idx).copied().unwrap_or(0)
+    }
+    fn set_entry(&mut self, idx: usize, v: u32) {
+        if let Some(e) = self.tables.get_mut(idx) {
+            *e = v;
         }
     }
+}
 
-    /// The count of `k` in `1..=verify_max` with `h[c-k] = h[i-k]`, stopping at the first
-    /// difference or at the block start. Requires `c < i <= h.len()`.
-    fn common_suffix(&self, c: usize, i: usize) -> u32 {
-        let limit = usize::from(self.params.verify_max).min(c);
-        let a = &self.history[c - limit..c];
-        let b = &self.history[i - limit..i];
-        let same = a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count();
-        // INVARIANT: same <= verify_max <= u16::MAX.
-        u32::try_from(same).unwrap_or(0)
+/// A store that reads the model and keeps its own writes ([`MatchModel::speculate`]).
+struct Overlay<'a> {
+    history: &'a [u32],
+    tables: &'a [u32],
+    /// The tokens after `history`.
+    ext: Vec<u32>,
+    /// The table writes in order; the last write of an entry is its value.
+    writes: Vec<(usize, u32)>,
+}
+
+impl Store for Overlay<'_> {
+    fn len(&self) -> usize {
+        self.history.len() + self.ext.len()
     }
+    fn hist(&self, i: usize) -> Option<u32> {
+        match i.checked_sub(self.history.len()) {
+            None => self.history.get(i).copied(),
+            Some(j) => self.ext.get(j).copied(),
+        }
+    }
+    fn push(&mut self, t: u32) {
+        self.ext.push(t);
+    }
+    fn entry(&self, idx: usize) -> u32 {
+        match self.writes.iter().rev().find(|w| w.0 == idx) {
+            Some(&(_, v)) => v,
+            None => self.tables.get(idx).copied().unwrap_or(0),
+        }
+    }
+    fn set_entry(&mut self, idx: usize, v: u32) {
+        self.writes.push((idx, v));
+    }
+}
+
+/// Rule 3 for the token `t`: the match, the history and the tables of `s`.
+fn step<S: Store>(params: &MatchParams, s: &mut S, ptr: &mut usize, len: &mut u32, t: u32) {
+    if *len > 0 {
+        if s.hist(*ptr) == Some(t) {
+            *ptr += 1;
+            *len = (*len + 1).min(params.max_len);
+        } else {
+            *len = 0;
+        }
+    }
+    // NOTE: a position must fit in a table entry (`position + 1` in a u32). After 2^32 - 2
+    // tokens (more than a block can hold, ADR 0006) the model stops: no new entries.
+    if s.len() >= usize::try_from(u32::MAX - 1).unwrap_or(usize::MAX) {
+        *len = 0;
+        return;
+    }
+    s.push(t);
+    let i = s.len();
+    let slots = slots(params, s, i);
+    let top = u32::from(params.orders[0]);
+    if *len < top {
+        look_up(params, s, i, &slots, ptr, len);
+    }
+    let size = 1usize << params.hash_bits;
+    // INVARIANT: i < u32::MAX - 1 (checked above), so i + 1 fits in a u32.
+    let entry = u32::try_from(i + 1).unwrap_or(0);
+    for (o, slot) in slots.iter().enumerate() {
+        if let Some(slot) = *slot {
+            s.set_entry(o * size + slot, entry);
+        }
+    }
+}
+
+/// The slot of each order at position `i`, or `None` if `i` is less than the order.
+fn slots<S: Store>(params: &MatchParams, s: &S, i: usize) -> [Option<usize>; MAX_ORDERS] {
+    let mut out = [None; MAX_ORDERS];
+    let orders = params.orders();
+    let mut acc: u64 = 0;
+    let mut bk: u64 = 1;
+    let mut next = orders.len();
+    // Orders are decreasing, so walk them from the shortest: index next - 1.
+    for k in 1..=usize::from(orders[0]) {
+        if k > i {
+            break;
+        }
+        let tok = u64::from(s.hist(i - k).unwrap_or(0));
+        acc = acc.wrapping_add((tok + 1).wrapping_mul(bk));
+        bk = bk.wrapping_mul(HASH_B);
+        while next > 0 && usize::from(orders[next - 1]) == k {
+            let x = (acc ^ (acc >> 32)).wrapping_mul(HASH_MIX);
+            let slot = x >> (64 - u32::from(params.hash_bits));
+            // INVARIANT: slot < 2^hash_bits <= 2^26, so it fits in a usize.
+            out[next - 1] = usize::try_from(slot).ok();
+            next -= 1;
+        }
+    }
+    out
+}
+
+/// Rule 3.3: the longest verified match at position `i`.
+fn look_up<S: Store>(
+    params: &MatchParams,
+    s: &S,
+    i: usize,
+    slots: &[Option<usize>; MAX_ORDERS],
+    ptr: &mut usize,
+    len: &mut u32,
+) {
+    let size = 1usize << params.hash_bits;
+    for (o, &order) in params.orders().iter().enumerate() {
+        let order32 = u32::from(order);
+        if order32 <= *len {
+            break;
+        }
+        let Some(slot) = slots[o] else { continue };
+        let entry = s.entry(o * size + slot);
+        if entry == 0 {
+            continue;
+        }
+        let c = usize::try_from(entry - 1).unwrap_or(usize::MAX);
+        let v = common_suffix(params, s, c, i);
+        if v >= order32 {
+            *ptr = c;
+            *len = v;
+            return;
+        }
+    }
+}
+
+/// The count of `k` in `1..=verify_max` with `h[c-k] = h[i-k]`, stopping at the first
+/// difference or at the block start. Requires `c < i <= h.len()`.
+fn common_suffix<S: Store>(params: &MatchParams, s: &S, c: usize, i: usize) -> u32 {
+    let limit = usize::from(params.verify_max).min(c);
+    let same = (1..=limit).take_while(|&k| s.hist(c - k) == s.hist(i - k)).count();
+    // INVARIANT: same <= verify_max <= u16::MAX.
+    u32::try_from(same).unwrap_or(0)
 }

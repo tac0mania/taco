@@ -132,6 +132,16 @@ pub enum Error {
         /// The context length of the model.
         n_ctx: usize,
     },
+    /// A truncation of a stream (speculative decoding, ADR 0017) asks for a length that the
+    /// stream cannot go back to: more inputs than the stream has, or a length before the
+    /// context restart before the last one.
+    #[error("cannot truncate a stream of {stream_len} inputs to {len} inputs")]
+    BadTruncate {
+        /// The asked length.
+        len: usize,
+        /// The number of inputs of the stream.
+        stream_len: usize,
+    },
     /// The writer cannot make the file, because a part is too large for the format.
     #[error("cannot write the .hsm file: {reason}")]
     TooLarge {

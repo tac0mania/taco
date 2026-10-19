@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use hardshell::TokenId;
+use hardshell::gpt2::StreamState;
 
 use super::{CudaBatch, Row};
 
@@ -16,6 +17,10 @@ pub(super) struct Plan {
     pos: Vec<usize>,
     /// The new history of each slot that the call changed.
     hist: HashMap<usize, Vec<TokenId>>,
+    /// The new inputs of each slot that the call changed (ADR 0017).
+    streams: HashMap<usize, StreamState>,
+    /// The history before the last restart of each slot that restarted in the call.
+    prev: HashMap<usize, Vec<TokenId>>,
 }
 
 /// The rows of the pass that the planner fills, and the passes before it.
@@ -60,6 +65,8 @@ impl CudaBatch<'_> {
         let eot = self.model.eot_token();
         let mut pos = self.pos.clone();
         let mut hist: HashMap<usize, Vec<TokenId>> = HashMap::new();
+        let mut streams: HashMap<usize, StreamState> = HashMap::new();
+        let mut prev: HashMap<usize, Vec<TokenId>> = HashMap::new();
         let mut p = Passes {
             max_rows: self.max_rows,
             done: Vec::new(),
@@ -72,11 +79,17 @@ impl CudaBatch<'_> {
                     .get(slot * n_ctx..(slot + 1) * n_ctx)
                     .map_or_else(|| vec![TokenId::new(0); n_ctx], <[TokenId]>::to_vec)
             });
+            let st = streams
+                .entry(slot)
+                .or_insert_with(|| self.streams.get(slot).copied().unwrap_or_default());
             let mut at = pos.get(slot).copied().unwrap_or(0);
             if at >= n_ctx {
                 if p.in_pass.get(slot).copied().unwrap_or(false) {
                     p.flush();
                 }
+                // The full context before the restart, for a truncation (ADR 0017).
+                prev.insert(slot, h.clone());
+                st.restart(k);
                 // PLAN(§7.7): the context starts again with <|endoftext|> at position 0 and
                 // the last `k` tokens at 1..=k (ADR 0015). These rows answer no input.
                 // NOTE: the ranges overlap when 2k >= n_ctx; `copy_within` is a memmove.
@@ -93,13 +106,14 @@ impl CudaBatch<'_> {
             if let Some(t) = h.get_mut(at) {
                 *t = token;
             }
+            st.input(at);
             p.push(Row { slot, token, pos: at, input: Some(i) });
             if let Some(x) = pos.get_mut(slot) {
                 *x = at + 1;
             }
         }
         p.flush();
-        Plan { passes: p.done, pos, hist }
+        Plan { passes: p.done, pos, hist, streams, prev }
     }
 
     /// Keeps the positions and the histories of a plan whose passes ran.
@@ -109,6 +123,16 @@ impl CudaBatch<'_> {
         for (slot, h) in plan.hist {
             if let Some(dst) = self.hist.get_mut(slot * n_ctx..(slot + 1) * n_ctx) {
                 dst.copy_from_slice(&h);
+            }
+        }
+        for (slot, s) in plan.streams {
+            if let Some(dst) = self.streams.get_mut(slot) {
+                *dst = s;
+            }
+        }
+        for (slot, h) in plan.prev {
+            if let Some(dst) = self.prev.get_mut(slot) {
+                *dst = h;
             }
         }
     }

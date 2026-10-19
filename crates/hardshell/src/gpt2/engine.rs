@@ -86,6 +86,11 @@ impl Work {
         self.cap
     }
 
+    /// The number of output slots of `vocab` weights.
+    pub(crate) fn slots(&self, vocab: usize) -> usize {
+        self.weights.len() / vocab.max(1)
+    }
+
     /// The weights of output slot `slot`, or `None` if there is no such slot.
     pub(crate) fn weights(&self, vocab: usize, slot: usize) -> Option<&[u64]> {
         self.weights.get(slot * vocab..(slot + 1) * vocab)
