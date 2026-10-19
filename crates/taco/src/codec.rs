@@ -102,8 +102,11 @@ impl Candidate {
         self.check_stop(prefix, stop);
     }
 
+    /// Stops the candidate when its payload cannot be shorter than `stop`. This uses the lower
+    /// bound of the final coder length, not the bytes written: `finish` removes trailing zero
+    /// bytes (4,096 zero bytes code to 2 bytes, measured with the tiny model).
     fn check_stop(&mut self, prefix: usize, stop: usize) {
-        if prefix + self.encoder.bytes_written() >= stop {
+        if prefix + self.encoder.min_final_len() >= stop {
             self.live = false;
         }
     }
@@ -419,6 +422,9 @@ mod tests {
             "dasdasdasdada".repeat(30).into_bytes(),
             (0..=255u8).collect(),
             (0..600u32).flat_map(|i| [(i % 7) as u8, 0, 0, 1]).collect(),
+            // The coder writes zero bytes that `finish` removes again: the bytes written are
+            // not a lower bound of the payload (found in a review, 2026-10-19).
+            vec![0u8; 4096],
         ];
         let mut x = 0x7AC0_u64;
         inputs.push(

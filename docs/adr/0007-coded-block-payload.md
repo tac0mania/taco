@@ -69,14 +69,21 @@ of the container. Thus the conformance vectors depend on them.
    §3 rule 6). From container version 2, the encoder selects with
    `Block::choose_smallest(original length, payload, zstd frame)` (ADR 0011 §4).
 2. The encoder stops, with no payload, when the varint and the bytes that the coder has
-   already written have at least the stop length. Version 1: the stop length is the original
+   already written, without their trailing zero bytes (`Encoder::min_final_len`), have at
+   least the stop length. Version 1: the stop length is the original
    length. Version 2 (ADR 0011 §4.5): the stop length is the smaller of the original length
-   and the length of the zstd frame of the block. The coder bytes only grow, so a payload that
-   reaches the stop length loses to raw or to zstd (zstd wins a tie with coded). Thus the stop
+   and the length of the zstd frame of the block. The written bytes do not change, and
+   `finish` removes only trailing zero bytes, so the last non-zero byte stays. Thus a payload
+   that reaches the stop length loses to raw or to zstd (zstd wins a tie with coded). Thus the stop
    does not change the selected block. This saves the model time on bytes that do not compress
    (`kennedy.xls`, first 8,192 bytes: fold 11.2 s before, 4.5 s after, 6 threads, measured on
    the Mac). The rule depends only on the input, so every machine selects the same form. A
    test (`codec::tests`) compares the selected block with and without the stop.
+   Correction (2026-10-19): until then the rule used all written bytes. `finish` can remove
+   written zero bytes, so the rule stopped too early for some inputs: 4,096 zero bytes code to
+   2 bytes with the tiny model, but the encoder selected an 18-byte zstd frame (measured, found
+   in a review). Every output was valid. Only the encoder changes; decoders and the format do
+   not change.
 3. The encoder checks that the tokens give the original bytes with the vocabulary of the model
    before it codes the block. A failure is an error, not a damaged container.
 

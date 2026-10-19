@@ -22,6 +22,9 @@ pub struct Encoder {
     /// It is 0 only before the first byte.
     pending: usize,
     out: Vec<u8>,
+    /// The length of `out` up to and including its last non-zero byte.
+    /// INVARIANT: `nonzero_len <= out.len()`, and `out[nonzero_len..]` holds only zero bytes.
+    nonzero_len: usize,
     /// The number of carries into the held bytes, for the carry tests.
     #[cfg(test)]
     carries: usize,
@@ -49,6 +52,7 @@ impl Encoder {
             cache: 0,
             pending: 0,
             out: Vec::with_capacity(bytes),
+            nonzero_len: 0,
             #[cfg(test)]
             carries: 0,
         }
@@ -152,6 +156,16 @@ impl Encoder {
         self.out.len()
     }
 
+    /// A lower bound of the length that [`Encoder::finish`] gives: the bytes written so far,
+    /// without their trailing zero bytes. The written bytes do not change after they are
+    /// written, and `finish` only adds bytes and then removes trailing zero bytes, so the last
+    /// non-zero byte written so far stays in the output. [`Encoder::bytes_written`] is not a
+    /// lower bound: `finish` can remove zero bytes that are already written.
+    #[must_use]
+    pub fn min_final_len(&self) -> usize {
+        self.nonzero_len
+    }
+
     /// Shifts bytes out until `range >= 2^56`. Each step moves one byte.
     #[inline]
     fn renormalise(&mut self) {
@@ -177,9 +191,17 @@ impl Encoder {
                 }
                 // INVARIANT: a held cache byte is followed by values below (cache + 2) * 2^56
                 // at its position, so cache + carry <= 0xFF (the LZMA carry argument).
-                self.out.push(self.cache.wrapping_add(carry));
+                let first = self.cache.wrapping_add(carry);
+                self.out.push(first);
+                if first != 0 {
+                    self.nonzero_len = self.out.len();
+                }
                 // 0xFF + 1 is 0x00 with the carry going into the cache byte above.
-                self.out.extend(repeat_n(0xFFu8.wrapping_add(carry), self.pending - 1));
+                let fill = 0xFFu8.wrapping_add(carry);
+                self.out.extend(repeat_n(fill, self.pending - 1));
+                if fill != 0 && self.pending > 1 {
+                    self.nonzero_len = self.out.len();
+                }
             }
             self.cache = top_byte(window);
             self.pending = 0;
@@ -211,6 +233,48 @@ mod tests {
     fn decode_all(t: &FreqTable, bytes: &[u8], n: usize) -> Vec<u32> {
         let mut d = Decoder::new(bytes);
         (0..n).map(|_| d.decode(t).get()).collect()
+    }
+
+    /// Checks `min_final_len` after each symbol: it is the written bytes without trailing zero
+    /// bytes, and it is never more than the length that `finish` gives.
+    fn check_min_final_len(t: &FreqTable, symbols: &[u32]) {
+        let mut e = Encoder::new();
+        let mut bounds = Vec::new();
+        for &s in symbols {
+            e.encode(t, Symbol::new(s)).unwrap();
+            let trimmed = e.out.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+            assert_eq!(e.min_final_len(), trimmed);
+            bounds.push(e.min_final_len());
+        }
+        let len = e.finish().len();
+        assert!(bounds.iter().all(|&b| b <= len), "{bounds:?} > {len}");
+    }
+
+    #[test]
+    fn min_final_len_is_a_lower_bound_when_zero_bytes_are_removed() {
+        // A symbol with almost all of the range writes zero bytes that `finish` removes.
+        let t = table(&[15, 1], 4);
+        let mut e = Encoder::new();
+        for _ in 0..20_000 {
+            e.encode(&t, Symbol::new(0)).unwrap();
+        }
+        assert!(e.bytes_written() > 0);
+        assert_eq!(e.min_final_len(), 0);
+        assert!(e.finish().is_empty());
+        check_min_final_len(&t, &[0; 20_000]);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn min_final_len_never_exceeds_the_final_length(
+            symbols in proptest::collection::vec(0u32..3, 0..3000),
+            top in proptest::bool::ANY,
+        ) {
+            // `top` puts most of the range on the last symbol, which makes runs of 0xFF and
+            // carries; otherwise the first symbol has most of the range, which makes zero bytes.
+            let freqs = if top { [1, 1, (1 << 20) - 2] } else { [(1 << 20) - 2, 1, 1] };
+            check_min_final_len(&table(&freqs, 20), &symbols);
+        }
     }
 
     #[test]
