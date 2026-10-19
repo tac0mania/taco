@@ -150,6 +150,9 @@ check before commercial use; the business validation steps (customer conversatio
   - `bench-whole-gpu`: starts after `overlap-speed`. All 23 whole files (profile text, CUDA),
     then 6 logs and twitter.json (profile logs). Binary: the overlap tree (not committed).
     Output: `~/bench/whole-gpu/results.tsv` (the last line is DONE).
+- Owner decision (2026-10-19): fine-tuned models (Route A, per-customer fine-tunes,
+  `taco train`) are frozen. The profile `logs` with `gpt2.hsm` stays. The main advantage is
+  cross-hardware bit-exactness; work on it has priority (product-v1.md §4 items 6 and 7).
 - Owner decision (2026-10-19): English only. Non-English text is not a goal; do not build a
   non-English fallback.
 - Next: read the results, resume the overlap work (note, block size, ADRs), commit it. Then

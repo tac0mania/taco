@@ -60,3 +60,11 @@ team decides before the release.
 3. **Platforms for version 1.** All of §1 where possible: macOS (ARM, x86), Linux (x86, ARM),
    Windows (x86).
 4. **Windows.** Native Windows builds and tests on the Windows side of devbox are permitted.
+5. **English only** (2026-10-19). Non-English text is not a goal.
+6. **Fine-tuned models are frozen** (2026-10-19). Route A (the log-fine-tuned distilgpt2), per-
+   customer fine-tunes and `taco train` get no more work and do not ship in version 1. The
+   results stay in `docs/research/2026-10-19-route-a.md` and `2026-10-19-calibration.md`. The
+   profile `logs` stays: it uses `gpt2.hsm` with the match model and the mixer.
+7. **The main advantage is cross-hardware bit-exactness** (2026-10-19). A file that one machine
+   compresses decompresses on every other machine: CPU (x86, ARM), NVIDIA, AMD, Apple and Intel
+   GPUs. Work that proves or extends this has priority.
