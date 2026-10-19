@@ -25,8 +25,11 @@ use crate::model::CudaModel;
 use crate::ops::MatKernel;
 
 mod fused;
+mod mixed;
 mod plan;
 mod record;
+
+pub(crate) use mixed::Mixing;
 
 /// A question to the coder op for one input (see [`CudaBatch::run_coded`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +65,24 @@ enum Out {
     Weights,
     /// The coder interval of each row (with `freq_bits`).
     Intervals(u32),
+    /// The mixer statistics of each row, then (after the host step) the coder interval of the
+    /// mixed weights of each row (with `freq_bits`). See `mixed`.
+    Mixed(u32),
+}
+
+/// What a call asks of each pass: the output, the coder query words of the inputs, and for
+/// [`Out::Mixed`] the predictions and the host step of the mixer.
+struct Ask<'q, 'm> {
+    out: Out,
+    queries: &'q [(u32, u32)],
+    mixing: Option<&'q mut Mixing<'m>>,
+}
+
+impl<'q> Ask<'q, '_> {
+    /// A call with no mixer.
+    fn new(out: Out, queries: &'q [(u32, u32)]) -> Self {
+        Self { out, queries, mixing: None }
+    }
 }
 
 /// One row of a pass: a token of a slot at a position. `input` is the index of the input that
@@ -102,6 +123,12 @@ struct Bufs {
     stamps: DevBuf,
     /// The row groups of `attend_rows`: (first row, count) for each group.
     groups: DevBuf,
+    /// The mix record of each row (8 u32 words, `kernels/hardshell.cu`).
+    mix: DevBuf,
+    /// The mixer statistics of each row: W, w[p] and the top token (u64).
+    stats: DevBuf,
+    /// The intervals of GPT-2 alone of a dual mixed pass (symbol, start, freq).
+    plain: DevBuf,
 }
 
 /// Many sessions of one model on one CUDA device.
@@ -184,10 +211,13 @@ const ATTEND_SMEM_CTX: u32 = 1024;
 /// The most timer marks of one profiled pass.
 const MAX_STAMPS: usize = 1024;
 
-/// The key of a recorded graph: the number of rows, the output (0: no coder op; otherwise
-/// `freq_bits` of the coder op), and the number of row groups of the attention (0: one block for
-/// each row).
+/// The key of a recorded graph: the number of rows, the output (0: no coder op; `MIXED_GRAPH`:
+/// the mixer statistics; otherwise `freq_bits` of the coder op), and the number of row groups of
+/// the attention (0: one block for each row).
 type GraphKey = (u32, u32, u32);
+
+/// The output part of the key of a graph that ends with the mixer statistics (above 32).
+const MIXED_GRAPH: u32 = 64;
 
 impl<'m> CudaBatch<'m> {
     /// Makes a batch of `slots` sessions with empty contexts, and work buffers for passes of
@@ -231,6 +261,9 @@ impl<'m> CudaBatch<'m> {
             2 * r * us(d.vocab),
             8 * r * us(d.vocab.div_ceil(LOGIT_TILE)),
             8 * r,
+            32 * r,
+            24 * r,
+            24 * r,
         ];
         let mut it = sizes.iter().map(|&s| dev.zeroed(s));
         let mut next = || it.next().unwrap_or_else(|| dev.zeroed(0));
@@ -252,6 +285,9 @@ impl<'m> CudaBatch<'m> {
             d16: next()?,
             tmax: next()?,
             groups: next()?,
+            mix: next()?,
+            stats: next()?,
+            plain: next()?,
         };
         let cache = slots * us(ctx4) * us(d.d);
         let kv = (0..d.n_layer)
@@ -391,7 +427,7 @@ impl<'m> CudaBatch<'m> {
     /// position changed.
     pub fn run_weights(&mut self, inputs: &[(usize, TokenId)]) -> Result<Vec<u64>> {
         let mut out = vec![0u64; inputs.len() * self.model.vocab_size()];
-        self.run(inputs, Out::Weights, &mut out, &[], None)?;
+        self.run(inputs, Ask::new(Out::Weights, &[]), &mut out, None)?;
         Ok(out)
     }
 
@@ -414,41 +450,10 @@ impl<'m> CudaBatch<'m> {
         if queries.len() != inputs.len() {
             return Err(Error::LengthMismatch { expected: inputs.len(), found: queries.len() });
         }
-        let vocab = self.model.dims.vocab;
-        if freq_bits == 0 || freq_bits > 32 || u64::from(vocab) > 1u64 << freq_bits {
-            return Err(Error::Unsupported {
-                reason: "freq_bits must be in 1..=32 and 2^freq_bits >= vocab",
-            });
-        }
-        let total = 1u64 << freq_bits;
-        let mut q = Vec::with_capacity(queries.len());
-        for query in queries {
-            q.push(match *query {
-                CoderQuery::Encode(t) if t.get() < vocab => (0, t.get()),
-                CoderQuery::Decode(x) if x < total => (1, u32::try_from(x).unwrap_or(u32::MAX)),
-                _ => {
-                    return Err(Error::Unsupported {
-                        reason: "a coder token or target is out of range",
-                    });
-                }
-            });
-        }
+        let q = coder_words(queries, self.model.dims.vocab, freq_bits)?;
         let mut raw = vec![0u64; 3 * inputs.len()];
-        self.run(inputs, Out::Intervals(freq_bits), &mut raw, &q, None)?;
-        Ok(raw
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .map(|w| {
-                let sym = u32::try_from(w[0]).unwrap_or(u32::MAX);
-                CoderInterval {
-                    symbol: TokenId::new(sym),
-                    start: w[1],
-                    freq: w[2],
-                    is_last: sym + 1 == vocab,
-                }
-            })
-            .collect())
+        self.run(inputs, Ask::new(Out::Intervals(freq_bits), &q), &mut raw, None)?;
+        Ok(intervals_of(&raw, self.model.dims.vocab))
     }
 
     /// Runs the inputs and waits, with no read back. For measurements.
@@ -456,7 +461,7 @@ impl<'m> CudaBatch<'m> {
     /// # Errors
     /// The errors of [`CudaBatch::run_weights`].
     pub fn run_without_readback(&mut self, inputs: &[(usize, TokenId)]) -> Result<()> {
-        self.run(inputs, Out::Nothing, &mut [], &[], None)
+        self.run(inputs, Ask::new(Out::Nothing, &[]), &mut [], None)
     }
 
     /// Runs the inputs as [`CudaBatch::run_coded`] does (with encode queries of token 0 and
@@ -469,7 +474,7 @@ impl<'m> CudaBatch<'m> {
     pub fn profile(&mut self, inputs: &[(usize, TokenId)]) -> Result<Vec<(&'static str, u64)>> {
         let mut prof = Vec::new();
         let queries = vec![(0, 0); inputs.len()];
-        self.run(inputs, Out::Intervals(32), &mut [], &queries, Some(&mut prof))?;
+        self.run(inputs, Ask::new(Out::Intervals(32), &queries), &mut [], Some(&mut prof))?;
         Ok(prof)
     }
 
@@ -477,11 +482,11 @@ impl<'m> CudaBatch<'m> {
     fn run(
         &mut self,
         inputs: &[(usize, TokenId)],
-        out: Out,
+        ask: Ask<'_, '_>,
         sink: &mut [u64],
-        queries: &[(u32, u32)],
         mut prof: Option<&mut Vec<(&'static str, u64)>>,
     ) -> Result<()> {
+        let Ask { out, queries, mut mixing } = ask;
         let vocab = self.model.dims.vocab;
         for &(slot, tok) in inputs {
             if slot >= self.slots {
@@ -496,7 +501,10 @@ impl<'m> CudaBatch<'m> {
         }
         let plan = self.plan(inputs);
         for pass in &plan.passes {
-            if let Out::Intervals(_) = out {
+            if let (Out::Mixed(_), Some(m)) = (out, mixing.as_deref()) {
+                self.write_predictions(pass, m)?;
+            }
+            if let Out::Intervals(_) | Out::Mixed(_) = out {
                 let mut words = Vec::with_capacity(4 * pass.len());
                 for row in pass {
                     let (kind, v) =
@@ -506,6 +514,9 @@ impl<'m> CudaBatch<'m> {
                 self.model.dev.ctx.write(&self.b.queries, 0, &u32_bytes(&words))?;
             }
             self.forward(pass, out, prof.as_deref_mut())?;
+            if let (Out::Mixed(bits), Some(m)) = (out, mixing.as_deref_mut()) {
+                self.mix_pass(pass, bits, m)?;
+            }
             self.collect(pass, out, sink)?;
         }
         self.commit(plan);
@@ -518,7 +529,7 @@ impl<'m> CudaBatch<'m> {
         let (per_row, buf) = match out {
             Out::Nothing => return ctx.synchronize(),
             Out::Weights => (self.model.vocab_size(), &self.b.weights),
-            Out::Intervals(_) => (3, &self.b.intervals),
+            Out::Intervals(_) | Out::Mixed(_) => (3, &self.b.intervals),
         };
         let mut bytes = vec![0u8; 8 * per_row * pass.len()];
         ctx.read(buf, &mut bytes)?;
@@ -587,7 +598,12 @@ impl<'m> CudaBatch<'m> {
             }
             return Ok(());
         }
-        let key: GraphKey = (n, if let Out::Intervals(bits) = out { bits } else { 0 }, groups);
+        let shape = match out {
+            Out::Intervals(bits) => bits,
+            Out::Mixed(_) => MIXED_GRAPH,
+            Out::Nothing | Out::Weights => 0,
+        };
+        let key: GraphKey = (n, shape, groups);
         let mut graphs = self.graphs.borrow_mut();
         let graph = match graphs.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -602,4 +618,47 @@ impl<'m> CudaBatch<'m> {
         };
         dev.ctx.launch_graph(graph)
     }
+}
+
+/// The query words of the coder op (kind, value) for `queries`.
+///
+/// # Errors
+/// [`Error::Unsupported`] if `freq_bits` is not in `1..=32`, `2^freq_bits` is less than the
+/// vocabulary, or a token or target is out of range.
+pub(crate) fn coder_words(
+    queries: &[CoderQuery],
+    vocab: u32,
+    freq_bits: u32,
+) -> Result<Vec<(u32, u32)>> {
+    if freq_bits == 0 || freq_bits > 32 || u64::from(vocab) > 1u64 << freq_bits {
+        return Err(Error::Unsupported {
+            reason: "freq_bits must be in 1..=32 and 2^freq_bits >= vocab",
+        });
+    }
+    let total = 1u64 << freq_bits;
+    queries
+        .iter()
+        .map(|query| match *query {
+            CoderQuery::Encode(t) if t.get() < vocab => Ok((0, t.get())),
+            CoderQuery::Decode(x) if x < total => Ok((1, u32::try_from(x).unwrap_or(u32::MAX))),
+            _ => Err(Error::Unsupported { reason: "a coder token or target is out of range" }),
+        })
+        .collect()
+}
+
+/// The intervals of the raw output of the coder op: symbol, start and freq for each input.
+pub(crate) fn intervals_of(raw: &[u64], vocab: u32) -> Vec<CoderInterval> {
+    raw.as_chunks::<3>()
+        .0
+        .iter()
+        .map(|w| {
+            let sym = u32::try_from(w[0]).unwrap_or(u32::MAX);
+            CoderInterval {
+                symbol: TokenId::new(sym),
+                start: w[1],
+                freq: w[2],
+                is_last: sym.checked_add(1) == Some(vocab),
+            }
+        })
+        .collect()
 }

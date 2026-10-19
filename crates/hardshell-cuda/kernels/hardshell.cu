@@ -1378,12 +1378,14 @@ struct WeightSrc {
     }
 };
 
-__device__ __forceinline__ u64 freq_at(const WeightSrc& w, u32 i, bool zero, u64 wsum, u64 spare, u64 frac, u32 largest, u64 rem) {
+template <class Src>
+__device__ __forceinline__ u64 freq_at(const Src& w, u32 i, bool zero, u64 wsum, u64 spare, u64 frac, u32 largest, u64 rem) {
     const u64 wi = zero ? 1 : w.at(i);
     return 1 + (frac ? quot_fast(wi, wsum, spare, frac) : quot(wi, wsum, spare)) + (i == largest ? rem : 0);
 }
 
-__device__ void coder_body(WeightSrc w, const u32* __restrict__ queries, u64* __restrict__ out, u32 vocab, u64 total) {
+template <class Src>
+__device__ void coder_body(const Src& w, const u32* __restrict__ queries, u64* __restrict__ out, u32 vocab, u64 total) {
     __shared__ u64 cs[256];
     __shared__ u64 bw[256];
     __shared__ u32 bi[256];
@@ -1423,7 +1425,9 @@ __device__ void coder_body(WeightSrc w, const u32* __restrict__ queries, u64* __
         __syncthreads();
     }
     if (t == 0) {
-        // INVARIANT: weights <= 2^40 and vocab <= 2^20, so the u64 sum cannot overflow.
+        // INVARIANT: the u64 sum cannot overflow: GPT-2 weights are at most 2^40 and vocab <= 2^20;
+        // the mixed weights of MixedSrc are below 2^62 with a sum below 2^63 (ADR 0010 section 3).
+        // quot and quot_fast are exact for every big_w < 2^64.
         zero_s = cs[0] == 0;
         wsum_s = cs[0] == 0 ? vocab : cs[0];
         // Rule 1: with all weights 0, symbol 0 is the largest. Otherwise the largest weight
@@ -1498,11 +1502,10 @@ extern "C" __global__ void __launch_bounds__(256) coder_interval(const u64* __re
     coder_body(w, queries, out, vocab, total);
 }
 
-// Fused: logits_weights and coder_interval. Pass 0 finds the row max (as logits_weights); the
-// passes of the coder read each weight from the logit and the table. One block of 256 for each row.
-extern "C" __global__ void __launch_bounds__(256) coder_logits(const i64* __restrict__ logit, const u64* __restrict__ logits_exp,
-                                                               const u32* __restrict__ queries, u64* __restrict__ out, u32 vocab,
-                                                               u32 table_len, u64 total) {
+// The weights of one row from the logits and the table of logits_weights: pass 0 finds the row max
+// (as logits_weights). One block of 256 for each row.
+__device__ __forceinline__ WeightSrc src_logits(const i64* __restrict__ logit, const u64* __restrict__ logits_exp, u32 vocab,
+                                                u32 table_len) {
     __shared__ i64 red[8];
     const u32 t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const i64* l = logit + (u64)blockIdx.x * vocab;
@@ -1515,17 +1518,16 @@ extern "C" __global__ void __launch_bounds__(256) coder_logits(const i64* __rest
 #pragma unroll
     for (u32 k = 1; k < 8; k++) m = red[k] > m ? red[k] : m;
     WeightSrc w = {nullptr, l, nullptr, nullptr, logits_exp, m, table_len};
-    coder_body(w, queries, out, vocab, total);
+    return w;
 }
 
-// Fused: logits_weights and coder_interval on the compact logits of gemm_tc*_logits (d16, tmax with
-// `tiles` tiles of 128 columns for each row). The row max is the max of the tile maxima; the weight
-// of column i is table[min((max - tm) + d, len - 1)] (see gemm_tc_body), the expression of
-// logits_weights. off[tile] = min(max - tm, len - 1) keeps the sum small; it does not change the
-// clamped index. One block of 256 for each row; tiles <= CODER_TILES.
-extern "C" __global__ void __launch_bounds__(256) coder_d16(const u16* __restrict__ d16, const i64* __restrict__ tmax, const u64* __restrict__ logits_exp,
-                                                            const u32* __restrict__ queries, u64* __restrict__ out, u32 vocab, u32 tiles,
-                                                            u32 table_len, u64 total) {
+// The weights of one row from the compact logits of gemm_tc*_logits (d16, tmax with `tiles` tiles of
+// 128 columns for each row). The row max is the max of the tile maxima; the weight of column i is
+// table[min((max - tm) + d, len - 1)] (see gemm_tc_body), the expression of logits_weights.
+// off[tile] = min(max - tm, len - 1) keeps the sum small; it does not change the clamped index. One
+// block of 256 for each row; tiles <= CODER_TILES.
+__device__ __forceinline__ WeightSrc src_d16(const u16* __restrict__ d16, const i64* __restrict__ tmax,
+                                             const u64* __restrict__ logits_exp, u32 vocab, u32 tiles, u32 table_len) {
     __shared__ i64 red[8];
     __shared__ u32 off[CODER_TILES];
     const u32 t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -1545,5 +1547,156 @@ extern "C" __global__ void __launch_bounds__(256) coder_d16(const u16* __restric
     }
     __syncthreads();
     WeightSrc w = {nullptr, nullptr, d16 + (u64)blockIdx.x * vocab, off, logits_exp, m, table_len};
+    return w;
+}
+
+// Fused: logits_weights and coder_interval. The passes of the coder read each weight from the logit
+// and the table. One block of 256 for each row.
+extern "C" __global__ void __launch_bounds__(256) coder_logits(const i64* __restrict__ logit, const u64* __restrict__ logits_exp,
+                                                               const u32* __restrict__ queries, u64* __restrict__ out, u32 vocab,
+                                                               u32 table_len, u64 total) {
+    const WeightSrc w = src_logits(logit, logits_exp, vocab, table_len);
+    coder_body(w, queries, out, vocab, total);
+}
+
+// Fused: logits_weights and coder_interval on the compact logits of gemm_tc*_logits (src_d16).
+extern "C" __global__ void __launch_bounds__(256) coder_d16(const u16* __restrict__ d16, const i64* __restrict__ tmax, const u64* __restrict__ logits_exp,
+                                                            const u32* __restrict__ queries, u64* __restrict__ out, u32 vocab, u32 tiles,
+                                                            u32 table_len, u64 total) {
+    const WeightSrc w = src_d16(d16, tmax, logits_exp, vocab, tiles, table_len);
+    coder_body(w, queries, out, vocab, total);
+}
+
+// ---------------------------------------------------------------- the mixer of the logs profile
+
+// The mixer of ADR 0010 section 3 (taco_match::Mixer) runs in two parts with a host step between
+// them. The match model and the adaptive state of the mixer stay on the host.
+//
+// 1. mix_stats_*: for each row, out = (W, w[p], top) of the GPT-2 weights w: W = sum(w), w[p] for
+//    the prediction p of the row (0 without a prediction), and top = the token with the largest
+//    weight, the lowest id on a tie, or 0 if every weight is 0 (rule 1 to 3 of Mixer::mix: the
+//    loop that keeps the first strictly larger weight, starting at token 0 with weight 0).
+// 2. The host computes q from (W, w[p], top == p) with the mixer state, then R = max(W - w[p], 1),
+//    m = 2^16 - q, k = max(0, bitlen(R) + 16 - 62) and w'[p] = max(1, (R * q) >> k) (rule 5).
+// 3. coder_mixed_*: the coder interval of from_weights(w'), with w'[i] = max(1, (w[i] * m) >> k)
+//    for i != p, and w'[i] = max(1, w[i]) for a row without a prediction (rule 1). A plain row
+//    (a block of GPT-2 alone in the same pass) has w' = w: the table of coder_interval.
+//
+// The mix record of a row: 8 u32 words: p (MIX_NONE: no prediction; MIX_PLAIN: a plain row), k,
+// m, 0, w'[p] (low word, high word), 0, 0. The stats kernel reads only p.
+#define MIX_NONE 0xffffffffu
+#define MIX_PLAIN 0xfffffffeu
+
+struct MixedSrc {
+    WeightSrc base;
+    u32 p, k;
+    u64 m, wp;
+    __device__ __forceinline__ u64 at(u32 i) const {
+        const u64 w = base.at(i);
+        if (p == MIX_PLAIN) return w;
+        if (p == MIX_NONE) return w > 1 ? w : 1;
+        if (i == p) return wp;
+        // INVARIANT: w <= R for i != p, m <= 2^16 and k = max(0, bitlen(R) + 16 - 62) < 128, so
+        // (w * m) >> k < 2^62 and fits in u64: the value of the u128 and u64 loops of Mixer::mix.
+        const u64 v = (u64)(((u128)w * m) >> k);
+        return v > 1 ? v : 1;
+    }
+};
+
+__device__ __forceinline__ MixedSrc mixed_of(const WeightSrc& base, const u32* __restrict__ mix) {
+    const u32* r = mix + 8 * (u64)blockIdx.x;
+    MixedSrc s;
+    s.base = base;
+    s.p = r[0];
+    s.k = r[1];
+    s.m = r[2];
+    s.wp = (u64)r[4] | ((u64)r[5] << 32);
+    return s;
+}
+
+// Part 1. One block of 256 for each row. Each thread reads the ids t, t + 256, ... in increasing
+// order, so `>` keeps the lowest id of a tie; the reduction keeps the lower id of two equal maxima.
+// INVARIANT: GPT-2 weights are at most 2^40 and vocab <= 2^20, so the u64 sum is exact (the u128
+// sum of Mixer::mix has the same value).
+__device__ void mix_stats_body(const WeightSrc& w, const u32* __restrict__ mix, u64* __restrict__ out, u32 vocab) {
+    __shared__ u64 cs[256];
+    __shared__ u64 bw[256];
+    __shared__ u32 bi[256];
+    const u32 t = threadIdx.x, row = blockIdx.x;
+    u64 s = 0, best = 0;
+    u32 besti = 0xffffffffu;
+    for (u32 i = t; i < vocab; i += 256) {
+        const u64 wi = w.at(i);
+        s += wi;
+        if (besti == 0xffffffffu || wi > best) {
+            best = wi;
+            besti = i;
+        }
+    }
+    cs[t] = s;
+    bw[t] = best;
+    bi[t] = besti;
+    __syncthreads();
+    for (u32 h = 128; h > 0; h >>= 1) {
+        if (t < h) {
+            cs[t] += cs[t + h];
+            const bool other_valid = bi[t + h] != 0xffffffffu;
+            const bool mine_valid = bi[t] != 0xffffffffu;
+            if (other_valid && (!mine_valid || bw[t + h] > bw[t] || (bw[t + h] == bw[t] && bi[t + h] < bi[t]))) {
+                bw[t] = bw[t + h];
+                bi[t] = bi[t + h];
+            }
+        }
+        __syncthreads();
+    }
+    if (t == 0) {
+        const u32 p = mix[8 * (u64)row];
+        out[3 * (u64)row] = cs[0];
+        out[3 * (u64)row + 1] = p < vocab ? w.at(p) : 0;
+        out[3 * (u64)row + 2] = cs[0] == 0 ? 0 : bi[0];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) mix_stats_weights(const u64* __restrict__ weights, const u32* __restrict__ mix,
+                                                                    u64* __restrict__ out, u32 vocab) {
+    WeightSrc w = {weights + (u64)blockIdx.x * vocab, nullptr, nullptr, nullptr, nullptr, 0, 0};
+    mix_stats_body(w, mix, out, vocab);
+}
+
+extern "C" __global__ void __launch_bounds__(256) mix_stats_logits(const i64* __restrict__ logit, const u64* __restrict__ logits_exp,
+                                                                   const u32* __restrict__ mix, u64* __restrict__ out, u32 vocab,
+                                                                   u32 table_len) {
+    const WeightSrc w = src_logits(logit, logits_exp, vocab, table_len);
+    mix_stats_body(w, mix, out, vocab);
+}
+
+extern "C" __global__ void __launch_bounds__(256) mix_stats_d16(const u16* __restrict__ d16, const i64* __restrict__ tmax,
+                                                                const u64* __restrict__ logits_exp, const u32* __restrict__ mix,
+                                                                u64* __restrict__ out, u32 vocab, u32 tiles, u32 table_len) {
+    const WeightSrc w = src_d16(d16, tmax, logits_exp, vocab, tiles, table_len);
+    mix_stats_body(w, mix, out, vocab);
+}
+
+// Part 3: the coder interval of the mixed weights (coder_body with MixedSrc).
+extern "C" __global__ void __launch_bounds__(256) coder_mixed_weights(const u64* __restrict__ weights, const u32* __restrict__ mix,
+                                                                      const u32* __restrict__ queries, u64* __restrict__ out, u32 vocab,
+                                                                      u64 total) {
+    WeightSrc base = {weights + (u64)blockIdx.x * vocab, nullptr, nullptr, nullptr, nullptr, 0, 0};
+    const MixedSrc w = mixed_of(base, mix);
+    coder_body(w, queries, out, vocab, total);
+}
+
+extern "C" __global__ void __launch_bounds__(256) coder_mixed_logits(const i64* __restrict__ logit, const u64* __restrict__ logits_exp,
+                                                                     const u32* __restrict__ mix, const u32* __restrict__ queries,
+                                                                     u64* __restrict__ out, u32 vocab, u32 table_len, u64 total) {
+    const MixedSrc w = mixed_of(src_logits(logit, logits_exp, vocab, table_len), mix);
+    coder_body(w, queries, out, vocab, total);
+}
+
+extern "C" __global__ void __launch_bounds__(256) coder_mixed_d16(const u16* __restrict__ d16, const i64* __restrict__ tmax,
+                                                                  const u64* __restrict__ logits_exp, const u32* __restrict__ mix,
+                                                                  const u32* __restrict__ queries, u64* __restrict__ out, u32 vocab,
+                                                                  u32 tiles, u32 table_len, u64 total) {
+    const MixedSrc w = mixed_of(src_d16(d16, tmax, logits_exp, vocab, tiles, table_len), mix);
     coder_body(w, queries, out, vocab, total);
 }

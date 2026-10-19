@@ -11,10 +11,13 @@
 //! - `gemm_tc64_logits`, `gemm_tc128_logits` with `coder_d16`: the logits product,
 //!   `logits_scale`, `logits_weights` and `coder_interval`, with compact logits (u16 differences to
 //!   the max of each 128-column tile) between the two kernels.
+//! - The mixed coder op (`batch::mixed`): `mix_stats_logits` or `mix_stats_d16`, then
+//!   `coder_mixed_logits` or `coder_mixed_d16`, on the same two sources.
 //!
 //! ADR 0013 permits a fused kernel only with a test that proves it equal to the op-level path:
 //! `tests/fused.rs` runs both paths on the same inputs and compares every weight and interval.
 
+use super::mixed::MixSrc;
 use super::{CODER_TILES, CudaBatch, LOGIT_TILE, NORM_THREADS, Out, Stamps, mark};
 use crate::driver::{Arg, DevBuf};
 use crate::error::Result;
@@ -64,24 +67,36 @@ impl CudaBatch<'_> {
             self.residual_norm(&l.mlp_proj, next, n, z)?;
             op("residual norm")?;
         }
-        if let Out::Intervals(bits) = out
+        if let Out::Intervals(_) | Out::Mixed(_) = out
             && self.compact_logits(kernel, n)?
         {
             op("matmul logits")?;
-            self.coder_d16(n, bits)?;
-            op("coder interval")?;
+            if let Out::Intervals(bits) = out {
+                self.coder_d16(n, bits, &self.b.intervals)?;
+                op("coder interval")?;
+            } else {
+                self.mix_stats(MixSrc::D16, n)?;
+                op("mix stats")?;
+            }
             return Ok(());
         }
         self.matmul(kernel, &model.wte, &b.a, n, false)?;
         op("matmul logits")?;
         self.logits_scale(n)?;
         op("logits")?;
-        if let Out::Intervals(bits) = out {
-            self.coder_logits(n, bits)?;
-            op("coder interval")?;
-        } else {
-            self.logits_weights(n)?;
-            op("logits")?;
+        match out {
+            Out::Intervals(bits) => {
+                self.coder_logits(n, bits, &self.b.intervals)?;
+                op("coder interval")?;
+            }
+            Out::Mixed(_) => {
+                self.mix_stats(MixSrc::Logits, n)?;
+                op("mix stats")?;
+            }
+            Out::Nothing | Out::Weights => {
+                self.logits_weights(n)?;
+                op("logits")?;
+            }
         }
         Ok(())
     }
@@ -92,18 +107,10 @@ impl CudaBatch<'_> {
     /// otherwise.
     fn compact_logits(&self, kernel: MatKernel, n: u32) -> Result<bool> {
         let m = self.model;
-        let k = &m.dev.k;
-        let f = match kernel {
-            MatKernel::TensorCore64 => &k.gemm_tc64_logits,
-            MatKernel::TensorCore128 => &k.gemm_tc128_logits,
-            _ => return Ok(false),
-        };
+        let Some(f) = self.compact_kernel(kernel) else { return Ok(false) };
         let (tm, tn, _) = kernel.tile();
         let wte = &m.wte;
         let tiles = wte.rows.div_ceil(tn);
-        if tn != LOGIT_TILE || m.logits_len > 1 << 16 || tiles > CODER_TILES {
-            return Ok(false);
-        }
         m.dev.ctx.launch(
             f,
             (n.div_ceil(tm), tiles, 1),
@@ -125,7 +132,23 @@ impl CudaBatch<'_> {
         Ok(true)
     }
 
-    fn coder_d16(&self, n: u32, bits: u32) -> Result<()> {
+    /// The logits kernel with the compact epilogue for `kernel` products, if the pass can use
+    /// it (the conditions of [`CudaBatch::compact_logits`]).
+    pub(super) fn compact_kernel(&self, kernel: MatKernel) -> Option<&crate::driver::Kernel> {
+        let m = self.model;
+        let k = &m.dev.k;
+        let f = match kernel {
+            MatKernel::TensorCore64 => &k.gemm_tc64_logits,
+            MatKernel::TensorCore128 => &k.gemm_tc128_logits,
+            _ => return None,
+        };
+        let (_, tn, _) = kernel.tile();
+        let tiles = m.wte.rows.div_ceil(tn);
+        (tn == LOGIT_TILE && m.logits_len <= 1 << 16 && tiles <= CODER_TILES).then_some(f)
+    }
+
+    /// The fused coder op of `n` rows on the compact logits, into `out`.
+    pub(super) fn coder_d16(&self, n: u32, bits: u32, out: &DevBuf) -> Result<()> {
         let m = self.model;
         let b = &self.b;
         m.dev.launch(
@@ -137,7 +160,7 @@ impl CudaBatch<'_> {
                 Arg::Ptr(b.tmax.ptr()),
                 Arg::Ptr(m.logits_exp.ptr()),
                 Arg::Ptr(b.queries.ptr()),
-                Arg::Ptr(b.intervals.ptr()),
+                Arg::Ptr(out.ptr()),
                 Arg::U32(m.dims.vocab),
                 Arg::U32(m.dims.vocab.div_ceil(LOGIT_TILE)),
                 Arg::U32(m.logits_len),
@@ -234,7 +257,8 @@ impl CudaBatch<'_> {
         )
     }
 
-    fn coder_logits(&self, n: u32, bits: u32) -> Result<()> {
+    /// The fused coder op of `n` rows on the i64 logits, into `out`.
+    pub(super) fn coder_logits(&self, n: u32, bits: u32, out: &DevBuf) -> Result<()> {
         let m = self.model;
         let b = &self.b;
         m.dev.launch(
@@ -245,7 +269,7 @@ impl CudaBatch<'_> {
                 Arg::Ptr(b.logit.ptr()),
                 Arg::Ptr(m.logits_exp.ptr()),
                 Arg::Ptr(b.queries.ptr()),
-                Arg::Ptr(b.intervals.ptr()),
+                Arg::Ptr(out.ptr()),
                 Arg::U32(m.dims.vocab),
                 Arg::U32(m.logits_len),
                 Arg::U64(1u64 << bits),

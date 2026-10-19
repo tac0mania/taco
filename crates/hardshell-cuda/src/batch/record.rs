@@ -1,6 +1,7 @@
 //! The op-level path of a pass: one kernel for each op (ADR 0013), and the launches that both
 //! paths share.
 
+use super::mixed::MixSrc;
 use super::{
     ATTEND_GROUP_ROWS, ATTEND_THREADS, CudaBatch, LinOut, NORM_THREADS, Out, Row, Stamps, mark,
 };
@@ -123,8 +124,12 @@ impl CudaBatch<'_> {
         self.logits_weights(n)?;
         op("logits")?;
         if let Out::Intervals(bits) = out {
-            self.coder_interval(n, bits)?;
+            self.coder_interval(n, bits, &self.b.intervals)?;
             op("coder interval")?;
+        }
+        if let Out::Mixed(_) = out {
+            self.mix_stats(MixSrc::Weights, n)?;
+            op("mix stats")?;
         }
         Ok(())
     }
@@ -281,7 +286,8 @@ impl CudaBatch<'_> {
         )
     }
 
-    pub(super) fn coder_interval(&self, n: u32, bits: u32) -> Result<()> {
+    /// The coder op of `n` rows on the weights of `logits_weights`, into `out`.
+    pub(super) fn coder_interval(&self, n: u32, bits: u32, out: &DevBuf) -> Result<()> {
         let model = self.model;
         let (dev, d, b) = (model.dev, model.dims, &self.b);
         dev.launch(
@@ -291,7 +297,7 @@ impl CudaBatch<'_> {
             &[
                 Arg::Ptr(b.weights.ptr()),
                 Arg::Ptr(b.queries.ptr()),
-                Arg::Ptr(b.intervals.ptr()),
+                Arg::Ptr(out.ptr()),
                 Arg::U32(d.vocab),
                 Arg::U64(1u64 << bits),
             ],

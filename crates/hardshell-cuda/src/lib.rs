@@ -9,6 +9,8 @@
 //! The kernels are one for each op of the op set (`docs/design/anymodel.md` §4): `embed`,
 //! `norm`, `linear` (int8 tensor cores or dp4a, then the output rescale), `add`, `table`,
 //! `attention`, `logits`, and the coder interval. The host composes them into the GPT-2 step.
+//! The mixed coder op gives the coder interval of the logs profile (ADR 0010) without a read
+//! back of the weights ([`CudaBatch::run_coded_mixed`]).
 //!
 //! The main types:
 //! - [`CudaDevice`]: one GPU with the kernels loaded.
@@ -22,6 +24,7 @@ mod device;
 mod driver;
 mod error;
 mod kernels;
+mod mixed;
 mod model;
 mod ops;
 mod session;
@@ -30,6 +33,7 @@ pub use batch::{CoderInterval, CoderQuery, CudaBatch};
 pub use device::CudaDevice;
 pub use error::{Error, Result};
 pub use kernels::{PTX_SOURCE_LINE, SOURCE as KERNEL_SOURCE, ptx};
+pub use mixed::{MixInput, MixStats, mixed_intervals_of_weights};
 pub use model::CudaModel;
 pub use ops::{MatKernel, matmul_gpu_ns, matmul_i8, matmul_i8_split, read_gpu_ns};
 pub use session::{CudaSession, RESTART_ROWS};

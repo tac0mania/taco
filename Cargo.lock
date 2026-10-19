@@ -590,6 +590,7 @@ dependencies = [
  "libloading",
  "sha2",
  "taco-coder",
+ "taco-match",
  "thiserror",
 ]
 

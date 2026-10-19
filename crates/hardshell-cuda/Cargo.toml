@@ -15,6 +15,7 @@ libloading.workspace = true
 [dev-dependencies]
 sha2.workspace = true
 taco-coder = { path = "../taco-coder" }
+taco-match = { path = "../taco-match" }
 
 [lints]
 workspace = true
