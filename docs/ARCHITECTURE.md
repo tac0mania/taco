@@ -67,6 +67,7 @@ may use floats. Nothing in `crates/` calls a tool at run time.
 |---|---|
 | `conformance/` | Conformance vectors and the tiny model (§11). |
 | `scripts/` | `dx` (devbox), `mx` (Mac), `check.sh`, `check-tags.sh`, `check-no-floats.sh`, `xcheck` (Mac and devbox), `wcheck` (native Windows). |
+| `scripts/conformance/` | The cross-machine conformance program: its own Cargo workspace; 50 hashes from `conformance/tiny.hsm` (`docs/ci.md`). |
 | `docs/adr/` | Decisions. |
 | `docs/research/` | Research notes and measurements. |
 | `.agent-status/` | Agent status files. Not committed. |
