@@ -131,7 +131,10 @@ impl Candidate {
 /// coder op ([`BlockEncoder::push_interval`]).
 pub(crate) struct BlockEncoder {
     plain: Candidate,
-    mixed: Option<(Candidate, MixState)>,
+    /// The mixed candidate and its state. The state is `None` while the block waits for a GPU
+    /// slot ([`BlockEncoder::with_mixer_later`]), so the memory of many waiting blocks does
+    /// not grow with the block count.
+    mixed: Option<(Candidate, Option<MixState>)>,
     count: u64,
     prefix: usize,
     stop: usize,
@@ -143,10 +146,32 @@ impl BlockEncoder {
     pub(crate) fn new(count: u64, stop: usize, mix: Option<MixState>) -> Self {
         Self {
             plain: Candidate::new(stop),
-            mixed: mix.map(|m| (Candidate::new(stop), m)),
+            mixed: mix.map(|m| (Candidate::new(stop), Some(m))),
             count,
             prefix: varint_len(count),
             stop,
+        }
+    }
+
+    /// As [`BlockEncoder::new`] with a mixer, but the mixer state comes later
+    /// ([`BlockEncoder::set_mix_state`], when the block enters a GPU slot).
+    pub(crate) fn with_mixer_later(count: u64, stop: usize) -> Self {
+        let mut enc = Self::new(count, stop, None);
+        enc.mixed = Some((Candidate::new(stop), None));
+        enc
+    }
+
+    /// Gives the mixed candidate its state (a new state: the block start).
+    pub(crate) fn set_mix_state(&mut self, state: MixState) {
+        if let Some((_, m)) = self.mixed.as_mut() {
+            *m = Some(state);
+        }
+    }
+
+    /// Drops the mixer state (the block left its GPU slot). The payloads stay.
+    pub(crate) fn drop_mix_state(&mut self) {
+        if let Some((_, m)) = self.mixed.as_mut() {
+            *m = None;
         }
     }
 
@@ -169,6 +194,7 @@ impl BlockEncoder {
         {
             // ADR 0010 section 4: mix with the prediction before the token, code, then
             // update the mixer and the match model with the token.
+            let state = state.as_mut().ok_or(TacoError::WorkerFailed)?;
             cand.encode(state.mix(weights)?, token, prefix, stop)?;
             state.observe(token);
         }
@@ -184,6 +210,35 @@ impl BlockEncoder {
             self.plain.encode_interval(interval, prefix, stop);
         }
         self.stopped()
+    }
+
+    /// Codes one token with its two intervals from the GPU dual op (`run_coded_dual`): `plain`
+    /// in the table of its HardShell weights, `mixed` in the table of the mixer weights. The
+    /// caller ran the mixer state of [`BlockEncoder::mix_state`] for this token. Each live
+    /// candidate codes its interval; the bytes are the bytes of [`BlockEncoder::push`].
+    /// Returns `true` when every candidate has stopped.
+    pub(crate) fn push_dual(&mut self, plain: CodeInterval, mixed: CodeInterval) -> bool {
+        let (prefix, stop) = (self.prefix, self.stop);
+        if self.plain.live {
+            self.plain.encode_interval(plain, prefix, stop);
+        }
+        if let Some((cand, _)) = self.mixed.as_mut()
+            && cand.live
+        {
+            cand.encode_interval(mixed, prefix, stop);
+        }
+        self.stopped()
+    }
+
+    /// The match model and the mixer of the mixed candidate, or `None` without a mixer or
+    /// before [`BlockEncoder::set_mix_state`].
+    pub(crate) fn mix_state(&mut self) -> Option<&mut MixState> {
+        self.mixed.as_mut().and_then(|(_, m)| m.as_mut())
+    }
+
+    /// `true` if the encoder has the mixed candidate (the profile `logs`).
+    pub(crate) fn has_mixer(&self) -> bool {
+        self.mixed.is_some()
     }
 
     /// The payloads of GPT-2 alone and of the mixed form, as [`encode_block`] gives them.
@@ -352,6 +407,38 @@ impl<'a> BlockDecoder<'a> {
         }
         self.decoder.decode_interval(interval)?;
         self.accept(token)
+    }
+
+    /// Decodes the next token of a mixed block from its symbol and interval, which the GPU
+    /// mixed coder op found for [`BlockDecoder::target`] in the table of the mixer weights.
+    /// Before the op, the caller took the prediction ([`MixState::predict`]) and, in the host
+    /// step of the op, called [`MixState::mix_stats`] for this position. Then this call
+    /// updates the mixer and the match model with the token (ADR 0010 section 4). The result
+    /// is the result of [`BlockDecoder::next`] with the HardShell weights.
+    ///
+    /// # Errors
+    /// [`TacoError::Coder`] if the interval does not hold the target (a fault of the coder
+    /// op), [`TacoError::CorruptBlock`] if the block is not mixed, or as
+    /// [`BlockDecoder::next`].
+    pub(crate) fn next_mixed_interval(
+        &mut self,
+        token: TokenId,
+        interval: CodeInterval,
+    ) -> Result<Option<TokenId>> {
+        let Some(state) = self.mix.as_mut() else {
+            return Err(TacoError::CorruptBlock {
+                block: self.index,
+                reason: "a coded block has no mixer",
+            });
+        };
+        self.decoder.decode_interval(interval)?;
+        state.observe(token);
+        self.accept(token)
+    }
+
+    /// The match model and the mixer of a mixed block, or `None` for a coded block.
+    pub(crate) fn mix_state(&mut self) -> Option<&mut MixState> {
+        self.mix.as_mut()
     }
 
     /// Adds the bytes of a decoded token. Returns the token if the block has more tokens.

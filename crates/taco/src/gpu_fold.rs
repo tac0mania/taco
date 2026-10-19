@@ -4,7 +4,7 @@
 //! PLAN(§4): the calls are the calls of ADR 0007 section 3 (and ADR 0010 section 4 for the
 //! profile `logs`); only the place where HardShell runs changes.
 //!
-//! The GPU coder op gives the interval of each token in the table of
+//! **Profile `text`.** The GPU coder op gives the interval of each token in the table of
 //! `FreqTable::from_weights(weights, 32)`, so only 24 bytes for each token come back. The
 //! encoder codes the interval ([`BlockEncoder::push_interval`]). A block is divided into its
 //! context windows (ADR 0015 section 2, overlap `K`): window 0 codes the first `n_ctx` tokens;
@@ -14,38 +14,55 @@
 //! their intervals in token order. No window is longer than the context, so the backend never
 //! restarts a slot itself.
 //!
-//! This path is for the profile `text` only. The mixer of the profile `logs` changes the
-//! weights before the table, so it needs all weights of each token. On devbox the read back of
-//! the weights made the CUDA fold slower than the CPU fold (ADR 0016 section 5), so
-//! [`crate::fold_with`] codes the profiles `logs` and `auto` on the CPU.
+//! **Profiles `logs` and `auto`** (CUDA only, ADR 0016 section 5, form 1). The mixer state is
+//! sequential over the whole block, so each block runs in one slot, and the backend restarts
+//! the context with the overlap `K`. The dual coder op gives two intervals for each token from
+//! one forward pass: GPT-2 alone and the mixer table. Before a call, the match model of each
+//! block runs over the tokens of the call (it depends only on the tokens) and gives the
+//! prediction of each row. In the host step of the op, the mixer of the block gives `q` from
+//! the statistics of the row (`Mixer::mix_stats`) and then takes the known token
+//! (`Mixer::update`), so the next row of the block sees the new state. The sequence is
+//! `gpu_encode` of `hardshell-cuda/examples/mixed.rs` (`MIXED-INTEGRATION.md` section 4).
 //!
-//! DETERMINISM: the weights and the intervals are the CPU values, bit for bit (ADR 0008), and
-//! [`crate::codec`] codes them in the order of the CPU path. Thus the payloads are the CPU
-//! payloads, byte for byte (tests in `tests/backends.rs`).
+//! DETERMINISM: the weights and the intervals are the CPU values, bit for bit (ADR 0008,
+//! `hardshell-cuda/tests/mixed.rs`), and [`crate::codec`] codes them in the order of the CPU
+//! path. Thus the payloads are the CPU payloads, byte for byte (tests in `tests/backends.rs`).
 
 use std::collections::{BTreeMap, VecDeque};
 
 use hardshell::TokenId;
 use hardshell::gpt2::{Model, Overlap};
+use taco_format::MixerRule;
 
 use crate::backend::{Backend, Engine};
 use crate::codec::{BlockEncoder, CodedBlock};
 use crate::error::{Result, TacoError};
-use crate::lanes::{Answer, Lanes, Query};
+use crate::lanes::{Answer, Lanes, Query, Stats};
+use crate::mix::MixState;
 
-/// One block before the model: its tokens and its encoder (GPT-2 alone, with the stop length
-/// of ADR 0007 §5.2).
+/// One block before the model: its tokens and its encoders (GPT-2 alone, and the mixed form
+/// for the profile `logs`), with the stop length of ADR 0007 §5.2.
 pub(crate) struct BlockWork {
     tokens: Vec<TokenId>,
     enc: BlockEncoder,
+    rule: Option<MixerRule>,
 }
 
 impl BlockWork {
-    /// A block of `tokens` with the stop length `stop`.
-    pub(crate) fn new(tokens: Vec<TokenId>, stop: usize) -> Result<Self> {
+    /// A block of `tokens` with the stop length `stop`. `rule` is the mixer rule of the
+    /// profile `logs`, else `None`.
+    ///
+    /// NOTE: the mixer state (24 MiB of zeroed match tables, 144 KiB of logistic tables) is
+    /// made when the block enters a GPU slot and dropped when it leaves, so the memory is
+    /// bounded by the slot count (security finding F2, the same rule as in unfold).
+    pub(crate) fn new(tokens: Vec<TokenId>, stop: usize, rule: Option<MixerRule>) -> Result<Self> {
         let count = u64::try_from(tokens.len())
             .map_err(|_| TacoError::InputTooLarge { reason: "token count" })?;
-        Ok(Self { tokens, enc: BlockEncoder::new(count, stop, None) })
+        let enc = match rule {
+            Some(_) => BlockEncoder::with_mixer_later(count, stop),
+            None => BlockEncoder::new(count, stop, None),
+        };
+        Ok(Self { tokens, enc, rule })
     }
 
     /// `true` if the model has work for the block: it has tokens, and its encoder did not stop.
@@ -63,10 +80,23 @@ const TEXT_ROWS: usize = 512;
 /// cache (18.9 MB for GPT-2 small).
 const TEXT_SLOTS: usize = 64;
 
-/// Codes `blocks` (profile `text`) on the GPU of `engine`, with the context overlap
-/// `overlap` (ADR 0015). Each result is the result of [`crate::codec::encode_block`] for the
-/// same tokens, stop length and overlap, with no mixer. The caller checked `overlap` against
-/// the model.
+/// The rows of one pass of the CUDA backend in the profile `logs`, and the most rows of one
+/// slot in one call.
+// NOTE: the same shape as the profile `text`. Prefill 1 slot x 512 rows gave 17,504 to 18,356
+// tokens/s with the dual op, and 8 x 512 gave 17,392 to 17,866 (measured, RTX 3060 at 45 W,
+// `hardshell-cuda/MIXED-INTEGRATION.md` section 7).
+const LOGS_ROWS: usize = 512;
+
+/// The most blocks that run at the same time in the profile `logs`, one slot each: the bound of
+/// the live mixer states of unfold (24 MiB of resident memory each).
+// NOTE: each pass is one slot of 512 rows in prefill, so more slots do not make a pass larger;
+// prefill 1 x 512 and 8 x 512 gave the same tokens/s (`MIXED-INTEGRATION.md` section 7).
+const LOGS_SLOTS: usize = crate::gpu_unfold::MAX_MIXED_SLOTS;
+
+/// Codes `blocks` on the GPU of `engine`, with the context overlap `overlap` (ADR 0015). Each
+/// result is the result of [`crate::codec::encode_block`] for the same tokens, stop length,
+/// overlap and mixer. The caller checked `overlap` against the model and, for blocks with a
+/// mixer, that the engine has the mixed coder op ([`Engine::mixes_on_gpu`]).
 ///
 /// # Errors
 /// [`TacoError::Backend`] on a GPU fault; the errors of the encoders.
@@ -76,6 +106,15 @@ pub(crate) fn code_blocks(
     mut blocks: Vec<BlockWork>,
     overlap: Overlap,
 ) -> Result<Vec<CodedBlock>> {
+    if blocks.iter().any(|b| b.enc.has_mixer()) {
+        let jobs = blocks.iter().filter(|b| b.needs_model()).count();
+        if jobs > 0
+            && let Some(mut lanes) = engine.lanes(jobs.min(LOGS_SLOTS), LOGS_ROWS, overlap)?
+        {
+            code_mixed(lanes.as_mut(), model, &mut blocks)?;
+        }
+        return Ok(blocks.into_iter().map(|b| b.enc.finish()).collect());
+    }
     let k = overlap.tokens();
     let windows = windows_of(&blocks, model.n_ctx(), k);
     // NOTE: the windows hold their restart rows and are never longer than the context, so the
@@ -266,6 +305,108 @@ fn code_with_intervals(
     }
 }
 
+/// A block of the profile `logs` in a slot: the block, and its next token to run.
+struct MixedLane {
+    block: usize,
+    next: usize,
+}
+
+/// The profiles `logs` and `auto`: each block in one slot, two intervals for each token from
+/// the dual coder op. Each call gives each running block up to [`LOGS_ROWS`] rows: row 0 has
+/// the input `<|endoftext|>` and codes `t[0]`, row `j` has the input `t[j - 1]` and codes
+/// `t[j]`. When both encoders of a block stop (ADR 0007 §5.2), the block leaves its slot.
+fn code_mixed(lanes: &mut dyn Lanes, model: &Model, blocks: &mut [BlockWork]) -> Result<()> {
+    let backend = lanes.backend();
+    if !lanes.has_mixer() {
+        return Err(backend.fault("the backend has no mixed coder op"));
+    }
+    let eot = model.eot_token();
+    let mut queue: VecDeque<usize> =
+        blocks.iter().enumerate().filter(|(_, b)| b.needs_model()).map(|(i, _)| i).collect();
+    let mut slots: Vec<Option<MixedLane>> = (0..lanes.slots()).map(|_| None).collect();
+    loop {
+        for (slot, s) in slots.iter_mut().enumerate() {
+            if s.is_none()
+                && let Some(block) = queue.pop_front()
+                && let Some(b) = blocks.get_mut(block)
+            {
+                let rule = b.rule.ok_or(TacoError::WorkerFailed)?;
+                b.enc.set_mix_state(MixState::new(rule));
+                lanes.reset(slot);
+                *s = Some(MixedLane { block, next: 0 });
+            }
+        }
+        if slots.iter().all(Option::is_none) {
+            return Ok(());
+        }
+        let mut inputs = Vec::new();
+        let mut tokens = Vec::new();
+        let mut preds = Vec::new();
+        let mut owners = Vec::new();
+        for (slot, s) in slots.iter_mut().enumerate() {
+            let Some(lane) = s.as_mut() else { continue };
+            let Some(b) = blocks.get_mut(lane.block) else { continue };
+            let end = lane.next.saturating_add(LOGS_ROWS).min(b.tokens.len());
+            for j in lane.next..end {
+                let t = b.tokens.get(j).copied().ok_or(TacoError::WorkerFailed)?;
+                let input = match j.checked_sub(1) {
+                    None => eot,
+                    Some(i) => b.tokens.get(i).copied().ok_or(TacoError::WorkerFailed)?,
+                };
+                let state = b.enc.mix_state().ok_or(TacoError::WorkerFailed)?;
+                // NOTE: the match model depends only on the tokens, so it runs ahead of the
+                // mixer: the prediction of row `j` sees `t[0..j]`, as on the CPU.
+                preds.push(state.predict());
+                state.observe_match(t);
+                inputs.push((slot, input));
+                tokens.push(t);
+                owners.push(lane.block);
+            }
+            lane.next = end;
+        }
+        let predictions: Vec<Option<TokenId>> =
+            preds.iter().map(|p| p.map(|p| TokenId::new(p.token.get()))).collect();
+        // The host step of row `i`: `q` from the mixer of its block, then the known token
+        // (ADR 0010 section 4). A `q` of 0 makes the op fail (an internal fault, never a
+        // silent wrong table).
+        let mut host = |i: usize, s: Stats| -> u32 {
+            let (Some(&b), Some(&t), Some(&p)) = (owners.get(i), tokens.get(i), preds.get(i))
+            else {
+                return 0;
+            };
+            let Some(state) = blocks.get_mut(b).and_then(|w| w.enc.mix_state()) else {
+                return 0;
+            };
+            let q = state.mix_stats(s.total, s.predicted, s.top, p);
+            state.update_mixer(t);
+            q.unwrap_or(0)
+        };
+        let answers = lanes.dual(&inputs, &tokens, &predictions, &mut host)?;
+        if answers.len() != inputs.len() {
+            return Err(backend.fault("the dual coder op gave too few answers"));
+        }
+        for ((&b, &t), (plain, mixed)) in owners.iter().zip(&tokens).zip(answers) {
+            let Some(w) = blocks.get_mut(b) else { continue };
+            if w.enc.stopped() {
+                continue;
+            }
+            if plain.token != t || mixed.token != t {
+                return Err(backend.fault("the dual coder op answered for another token"));
+            }
+            w.enc.push_dual(plain.interval, mixed.interval);
+        }
+        for s in &mut slots {
+            if let Some(lane) = s.as_ref()
+                && let Some(b) = blocks.get_mut(lane.block)
+                && (b.enc.stopped() || lane.next >= b.tokens.len())
+            {
+                b.enc.drop_mix_state();
+                *s = None;
+            }
+        }
+    }
+}
+
 /// Codes `answers`, the intervals of the tokens `first..`, in the encoder of `block`, until
 /// the encoder stops.
 fn code_answers(
@@ -323,7 +464,7 @@ mod tests {
                 want.push(s.step(t).unwrap().to_vec());
             }
             // The windows, each in a fresh session.
-            let work = vec![BlockWork::new(tokens.clone(), 1 << 20).unwrap()];
+            let work = vec![BlockWork::new(tokens.clone(), 1 << 20, None).unwrap()];
             let windows = windows_of(&work, n_ctx, k);
             assert_eq!(windows.iter().map(|w| w.len).sum::<usize>(), n, "K = {k}");
             let mut got = Vec::new();

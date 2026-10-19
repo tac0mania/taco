@@ -126,9 +126,11 @@ fn peak_kib() -> u64 {
 /// before the first slot runs. 20,000 blocks of 2 bytes (a container of 120 KB) then need about
 /// 2.8 GiB of resident memory and 480 GiB of address space (est.). The required behaviour: the
 /// memory does not grow with the number of blocks; make the state when a block enters a slot.
+/// Repaired in `gpu_unfold.rs`: the state is made in the slot, and at most `MAX_MIXED_SLOTS`
+/// (12) mixed blocks decode at the same time (gpucli2). On a machine without a GPU the test
+/// does nothing.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "bug F2 in crates/taco (gpu_unfold.rs, unfold.rs decode_on_gpu); needs a GPU and the free timing lock"]
 fn many_mixed_blocks_on_a_gpu_use_bounded_memory() {
     use taco::{BackendChoice, unfold_with, with_engine};
     let model = Model::load(TINY).unwrap();

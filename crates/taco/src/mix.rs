@@ -20,7 +20,7 @@
 
 use hardshell::TokenId;
 use taco_format::MixerRule;
-use taco_match::{MatchModel, MatchParams, Mixer, MixerParams};
+use taco_match::{MatchModel, MatchParams, Mixer, MixerParams, Prediction};
 
 use crate::error::Result;
 
@@ -69,9 +69,44 @@ impl MixState {
 
     /// Adds the token that the coder coded or decoded (ADR 0010 section 4, step 2).
     pub(crate) fn observe(&mut self, token: TokenId) {
-        let t = taco_match::TokenId::new(token.get());
-        self.mixer.update(t);
-        self.model.observe(t);
+        self.update_mixer(token);
+        self.observe_match(token);
+    }
+
+    // The three calls of the GPU mixed coder op (`hardshell-cuda/MIXED-INTEGRATION.md` §3):
+    // the GPU gives the statistics of the HardShell weights, and the state stays here. The
+    // sequence `predict`, `mix_stats`, `update_mixer`, `observe_match` for each token gives the
+    // state of `mix` and `observe` (a `taco-match` test proves `mix_stats` against `mix`).
+
+    /// The prediction of the match model for the next token.
+    pub(crate) fn predict(&self) -> Option<Prediction> {
+        self.model.predict()
+    }
+
+    /// The probability `q` of the predicted token (units of 2^-16) from the statistics of the
+    /// HardShell weights `w` of this position: `total = sum(w)`, `predicted = w[p]` and `top`,
+    /// the token with the largest weight (the lowest id on a tie). `prediction` must be the
+    /// prediction of [`MixState::predict`] at this position. `None` without a prediction.
+    pub(crate) fn mix_stats(
+        &mut self,
+        total: u64,
+        predicted: u64,
+        top: TokenId,
+        prediction: Option<Prediction>,
+    ) -> Option<u32> {
+        let agree = prediction.is_some_and(|p| p.token.get() == top.get());
+        self.mixer.mix_stats(u128::from(total), predicted, agree, prediction)
+    }
+
+    /// The mixer part of [`MixState::observe`] (`Mixer::update`).
+    pub(crate) fn update_mixer(&mut self, token: TokenId) {
+        self.mixer.update(taco_match::TokenId::new(token.get()));
+    }
+
+    /// The match-model part of [`MixState::observe`] (`MatchModel::observe`). The match model
+    /// depends only on the tokens, so fold can run it ahead of the mixer.
+    pub(crate) fn observe_match(&mut self, token: TokenId) {
+        self.model.observe(taco_match::TokenId::new(token.get()));
     }
 }
 

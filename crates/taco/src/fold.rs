@@ -15,7 +15,7 @@ use crate::gpu_fold::{BlockWork, code_blocks};
 use crate::mix::MixState;
 use crate::parallel::{Threads, map_blocks};
 use crate::tokenizer::Tokenizer;
-use crate::{DEFAULT_BLOCK_SIZE, LOGS_BLOCK_SIZE, container_hash};
+use crate::{DEFAULT_BLOCK_SIZE, LOGS_BLOCK_SIZE, SPREAD_BLOCKS, SPREAD_MIN_BLOCK, container_hash};
 
 /// The number of tokens that the encoder gives to HardShell in one call (the prefill path).
 // NOTE: measured on the M2 with gpt2.hsm (1,024 tokens, one thread): 8 tokens 329, 32 tokens
@@ -97,6 +97,12 @@ pub struct FoldOptions {
     /// profile ([`FoldProfile::default_overlap`]). The container stores it, so the decoder
     /// needs no option.
     pub overlap: Option<Overlap>,
+    /// With the profile `text` and no `block_size`: smaller blocks for a small input, so that
+    /// more blocks decode in parallel on a GPU ([`FoldOptions::block_size_for`]). The default
+    /// is `false`. The container stores the block size, so the decoder needs no option. Only
+    /// [`fold`] and [`fold_with`] apply it: the stream fold (`crate::stream`) does not know the
+    /// input length before it writes the header, so it keeps the block size of the options.
+    pub spread: bool,
 }
 
 impl FoldOptions {
@@ -132,6 +138,37 @@ impl FoldOptions {
         }
     }
 
+    /// The same options with the spread rule on or off ([`FoldOptions::spread`]).
+    #[must_use]
+    pub const fn with_spread(mut self, spread: bool) -> Self {
+        self.spread = spread;
+        self
+    }
+
+    /// The block size that [`fold`] uses for an input of `input_len` bytes. It is
+    /// [`FoldOptions::effective_block_size`], except with [`FoldOptions::spread`], the profile
+    /// `text` and no `block_size`: then it is the smallest power of two that gives the input at
+    /// most [`SPREAD_BLOCKS`] blocks, but at least [`SPREAD_MIN_BLOCK`] and at most the default
+    /// of the profile. The rule depends only on the input length, so every machine and every
+    /// backend selects the same block size.
+    ///
+    /// The unfold of one block is sequential (one model step for each token), so a small file
+    /// with few large blocks unfolds no faster than its largest block. Smaller blocks run in
+    /// more GPU slots at the same time.
+    #[must_use]
+    pub fn block_size_for(&self, input_len: usize) -> BlockSize {
+        let default = self.effective_block_size();
+        if !self.spread || self.block_size.is_some() || self.profile != FoldProfile::Text {
+            return default;
+        }
+        let per_block = input_len.div_ceil(SPREAD_BLOCKS);
+        let size = per_block
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .clamp(SPREAD_MIN_BLOCK.as_usize(), default.as_usize());
+        u32::try_from(size).ok().and_then(|s| BlockSize::new(s).ok()).unwrap_or(default)
+    }
+
     /// The context overlap that [`fold`] uses with `model`: the overlap of the options, else
     /// the default of the profile.
     ///
@@ -150,12 +187,13 @@ impl FoldOptions {
         self
     }
 
-    /// `true` if [`fold_with`] runs HardShell on a GPU engine with these options: the profile
-    /// `text`. The profiles `logs` and `auto` fold on the CPU on every engine, because the
-    /// mixer needs all weights of each token (ADR 0016 section 5).
+    /// `true` if [`fold_with`] can run HardShell on a GPU engine with these options: every
+    /// profile. The profile `text` folds on every GPU engine. The profiles `logs` and `auto`
+    /// need the mixed coder op (ADR 0016 section 5), which only the CUDA engine has; on the
+    /// wgpu engine they fold on the CPU (`FoldStats::backend` says so).
     #[must_use]
     pub const fn uses_gpu(&self) -> bool {
-        matches!(self.profile, FoldProfile::Text)
+        matches!(self.profile, FoldProfile::Text | FoldProfile::Logs | FoldProfile::Auto)
     }
 
     /// The same options with another profile.
@@ -168,7 +206,13 @@ impl FoldOptions {
 
 impl Default for FoldOptions {
     fn default() -> Self {
-        Self { block_size: None, threads: Threads::ONE, profile: FoldProfile::Text, overlap: None }
+        Self {
+            block_size: None,
+            threads: Threads::ONE,
+            profile: FoldProfile::Text,
+            overlap: None,
+            spread: false,
+        }
     }
 }
 
@@ -202,6 +246,9 @@ pub struct FoldStats {
     pub backend: Backend,
     /// The context overlap of the container (ADR 0015).
     pub overlap: Overlap,
+    /// The block size of the container ([`FoldOptions::block_size_for`]). `None` only in
+    /// `FoldStats::default()`.
+    pub block_size: Option<BlockSize>,
 }
 
 /// The result of [`fold`]: the container and numbers about it.
@@ -274,9 +321,12 @@ pub fn fold(
 /// already on the GPU still run. Memory: the tokens and the zstd frame of every block, and the
 /// payloads.
 ///
-/// The profiles `logs` and `auto` run on the CPU on every engine (`FoldStats::backend` says
-/// so): their mixer needs all weights of each token, and on devbox the read back of the
-/// weights made the GPU slower than the CPU (ADR 0016 section 5).
+/// On CUDA, the profiles `logs` and `auto` run each block in one slot (the mixer state is
+/// sequential over the block), and the dual coder op gives the intervals of GPT-2 alone and of
+/// the mixer table for each token (48 bytes come back); the match model and the mixer run on
+/// the host. On wgpu they run on the CPU (`FoldStats::backend` says so): there the mixer
+/// needs all weights of each token, and the read back made the GPU slower than the CPU (ADR
+/// 0016 section 5).
 ///
 /// # Errors
 ///
@@ -288,7 +338,8 @@ pub fn fold_with(
     input: &[u8],
     options: &FoldOptions,
 ) -> Result<Folded> {
-    let plan = FoldPlan::new(model, tokenizer, options)?;
+    let mut plan = FoldPlan::new(model, tokenizer, options)?;
+    plan.block_size = options.block_size_for(input.len());
     let chunks: Vec<&[u8]> = plan.block_size.split(input).collect();
     let coded = code_segment(engine, model, tokenizer, &plan, (0, &chunks), &|_| {})?;
     let mut stats = FoldStats::default();
@@ -356,13 +407,15 @@ impl FoldPlan {
         })
     }
 
-    /// `true` if HardShell runs on the GPU of `engine` (the profile `text` on a GPU engine).
+    /// `true` if HardShell runs on the GPU of `engine`: the profile `text` on a GPU engine,
+    /// and the profiles `logs` and `auto` on the CUDA engine (the mixed coder op).
     pub(crate) fn on_gpu(&self, engine: &Engine<'_>) -> bool {
-        // NOTE: the profiles `logs` and `auto` run on the CPU on every engine. Their mixer needs
-        // all weights of each token, and the read back made the CUDA fold slower than the CPU
-        // fold: 128 KiB of `apache_access.log` took 162.8 s with CUDA and 141.4 s on 6 CPU
-        // threads (measured, devbox, ADR 0016 section 5).
-        engine.backend() != Backend::Cpu && self.uses_gpu
+        // NOTE: on wgpu the profiles `logs` and `auto` run on the CPU: there the mixer needs all
+        // weights of each token, and the read back made the GPU fold slower than the CPU fold
+        // (ADR 0016 section 5).
+        engine.backend() != Backend::Cpu
+            && self.uses_gpu
+            && (self.rule.is_none() || engine.mixes_on_gpu())
     }
 
     /// The profile and the coding parts while the blocks are coded: the parts of the profile
@@ -433,6 +486,7 @@ impl FoldStats {
         self.profile = profile;
         self.backend = if plan.on_gpu(engine) { engine.backend() } else { Backend::Cpu };
         self.overlap = plan.overlap;
+        self.block_size = Some(plan.block_size);
         Ok(())
     }
 }
@@ -495,7 +549,7 @@ pub(crate) fn code_segment(
     let mut frames = Vec::with_capacity(prepared.len());
     for (i, (tokens, zstd)) in prepared.into_iter().enumerate() {
         let stop = chunks.get(i).map_or(0, |d| d.len()).min(zstd.len());
-        work.push(BlockWork::new(tokens, stop)?);
+        work.push(BlockWork::new(tokens, stop, rule)?);
         frames.push(zstd);
     }
     let coded = code_blocks(engine, model, work, plan.overlap)?;

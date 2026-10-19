@@ -9,15 +9,13 @@
 
 use core::fmt;
 
-use hardshell::TokenId;
-use hardshell::gpt2::{Model, Overlap, Session};
+use hardshell::gpt2::{Model, Overlap};
 use hardshell_cuda::{CudaDevice, CudaModel};
 use hardshell_gpu::{AdapterChoice, GpuDevice, GpuModel};
-use taco_coder::{FreqBits, FreqTable, Symbol};
 
-use crate::codec::FREQ_BITS;
 use crate::error::{Result, TacoError};
-use crate::lanes::{Answer, CudaLanes, GpuLanes, Lanes, Query};
+use crate::lanes::{CudaLanes, GpuLanes, Lanes};
+use crate::selftest::{cpu_reference, self_test};
 
 /// The backend that the caller asks for (`taco --backend`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -134,6 +132,12 @@ impl Engine<'_> {
         &self.device
     }
 
+    /// `true` if the engine runs the mixer of the profile `logs` on the GPU (the mixed coder op
+    /// of ADR 0016 section 5): the CUDA engine only.
+    pub(crate) fn mixes_on_gpu(&self) -> bool {
+        matches!(self.kind, Kind::Cuda(_))
+    }
+
     /// Why [`BackendChoice::Auto`] did not select a faster backend: one line for each backend
     /// that it tried and refused.
     #[must_use]
@@ -234,6 +238,43 @@ pub fn with_engine<R>(
     model: &Model,
     f: impl FnOnce(&Engine<'_>) -> Result<R>,
 ) -> Result<R> {
+    if choice == BackendChoice::Cpu {
+        return f(&Engine::cpu());
+    }
+    // PERF: the CPU half of the self-test (the reference weights) runs on a second thread
+    // while the driver opens the device and the model goes to the GPU (about 1.8 s on devbox,
+    // measured), so the self-test then costs only its GPU half.
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(|| cpu_reference(model));
+        let mut reference = Reference { handle: Some(handle), value: None };
+        open_engine(choice, model_file, model, &mut reference, f)
+    })
+}
+
+/// The CPU half of the self-test, from a second thread, joined at the first use.
+struct Reference<'s> {
+    handle: Option<std::thread::ScopedJoinHandle<'s, Result<Vec<Vec<u64>>>>>,
+    value: Option<Vec<Vec<u64>>>,
+}
+
+impl Reference<'_> {
+    /// The reference weights of the self-test ([`cpu_reference`]).
+    fn get(&mut self) -> Result<&[Vec<u64>]> {
+        if let Some(h) = self.handle.take() {
+            self.value = Some(h.join().map_err(|_| TacoError::WorkerFailed)??);
+        }
+        self.value.as_deref().ok_or(TacoError::WorkerFailed)
+    }
+}
+
+/// [`with_engine`] for a GPU choice, with the reference of the self-test.
+fn open_engine<R>(
+    choice: BackendChoice,
+    model_file: &[u8],
+    model: &Model,
+    reference: &mut Reference<'_>,
+    f: impl FnOnce(&Engine<'_>) -> Result<R>,
+) -> Result<R> {
     let mut notes: Vec<BackendNote> = Vec::new();
     let mut f = Some(f);
     let mut call =
@@ -251,12 +292,12 @@ pub fn with_engine<R>(
                 (Backend::Cuda.fault(e), missing)
             })?;
             let failed = |e: TacoError| (e, false);
-            let gpu =
-                CudaModel::load(&dev, model_file).map_err(|e| failed(Backend::Cuda.fault(e)))?;
+            let gpu = CudaModel::load_with(&dev, model_file, model)
+                .map_err(|e| failed(Backend::Cuda.fault(e)))?;
             check_hash(model, gpu.hash()).map_err(failed)?;
             let mut engine =
                 Engine { kind: Kind::Cuda(&gpu), device: dev.name().to_owned(), notes: Vec::new() };
-            self_test(&engine, model).map_err(failed)?;
+            self_test(&engine, model, reference.get().map_err(failed)?).map_err(failed)?;
             engine.notes = std::mem::take(&mut notes);
             Ok(call(&engine))
         })();
@@ -285,7 +326,7 @@ pub fn with_engine<R>(
                 device: dev.adapter().to_string(),
                 notes: Vec::new(),
             };
-            self_test(&engine, model).map_err(failed)?;
+            self_test(&engine, model, reference.get().map_err(failed)?).map_err(failed)?;
             engine.notes = std::mem::take(&mut notes);
             Ok(call(&engine))
         })();
@@ -315,70 +356,4 @@ fn check_hash(model: &Model, gpu: hardshell::ModelHash) -> Result<()> {
     }
     let hash = |h: hardshell::ModelHash| taco_format::ModelHash::from_bytes(*h.as_bytes());
     Err(TacoError::ModelHashMismatch { container: hash(model.hash()), loaded: hash(gpu) })
-}
-
-/// The tokens of the self-test: fixed ids spread over the vocabulary (never `<|endoftext|>`).
-fn test_tokens(model: &Model) -> Vec<TokenId> {
-    let vocab = u32::try_from(model.vocab_size()).unwrap_or(u32::MAX).max(1);
-    (0..SELF_TEST_STEPS)
-        .map(|i| {
-            let t = TokenId::new((i * 7919 + 464) % vocab);
-            if t == model.eot_token() { TokenId::new((t.get() + 1) % vocab) } else { t }
-        })
-        .collect()
-}
-
-/// The number of tokens of the self-test.
-const SELF_TEST_STEPS: u32 = 6;
-
-/// Runs the first steps of a block on the GPU and on the CPU, and compares the weights of one
-/// step and the coder answers (encode and decode) of every step. A difference is an error:
-/// the GPU does not give the bits of the reference path (CLAUDE.md §1 rule 10).
-fn self_test(engine: &Engine<'_>, model: &Model) -> Result<()> {
-    let backend = engine.backend();
-    let Some(mut lanes) = engine.lanes(1, 16, Overlap::NONE)? else { return Ok(()) };
-    let bits = FreqBits::new(FREQ_BITS)?;
-    let tokens = test_tokens(model);
-    let mut session = Session::new(model);
-    let mut cpu_weights = vec![session.start_block()?.to_vec()];
-    for &t in tokens.iter().take(tokens.len() - 1) {
-        cpu_weights.push(session.step(t)?.to_vec());
-    }
-    let fail = |what: &str| backend.fault(format!("self-test: {what} differ from the CPU"));
-    let mut input = model.eot_token();
-    lanes.reset(0);
-    for (i, (w, &t)) in cpu_weights.iter().zip(&tokens).enumerate() {
-        let table = FreqTable::from_weights(w, bits)?;
-        let want = table.code_interval(Symbol::new(t.get())).ok_or_else(|| fail("tokens"))?;
-        // NOTE: step 0 also checks the full weights (the read back of the logs profile); the
-        // later steps check the coder op, for the encoder and for the decoder.
-        let got = if i == 0 {
-            let gw = lanes.weights(&[(0, input)])?;
-            if gw != *w {
-                return Err(fail("the weights"));
-            }
-            Answer { token: t, interval: want }
-        } else {
-            let a = lanes.coded(&[(0, input)], &[Query::Encode(t)])?;
-            a.first().copied().ok_or_else(|| fail("the answers"))?
-        };
-        if got.token != t || got.interval != want {
-            return Err(fail("the encoder intervals"));
-        }
-        input = t;
-    }
-    // The decoder queries, each from a new context (`<|endoftext|>` only): the first target,
-    // one inside the table, and the last target (the last symbol takes the remainder).
-    let w = cpu_weights.first().ok_or_else(|| fail("the weights"))?;
-    let table = FreqTable::from_weights(w, bits)?;
-    for target in [0, table.total() / 3, table.total() - 1] {
-        let (sym, iv) = table.symbol_at(target).ok_or_else(|| fail("targets"))?;
-        lanes.reset(0);
-        let a = lanes.coded(&[(0, model.eot_token())], &[Query::Decode(target)])?;
-        let a = a.first().copied().ok_or_else(|| fail("the answers"))?;
-        if a.token.get() != sym.get() || a.interval != iv {
-            return Err(fail("the decoder intervals"));
-        }
-    }
-    Ok(())
 }

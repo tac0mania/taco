@@ -1,7 +1,9 @@
 //! Every backend gives the CPU container byte for byte, and unfolds every container (ADR 0016).
 //!
 //! The GPU tests run on each GPU backend that this machine has (CUDA, wgpu) and say "skip" for
-//! a backend that it does not have. They use the tiny model of `tests/common` (a context of 24
+//! a backend that it does not have (no driver, no device, no adapter: `missing`). A backend
+//! that the machine has must work: a failed self-test or any other fault fails the test. They
+//! use the tiny model of `tests/common` (a context of 24
 //! tokens, so every block of more than 23 tokens has several context windows) and the golden
 //! vectors of `tests/container.rs` and `tests/logs_profile.rs`.
 //!
@@ -86,11 +88,42 @@ fn cases() -> Vec<(&'static str, Vec<u8>, u32, FoldProfile)> {
     ]
 }
 
+/// `Some(reason)` if this machine does not have the backend of `choice`: no CUDA driver or no
+/// CUDA device (`hardshell_cuda::Error::NoDevice`), or no wgpu adapter with compute shaders
+/// (`hardshell_gpu::Error::NoAdapter`). Only then does a GPU test skip. Every other fault of a
+/// backend that the machine has (a failed self-test, wrong bits, a driver error, no memory, a
+/// device below compute capability 8.0) fails the test, so a GPU with wrong bits is never
+/// skipped.
+fn missing(choice: BackendChoice) -> Option<String> {
+    match choice {
+        BackendChoice::Cuda => match hardshell_cuda::CudaDevice::open(0) {
+            Err(e @ hardshell_cuda::Error::NoDevice { .. }) => Some(e.to_string()),
+            _ => None,
+        },
+        BackendChoice::Gpu => {
+            match hardshell_gpu::GpuDevice::open(&hardshell_gpu::AdapterChoice::BestHardware) {
+                Err(e @ hardshell_gpu::Error::NoAdapter { .. }) => Some(e.to_string()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The GPU backends of the tests.
+const GPUS: [BackendChoice; 2] = [BackendChoice::Cuda, BackendChoice::Gpu];
+
 /// Runs `check` on each GPU backend of this machine. Gives the names of the backends that ran.
+/// A backend that the machine does not have ([`missing`]) is skipped; any other error of
+/// [`with_engine`] fails.
 fn on_each_gpu(check: impl Fn(&Engine<'_>)) -> Vec<Backend> {
     let t = tiny();
     let mut ran = Vec::new();
-    for choice in [BackendChoice::Cuda, BackendChoice::Gpu] {
+    for choice in GPUS {
+        if let Some(reason) = missing(choice) {
+            eprintln!("skip {choice:?}: the machine does not have it: {reason}");
+            continue;
+        }
         let r = with_engine(choice, &t.file, &t.model, |engine| {
             eprintln!("backend {} ({})", engine.backend(), engine.device());
             check(engine);
@@ -98,10 +131,7 @@ fn on_each_gpu(check: impl Fn(&Engine<'_>)) -> Vec<Backend> {
         });
         match r {
             Ok(b) => ran.push(b),
-            Err(TacoError::Backend { backend, reason }) => {
-                eprintln!("skip {backend}: {reason}");
-            }
-            Err(e) => panic!("{choice:?}: {e}"),
+            Err(e) => panic!("{choice:?}: the machine has the backend, but it failed: {e}"),
         }
     }
     ran
@@ -123,9 +153,14 @@ fn every_gpu_backend_gives_the_cpu_containers_and_restores_them() {
                     "{name}: {} fold, {threads} threads, K = {k}",
                     engine.backend()
                 );
-                // The profiles logs and auto fold on the CPU on every engine (ADR 0016 §5).
-                let folded_on =
-                    if profile == FoldProfile::Text { engine.backend() } else { Backend::Cpu };
+                // The profiles logs and auto fold on CUDA (the mixed coder op) and on the CPU
+                // on wgpu (ADR 0016 §5).
+                let folded_on = if profile == FoldProfile::Text || engine.backend() == Backend::Cuda
+                {
+                    engine.backend()
+                } else {
+                    Backend::Cpu
+                };
                 assert_eq!(gpu.stats.backend, folded_on, "{name}");
                 let back = unfold_with(engine, Some(&t.model), &cpu.container, &uopts).unwrap();
                 assert_eq!(back, data, "{name}: {} unfold, K = {k}", engine.backend());
@@ -192,10 +227,13 @@ const GOLDEN_LOGS_DEFAULT: &str =
 fn a_gpu_refuses_a_model_file_that_is_not_the_loaded_model() {
     let t = tiny();
     let other = model_file(2);
-    for choice in [BackendChoice::Cuda, BackendChoice::Gpu] {
+    for choice in GPUS {
+        if let Some(reason) = missing(choice) {
+            eprintln!("skip {choice:?}: the machine does not have it: {reason}");
+            continue;
+        }
         match with_engine(choice, &other, &t.model, |_| Ok(())) {
             Err(TacoError::ModelHashMismatch { .. }) => {}
-            Err(TacoError::Backend { backend, reason }) => eprintln!("skip {backend}: {reason}"),
             other => panic!("{choice:?}: {other:?}"),
         }
     }
@@ -220,4 +258,66 @@ fn the_cpu_and_auto_engines_give_the_cpu_container() {
     })
     .unwrap();
     assert_eq!(auto.container, cpu.container);
+}
+
+#[test]
+fn the_spread_rule_depends_only_on_the_length_and_restores_on_every_backend() {
+    let spread = FoldOptions::new().with_spread(true);
+    let size = |o: &FoldOptions, n: usize| o.block_size_for(n).get();
+    assert_eq!(size(&spread, 0), 4096);
+    assert_eq!(size(&spread, 24_603), 4096);
+    assert_eq!(size(&spread, 426_754), 8192);
+    assert_eq!(size(&spread, 64 * 16 * 1024), 16 * 1024);
+    assert_eq!(size(&spread, 2_663_455), 16 * 1024);
+    assert_eq!(size(&FoldOptions::new(), 24_603), 16 * 1024);
+    assert_eq!(size(&spread.with_block_size(BlockSize::new(700).unwrap()), 24_603), 700);
+    assert_eq!(size(&spread.with_profile(FoldProfile::Logs), 24_603), 64 * 1024);
+    let t = tiny();
+    let data = mixed(40_000);
+    let opts = spread.with_threads(Threads::new(4).unwrap());
+    let cpu = fold(&t.model, &t.tokenizer, &data, &opts).unwrap();
+    assert_eq!(cpu.stats.block_size.map(BlockSize::get), Some(4096));
+    assert_eq!(cpu.stats.blocks, 10);
+    assert_eq!(unfold(Some(&t.model), &cpu.container, &UnfoldOptions::new()).unwrap(), data);
+    on_each_gpu(|engine| {
+        let gpu = fold_with(engine, &t.model, &t.tokenizer, &data, &opts).unwrap();
+        assert_eq!(gpu.container, cpu.container, "{}", engine.backend());
+        let back = unfold_with(engine, Some(&t.model), &gpu.container, &UnfoldOptions::new());
+        assert_eq!(back.unwrap(), data);
+    });
+}
+
+/// The peak resident memory of this process (`VmHWM`, Linux), in KiB.
+#[cfg(target_os = "linux")]
+fn peak_kib() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let line = status.lines().find(|l| l.starts_with("VmHWM:")).unwrap();
+    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+/// The fold side of security finding F2: the GPU fold of the profile `logs` makes the mixer
+/// state of a block (144 KiB of logistic tables and 24 MiB of zeroed match tables) when the
+/// block enters a slot, and drops it when the block leaves. 5,000 blocks of 2 bytes must not
+/// need 5,000 states at the same time (about 0.7 GiB, est.). The container is the CPU
+/// container.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs a GPU and the free timing lock"]
+fn many_logs_blocks_on_a_gpu_fold_with_bounded_memory() {
+    let t = tiny();
+    let data = shuffled_words(11, 10_000);
+    let opts = options(2, FoldProfile::Logs, 4);
+    let cpu = fold(&t.model, &t.tokenizer, &data, &opts).unwrap();
+    assert_eq!(cpu.stats.blocks, 5_000);
+    let before = peak_kib();
+    let ran = on_each_gpu(|engine| {
+        // NOTE: the growth of the engine alone, for the record.
+        eprintln!("engine alone grew the peak by {} KiB", peak_kib().saturating_sub(before));
+        let gpu = fold_with(engine, &t.model, &t.tokenizer, &data, &opts).unwrap();
+        assert_eq!(gpu.container, cpu.container, "{}", engine.backend());
+        let grew = peak_kib().saturating_sub(before);
+        eprintln!("fold grew the peak by {grew} KiB");
+        assert!(grew < 512 * 1024, "{}: the peak memory grew by {grew} KiB", engine.backend());
+    });
+    eprintln!("ran on: {ran:?}");
 }

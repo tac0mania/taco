@@ -107,7 +107,9 @@ pub fn unfold(model: Option<&Model>, container: &[u8], options: &UnfoldOptions) 
 /// On a GPU, every coded and mixed block decodes in its own slot, and all slots step together
 /// (one token for each slot in each step). For a coded block the GPU coder op finds the token
 /// for the target value of the range decoder (24 bytes for each token come back). For a mixed
-/// block the GPU gives the full weights back (about 402 KB for each token of GPT-2 small), and
+/// block on CUDA the mixed coder op does the same in the table of the mixer weights (two read
+/// backs of 24 bytes; the match model and the mixer run on the host). On wgpu the GPU gives
+/// the full weights of a mixed block back (about 402 KB for each token of GPT-2 small), and
 /// the mixer and the decoder run on `options.threads` CPU threads. Raw and zstd blocks do not
 /// use the GPU.
 ///
@@ -374,9 +376,11 @@ fn decode_on_gpu(
             (Some(Err(e)), _) => errors.push((b.index(), e)),
             (None, kind) => {
                 // NOTE: the parser refuses a mixed block without a rule version in the header.
+                // The decoder and the mixer state are made when the block enters a GPU slot
+                // (`gpu_unfold::Job`), so the memory does not grow with the block count.
                 let mix = match (kind, rule) {
                     (BlockKind::Coded, _) => None,
-                    (BlockKind::Mixed, Some(r)) => Some(MixState::new(r)),
+                    (BlockKind::Mixed, Some(r)) => Some(r),
                     _ => {
                         errors.push((
                             b.index(),
@@ -388,10 +392,13 @@ fn decode_on_gpu(
                         continue;
                     }
                 };
-                match BlockDecoder::new(model, b.stored(), b.index(), b.original_len(), mix) {
-                    Ok(decoder) => jobs.push(Job { part, index: b.index(), decoder }),
-                    Err(e) => errors.push((b.index(), e)),
-                }
+                jobs.push(Job {
+                    part,
+                    index: b.index(),
+                    payload: b.stored(),
+                    original_len: b.original_len(),
+                    mix,
+                });
             }
         }
     }

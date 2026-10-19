@@ -33,6 +33,30 @@ pub(crate) struct Answer {
     pub(crate) interval: CodeInterval,
 }
 
+/// The table of one input of the mixed coder op (`hardshell_cuda::MixInput`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Table {
+    /// The table of GPT-2 alone (a coded block).
+    Plain,
+    /// The table of the mixer weights with this prediction of the match model (a mixed block).
+    Mixed(Option<TokenId>),
+}
+
+/// The statistics of the HardShell weights `w` of one input for the host mixer
+/// (`hardshell_cuda::MixStats`): `sum(w)`, `w[p]`, and the token with the largest weight (the
+/// lowest id on a tie, token 0 if every weight is 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Stats {
+    pub(crate) total: u64,
+    pub(crate) predicted: u64,
+    pub(crate) top: TokenId,
+}
+
+/// The host step of the mixed coder op: input index and statistics in, the probability `q`
+/// of the predicted token (units of 2^-16, `1..=65535`) out. The op calls it for each input
+/// with a prediction, in input order.
+pub(crate) type HostMixer<'f> = dyn FnMut(usize, Stats) -> u32 + 'f;
+
 /// Many sessions of one model on one GPU.
 pub(crate) trait Lanes {
     /// The number of slots.
@@ -55,6 +79,37 @@ pub(crate) trait Lanes {
     /// Runs the inputs and gives the weights of each input, `vocab` values each, in input
     /// order.
     fn weights(&mut self, inputs: &[(usize, TokenId)]) -> Result<Vec<u64>>;
+
+    /// `true` if the backend has the mixed coder op ([`Lanes::mixed`] and [`Lanes::dual`]).
+    fn has_mixer(&self) -> bool {
+        false
+    }
+
+    /// As [`Lanes::coded`], but the answer of input `i` is in the table that `tables[i]`
+    /// names; `mixer` is the host step (ADR 0016 §5). After an error, the caller drops the
+    /// mixer states that `mixer` changed.
+    fn mixed(
+        &mut self,
+        _inputs: &[(usize, TokenId)],
+        _queries: &[Query],
+        _tables: &[Table],
+        _mixer: &mut HostMixer<'_>,
+    ) -> Result<Vec<Answer>> {
+        Err(self.backend().fault("the backend has no mixed coder op"))
+    }
+
+    /// The two answers of each input for the encoder of the profile `logs`: the interval of
+    /// `tokens[i]` in the table of GPT-2 alone (first) and in the mixer table with the
+    /// prediction `predictions[i]` (second), from one forward pass.
+    fn dual(
+        &mut self,
+        _inputs: &[(usize, TokenId)],
+        _tokens: &[TokenId],
+        _predictions: &[Option<TokenId>],
+        _mixer: &mut HostMixer<'_>,
+    ) -> Result<Vec<(Answer, Answer)>> {
+        Err(self.backend().fault("the backend has no mixed coder op"))
+    }
 }
 
 fn freq_bits() -> Result<FreqBits> {
@@ -110,14 +165,7 @@ impl Lanes for CudaLanes<'_> {
     }
 
     fn coded(&mut self, inputs: &[(usize, TokenId)], queries: &[Query]) -> Result<Vec<Answer>> {
-        use hardshell_cuda::CoderQuery;
-        let q: Vec<CoderQuery> = queries
-            .iter()
-            .map(|q| match *q {
-                Query::Encode(t) => CoderQuery::Encode(t),
-                Query::Decode(x) => CoderQuery::Decode(x),
-            })
-            .collect();
+        let q = cuda_queries(queries);
         let out =
             self.batch.run_coded(inputs, &q, FREQ_BITS).map_err(|e| Backend::Cuda.fault(e))?;
         out.iter().map(|a| answer(Backend::Cuda, a.symbol, a.start, a.freq, a.is_last)).collect()
@@ -126,6 +174,73 @@ impl Lanes for CudaLanes<'_> {
     fn weights(&mut self, inputs: &[(usize, TokenId)]) -> Result<Vec<u64>> {
         self.batch.run_weights(inputs).map_err(|e| Backend::Cuda.fault(e))
     }
+
+    fn has_mixer(&self) -> bool {
+        true
+    }
+
+    fn mixed(
+        &mut self,
+        inputs: &[(usize, TokenId)],
+        queries: &[Query],
+        tables: &[Table],
+        mixer: &mut HostMixer<'_>,
+    ) -> Result<Vec<Answer>> {
+        use hardshell_cuda::MixInput;
+        let q = cuda_queries(queries);
+        let t: Vec<MixInput> = tables
+            .iter()
+            .map(|t| match *t {
+                Table::Plain => MixInput::Plain,
+                Table::Mixed(p) => MixInput::Mixed(p),
+            })
+            .collect();
+        let out = self
+            .batch
+            .run_coded_mixed(inputs, &q, &t, FREQ_BITS, |i, s| mixer(i, stats_of(s)))
+            .map_err(|e| Backend::Cuda.fault(e))?;
+        if out.len() != inputs.len() {
+            return Err(Backend::Cuda.fault("the mixed coder op gave too few intervals"));
+        }
+        out.iter().map(|a| answer(Backend::Cuda, a.symbol, a.start, a.freq, a.is_last)).collect()
+    }
+
+    fn dual(
+        &mut self,
+        inputs: &[(usize, TokenId)],
+        tokens: &[TokenId],
+        predictions: &[Option<TokenId>],
+        mixer: &mut HostMixer<'_>,
+    ) -> Result<Vec<(Answer, Answer)>> {
+        let out = self
+            .batch
+            .run_coded_dual(inputs, tokens, predictions, FREQ_BITS, |i, s| mixer(i, stats_of(s)))
+            .map_err(|e| Backend::Cuda.fault(e))?;
+        if out.len() != inputs.len() {
+            return Err(Backend::Cuda.fault("the dual coder op gave too few intervals"));
+        }
+        let one = |a: &hardshell_cuda::CoderInterval| {
+            answer(Backend::Cuda, a.symbol, a.start, a.freq, a.is_last)
+        };
+        out.iter().map(|(p, m)| Ok((one(p)?, one(m)?))).collect()
+    }
+}
+
+/// The queries of the CUDA coder op.
+fn cuda_queries(queries: &[Query]) -> Vec<hardshell_cuda::CoderQuery> {
+    use hardshell_cuda::CoderQuery;
+    queries
+        .iter()
+        .map(|q| match *q {
+            Query::Encode(t) => CoderQuery::Encode(t),
+            Query::Decode(x) => CoderQuery::Decode(x),
+        })
+        .collect()
+}
+
+/// The statistics of the CUDA stats kernel.
+fn stats_of(s: hardshell_cuda::MixStats) -> Stats {
+    Stats { total: s.total, predicted: s.predicted, top: s.top }
 }
 
 /// The portable backend: [`GpuBatch`], one input for each slot in a call. A slot whose context

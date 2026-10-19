@@ -73,6 +73,7 @@ mod lanes;
 mod mix;
 mod parallel;
 mod payload;
+mod selftest;
 pub mod stream;
 pub mod tokenizer;
 
@@ -125,6 +126,26 @@ pub const CONTAINER_WRITES: u16 = taco_format::VERSION;
 
 /// The `.hsm` model-file versions that [`Model::load`] reads.
 pub const MODEL_FILE_READS: [u32; 2] = [hardshell::hsm::VERSION_1, hardshell::hsm::VERSION_2];
+
+/// The spread rule ([`FoldOptions::block_size_for`]): the most blocks that it aims for.
+///
+/// NOTE: measured on devbox (CUDA, RTX 3060 at 95 W, profile `text`, `gpt2.hsm`), bytes and
+/// `taco unfold` seconds against the block size 16 / 8 / 4 / 2 KiB: cp.html (24,603 bytes)
+/// 4,775 / 4,846 / 4,886 / 4,930 bytes, 13.7 / 8.2 / 4.7 / 4.1 s; lcet10.txt (426,754 bytes)
+/// 91,643 / 91,936 / 92,534 / 95,123 bytes, 17.7 / 13.5 / 10.7 / 8.0 s; alice29.txt 38,939 /
+/// 39,116 / 39,674 / 39,934 bytes. With 64 blocks the rule gives cp.html and alice29 4 KiB
+/// (+2.3 %, +1.9 %) and lcet10 8 KiB (+0.3 %); a file of 1 MiB or more keeps 16 KiB.
+pub const SPREAD_BLOCKS: usize = 64;
+
+/// The smallest block of the spread rule: 4 KiB. Blocks of 2 KiB cost 2.6 % to 3.8 % more
+/// bytes than 16 KiB on cp.html, alice29 and lcet10 (measured, see [`SPREAD_BLOCKS`]).
+// NOTE: the compiler evaluates this constant. A panic here is a build error, not a run-time
+// panic, and 4 KiB is not 0.
+#[allow(clippy::panic)]
+pub const SPREAD_MIN_BLOCK: BlockSize = {
+    let Ok(b) = BlockSize::new(4 * 1024) else { panic!("the block size is not 0") };
+    b
+};
 
 /// The model hash of `model` as the container stores it.
 ///
