@@ -110,25 +110,31 @@ Owner decisions of 2026-10-18 evening (Rohit):
 - Later ideas for speed (not started): speculative decoding with the match model, a skip of the
   model for very confident tokens, small specialist models (5M to 20M).
 
-## 4b. State at the end of the session of 2026-10-18 (read this first)
+## 4b. State on 2026-10-19 at about 05:00 +04 (read this first)
 
-Committed and pushed: CUDA backend (2367f15), CPU SIMD (2319ea7), container version 2 with
-zstd (71a1192, xcheck PASS), taco-match crate and ADR 0010 (proposed) with the logs results.
-Logs result (simulation of the exact integer rules, 1 MiB blocks): GPT-2 + match 0.497 bits per
-byte against xz 0.554 and zstd --long 0.597 on 16 Loghub files. Not yet wired into `taco fold`.
-Agents that may still run (uncommitted work in the tree): kernels (CUDA tuning), finetune
-(now on the RTX 3060, artifacts in ~/taco-train on devbox), bench (benchmark notes), profile
-(the logs profile in fold/unfold).
+Committed and pushed overnight (newest last): Route A (2aa86bb), CUDA tuning (f26bca1), exact
+conversion ADR 0014 (5682f46), logs profile in fold/unfold (870ffaf), Windows check
+(92001b9), GPU backends in the CLI (8395a41), real logs-profile sizes (2f5dc5c), context
+overlap + model-file version 2 + GPU refusal of version-2 models (2bdeac5). xcheck PASS
+(11 of 11) after each engine or format change. Windows: 9 of 9 .taco files equal the Mac.
 
-**Colab lesson (2026-10-18):** the free tier terminated both GPU sessions (after 16 min, and
-after about 3 h while the model downloaded at about 20 MB per minute). The second training run
-finished (best float val 0.217 bits per byte), but the model was lost with the VM. Do not use
-the free tier for long jobs. Keep job outputs on a machine we control. Next: wire the logs profile into fold/unfold (ADR 0010, 0012), then
-speculative decoding and the skip rule, then the number/field model for logs.
+Key measured results:
+- Logs profile, 16 Loghub logs, 1 MiB blocks: 0.489 bits per byte (xz 0.554, zstd --long
+  0.597); smallest on 17 of 18 logs. 16 KiB blocks: 0.657 (xz 0.966).
+- GPU in the CLI (text profile, RTX 3060 at 45 W): fold 28-42 KB/s, unfold 9-17 KB/s (CPU
+  1.6 / 0.4). The logs profile still folds on the CPU (needs the GPU mixer).
+- CUDA: full-window decode 8.7-9.2k tokens/s (gate 10k not met; the GPU is power-capped at
+  45 W, default 80 W), prefill up to 40k tokens/s.
+- Route A (log-fine-tuned distilgpt2): -53% on systems seen in training, a tie with GPT-2 on
+  unseen systems. With model-file version 2 (recipe wide) its integer loss is ~0%. Customer-
+  specific fine-tunes are the strong product case.
+- Context overlap K = 512: English -2%, HTML -6%, Apache log -20.6%; not yet in fold/unfold.
 
-**Owner requirement (ADR 0014, 2026-10-19, important):** model conversion must be exact and
-give the same model file on every machine. The current converter uses floats; it gave the same
-hash on the Mac and devbox, but that is not guaranteed. Implement ADR 0014 before version 1.
+Agents running at 05:00: overlap (K in the container and fold/unfold, defaults: logs K = 512),
+gpumixer (the mixer on the GPU in hardshell-cuda). Status files in .agent-status/.
+
+Open items for Rohit: the GPU power cap (laptop power mode); the patent freedom-to-operate
+check before commercial use; the business validation steps (customer conversations).
 
 ## 5. Next steps, in order
 
