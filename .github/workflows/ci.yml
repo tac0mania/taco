@@ -1,0 +1,227 @@
+# Continuous integration of Taco. docs/ci.md tells what runs where, and why.
+#
+# Jobs:
+#   check        Linux x86-64: the comment tags, no floats, fmt, clippy, all workspace tests.
+#   conformance  One job for each machine: the golden tests (the conformance vectors) and
+#                scripts/conformance (fixed inputs through conformance/tiny.hsm). Each job
+#                uploads its list of SHA-256 hashes as an artifact.
+#   compare      Compares the lists of all machines. A difference fails the run (CLAUDE.md
+#                §1 rule 7, plan §11.3).
+#
+# COST RULE. The repository is private, so the free minutes of GitHub count. A macOS minute
+# costs 10 Linux minutes, and a Windows minute costs 2 Linux minutes (published, GitHub
+# billing, free tier multipliers). Thus macOS and Windows run only on workflow_dispatch (by
+# hand) and on the weekly schedule, not on each push or pull request. Linux x86-64 and Linux
+# ARM64 run on each push and pull request.
+#
+# The full cross-machine check with GPT-2 (scripts/xcheck, scripts/wcheck) needs the 127 MB
+# model file, which is not in the repository. It stays a manual check (docs/ci.md).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Each Monday at 03:17 UTC: all four machines, macOS and Windows included.
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # A new push to a pull request stops the old run. Runs on main always finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # The same as scripts/dx: no debug information in the dev profile, so builds are smaller.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: check (Linux x86-64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the toolchain of rust-toolchain.toml
+        run: |
+          if ! command -v rustup > /dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          # rustup 1.28 and later: "toolchain install" without a name reads rust-toolchain.toml.
+          rustup toolchain install || rustup show
+          rustup show active-toolchain
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check
+          # Pull requests read the cache of main and do not write their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Comment tags (CLAUDE.md §4)
+        run: scripts/check-tags.sh
+
+      - name: No floats in the kernel crates (CLAUDE.md §1 rule 1)
+        run: scripts/check-no-floats.sh
+
+      - name: Format
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path scripts/conformance/Cargo.toml -- --check
+
+      - name: Clippy
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cp Cargo.lock scripts/conformance/Cargo.lock
+          cargo clippy --manifest-path scripts/conformance/Cargo.toml --target-dir target -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --no-fail-fast
+
+      # The runner has no GPU. The tests of hardshell-cuda and hardshell-gpu then skip: no CUDA
+      # driver library, and no GPU adapter (wgpu does not use software adapters such as
+      # llvmpipe or lavapipe). Any other device error still fails a test. This step shows the
+      # skips in the summary, so that a reader sees that the GPU paths did not run here.
+      - name: Show the GPU tests that skipped
+        run: |
+          cargo test -q -p hardshell-gpu -p hardshell-cuda -- --nocapture > gpu-tests.log 2>&1
+          cargo test -q -p taco --test backends -- --nocapture >> gpu-tests.log 2>&1
+          {
+            echo "### GPU tests on this runner"
+            echo
+            echo "| Message | Tests |"
+            echo "|---|---:|"
+            { grep -hoE "SKIPPED, no (GPU adapter found|CUDA device)|skip (cuda|gpu)" gpu-tests.log || true; } |
+              sort | uniq -c | awk '{n=$1; $1=""; print "|" $0 " | " n " |"}'
+            echo
+            echo "A real GPU run is manual: scripts/wcheck, and the GPU tests on devbox (docs/ci.md)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  conformance:
+    name: conformance (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-latest (x86-64) and ubuntu-24.04-arm (ARM64) always. macos-latest (ARM64)
+        # and windows-latest (x86-64) only on workflow_dispatch and schedule (the cost rule
+        # above). Set the repository variable TACO_CI_ARM_LINUX to "false" to remove the ARM64
+        # Linux job, for example if the plan of the account has no ARM64 runners.
+        os: ${{ fromJSON(format('["ubuntu-latest"{0}{1}]', vars.TACO_CI_ARM_LINUX != 'false' && ',"ubuntu-24.04-arm"' || '', (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && ',"macos-latest","windows-latest"' || '')) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      # One target directory for the root workspace and for scripts/conformance (its own
+      # workspace), so the cache holds both.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the toolchain of rust-toolchain.toml
+        run: |
+          if ! command -v rustup > /dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          # rustup 1.28 and later: "toolchain install" without a name reads rust-toolchain.toml.
+          rustup toolchain install || rustup show
+          rustup show active-toolchain
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: conformance
+          workspaces: |
+            . -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The golden tests compare the outputs of HardShell, the coder, the match model and the
+      # container with the hashes that the Mac recorded (conformance/README.md, HANDOFF.md §2).
+      - name: Golden tests (the conformance vectors)
+        run: |
+          cargo test --no-fail-fast \
+            -p taco-coder -p hardshell -p taco-format -p taco-match -p taco \
+            --test golden --test gpt2 --test context --test wide --test hsm_merges \
+            --test version2 --test zstd --test container --test logs_profile
+
+      # The program uses the dependency versions of the root Cargo.lock (scripts/conformance/Cargo.toml).
+      - name: Conformance program (fixed inputs through conformance/tiny.hsm)
+        run: |
+          cp Cargo.lock scripts/conformance/Cargo.lock
+          cargo run --manifest-path scripts/conformance/Cargo.toml -- --out conformance-out
+
+      - name: Upload the list of hashes
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-${{ runner.os }}-${{ runner.arch }}
+          path: conformance-out/
+          if-no-files-found: error
+          retention-days: 30
+
+  compare:
+    name: compare the machines
+    needs: conformance
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: conformance-*
+          path: lists
+
+      - name: Compare the SHA256SUMS of all machines
+        env:
+          CONFORMANCE_RESULT: ${{ needs.conformance.result }}
+        run: |
+          set -euo pipefail
+          fail=0
+          shopt -s nullglob
+          lists=(lists/*/SHA256SUMS)
+          ref=lists/conformance-Linux-X64/SHA256SUMS
+          [ -f "$ref" ] || ref=${lists[0]:-}
+          {
+            echo "### Cross-machine conformance"
+            echo
+            echo "Reference: \`${ref:-none}\`"
+            echo
+            echo "| Machine | Hashes | Result |"
+            echo "|---|---:|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${#lists[@]}" -lt 2 ]; then
+            echo "compare: only ${#lists[@]} list(s); a machine did not upload its list" >&2
+            fail=1
+          fi
+          for l in "${lists[@]}"; do
+            m=$(basename "$(dirname "$l")"); m=${m#conformance-}
+            n=$(wc -l < "$l" | tr -d ' ')
+            if diff -u "$ref" "$l" > "diff-$m.txt"; then
+              echo "| $m | $n | same |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| $m | $n | DIFFERENT |" >> "$GITHUB_STEP_SUMMARY"
+              echo "compare: $m differs from $ref:"; cat "diff-$m.txt"
+              fail=1
+            fi
+          done
+          if [ "$CONFORMANCE_RESULT" != "success" ]; then
+            echo "compare: a conformance job did not pass ($CONFORMANCE_RESULT)" >&2
+            fail=1
+          fi
+          [ $fail -eq 0 ] && echo "compare: PASS, ${#lists[@]} machines give the same hashes"
+          exit $fail
