@@ -65,9 +65,11 @@ bits per byte; bzip2 gives 2.36, xz 2.51 and zstd 2.52.
 | Check | Result |
 |---|---|
 | Tests on x86 Linux with the hashes that the ARM Mac recorded | 234 of 234 pass |
-| Mac folds, Linux unfolds (9 inputs) | 9 of 9 restored |
-| Linux folds, Mac unfolds | 9 of 9 restored |
-| Same input on both machines | 9 of 9 `.taco` files identical |
+| Mac folds, Linux unfolds (`scripts/xcheck`, 12 inputs) | 12 of 12 restored |
+| Linux folds, Mac unfolds | 12 of 12 restored |
+| Same input on both machines | 12 of 12 `.taco` files identical |
+| Native Windows x86 against the Mac (`scripts/wcheck`) | 9 of 9 `.taco` files identical, 9 of 9 restored |
+| CUDA, wgpu (Metal, GL) and CPU | the same bytes (overlap note, 14 of 14 GPU cases) |
 
 For comparison, a float model fails: when the encoder and the decoder used two float code
 paths on the same Mac, 269 of 270 windows did not decode.
@@ -140,8 +142,8 @@ flowchart LR
 ```
 
 - **Blocks** are independent. Many blocks can run in parallel, and damage stays in one block.
-- A block that does not become smaller is stored **raw**. The worst-case growth is 88 bytes of
-  header plus 5 bytes for each block.
+- A block that does not become smaller is stored **raw**. The worst-case growth is 104 bytes of
+  header plus 5 bytes for each block (container version 2, ADR 0011 §8).
 - The decoder **never tokenizes**. It only changes token ids to bytes.
 - The container stores the **SHA-256 of the model file** and of the original data. A wrong model
   or a damaged file gives an error, never a silent wrong output.
@@ -205,6 +207,9 @@ taco/
 ├── crates/
 │   ├── taco-coder/        range coder and frequency tables
 │   ├── hardshell/         integer engine and model-file reader
+│   ├── hardshell-cuda/    NVIDIA backend (precompiled PTX)
+│   ├── hardshell-gpu/     portable GPU backend (wgpu: Vulkan, Metal, DX12, GL)
+│   ├── taco-match/        match model and mixer (profile logs)
 │   ├── taco-format/       .taco container
 │   ├── taco/              tokenizer, fold, unfold
 │   └── taco-cli/          the taco command
@@ -212,7 +217,7 @@ taco/
 │   ├── baseline/          downloads, float GPT-2, measurements
 │   └── convert/           model conversion and the tiny model
 ├── conformance/           tiny.hsm and its hash (conformance vectors)
-├── scripts/               dx (devbox), mx (Mac), check.sh, xcheck
+├── scripts/               dx (devbox), mx (Mac), check.sh, xcheck, wcheck, conformance/, release/
 ├── docs/
 │   ├── design/            plan.md, anymodel.md, product-v1.md
 │   ├── adr/               decisions (ADRs)
@@ -230,7 +235,7 @@ taco/
 
 | Item | Version | Why |
 |---|---|---|
-| macOS (Apple Silicon or x86) or Linux (x86 or ARM) | — | Windows is planned |
+| macOS (Apple Silicon or x86), Linux (x86 or ARM) or Windows x86 | — | Windows: tested natively (`docs/research/2026-10-19-windows.md`) |
 | [rustup](https://rustup.rs) | any | `rust-toolchain.toml` selects Rust 1.99.0 automatically |
 | [uv](https://docs.astral.sh/uv/) | a recent version | runs the Python tools (Python 3.12) |
 | Disk | about 1.5 GB | GPT-2 weights (548 MB), corpus, `gpt2.hsm` (127 MB), build output |
@@ -344,7 +349,7 @@ Golden tests hold the SHA-256 of fixed outputs: the coder stream, the HardShell 
 tiny model, the container, and a full `taco` container. They must pass unchanged on every
 machine.
 
-`scripts/xcheck` folds 9 inputs on the Mac, unfolds them on devbox, folds them on devbox, unfolds
+`scripts/xcheck` folds 12 inputs on the Mac, unfolds them on devbox, folds them on devbox, unfolds
 those on the Mac, and compares all `.taco` files. Run it after every change to HardShell, the
 coder, the tokenizer or the container. It takes about 40 minutes with the reference engine.
 
@@ -373,9 +378,9 @@ vectors, and an ADR. See `CLAUDE.md` §1 and §8.
 | 0, 1 | Float baseline and float drift measurement | Done |
 | 2 | Reference implementation, bit-exact on two machines | **Done (gate passed)** |
 | 3 | Quality: integer model within 0.2% of float | Done for text |
-| 4 | Speed: CPU SIMD, CUDA (gate: 10,000 tokens/s on the RTX 3060), portable GPU (AMD, Intel, Apple) | In progress |
+| 4 | Speed: CPU SIMD, CUDA (gate: 10,000 tokens/s on the RTX 3060), portable GPU (AMD, Intel, Apple) | Gate passed: 20,472 tokens/s at 95 W (`docs/research/2026-10-19-full-power.md`) |
 | 5 | Two profiles: `text` (GPT-2) and `logs` (log model, match model, mixer, skip rule, speculative decoding) | In progress (ADR 0012) |
-| 6 | Container version 2 (profiles, zstd blocks for binary data), streaming, builds for macOS, Linux and Windows, release | Planned (`docs/design/product-v1.md`) |
+| 6 | Container version 2 (profiles, zstd blocks, context overlap), streaming, builds for macOS, Linux and Windows, release | Container version 2 built; CI and release scripts built; streaming and the release planned |
 | 7 | Other models with an automatic converter | Designed (`docs/design/anymodel.md`) |
 
 ---

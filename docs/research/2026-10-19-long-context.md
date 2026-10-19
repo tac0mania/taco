@@ -22,7 +22,8 @@ number has a different label.
 - **The cost is exact and known.** A restart runs `K + 1` rows for `n_ctx - 1 - K` new
   tokens: 34 % more rows with `K = 256`, 100 % with `K = 512`, 302 % with `K = 768` (long
   blocks). The time grows less than the rows. With `K = 512`: the CPU step path (the decoder)
-  takes 24 % more time, the CPU prefill path (the encoder) 41 % more, the GPU window path 83 %
+  takes 24 % more time (NOTE: one thread, `cp.html`, Mac. ADR 0012 gives +39 % for the CPU
+  unfold of a whole log at 16 KiB blocks with 6 threads on devbox; the setups differ), the CPU prefill path (the encoder) 41 % more, the GPU window path 83 %
   to 100 % more.
 - **Every path gives the same bits.** The oracle, the CPU step, prefill and batch paths (NEON
   on the Mac, AVX2 on devbox) and the CUDA decode and prefill paths (RTX 3060) give the same

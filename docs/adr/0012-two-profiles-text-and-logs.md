@@ -18,11 +18,14 @@ is a model file and a set of coding parts.
 | Profile | Model file | Coding parts | Target data |
 |---|---|---|---|
 | `text` | `gpt2.hsm` (GPT-2 small, 124M) | HardShell only | prose, documents, HTML, code |
-| `logs` | the best log model of Route A (or `gpt2.hsm` if Route A loses) | HardShell, match model, mixer, skip rule | logs, JSON lines, CSV, telemetry |
+| `logs` | the best log model of Route A (or `gpt2.hsm` if Route A loses) | HardShell, match model, mixer, skip rule (planned, not built) | logs, JSON lines, CSV, telemetry |
 
 - `taco fold --profile text|logs|auto`. `auto` is the default. The encoder selects the profile
   from a sample of the input. Only the encoder selects, so the selection rule does not need to
   be the same on every machine.
+  NOTE (2026-10-19): the built rule is different. `auto` codes every block as `logs` and
+  writes a `text` container when no block is mixed (ADR 0010 §5.8,
+  `docs/research/2026-10-19-logs-profile.md`). It does not use a sample.
 - The container records the model hash and the profile. `taco unfold` reads both, so the user
   never names a profile to decode.
 - Both profiles obey every rule of `CLAUDE.md` §1: integer-only prediction, conformance vectors,
