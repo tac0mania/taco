@@ -5,6 +5,7 @@ description = "Taco: the library. Tokenizer, HardShell, range coder and containe
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 hardshell = { path = "../hardshell" }

@@ -5,6 +5,7 @@ description = "HardShell: the integer-only inference engine of Taco, and the .hs
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 thiserror.workspace = true

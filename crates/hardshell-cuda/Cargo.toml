@@ -5,6 +5,7 @@ description = "HardShell on NVIDIA GPUs: the integer GPT-2 of hardshell with int
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 hardshell = { path = "../hardshell" }

@@ -1,6 +1,7 @@
 [project]
 name = "taco-tools"
 version = "0.1.0"
+license = "Apache-2.0"
 description = "Taco tools that run before publication: float baselines and measurements."
 requires-python = ">=3.12,<3.13"
 dependencies = [
