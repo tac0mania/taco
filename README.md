@@ -331,6 +331,7 @@ big-endian and 32-bit CPUs; phones and browsers.
 | **Untrusted model files** | A model file can state a very large KV cache (finding F6, open). Load only the published `gpt2.hsm`. |
 | **Wide models** | Model-file version 2 runs on the CPU and with CUDA, not on wgpu yet. The default `gpt2.hsm` is version 1 and runs everywhere. |
 | **Format** | Container version 2 is frozen: later versions of Taco read the files of this version. |
+| **Release 0.1.0-alpha.1** | Its programs fold the default profile `auto` on the CPU (use `--profile text` for the GPU), and a crafted `.taco` file can use about 11 GB in GPU unfold (F2; use `--backend cpu` for untrusted files). Both are fixed on `main`; the GPU logs speeds above are from `main`. |
 
 ---
 
