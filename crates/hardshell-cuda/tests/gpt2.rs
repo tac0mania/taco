@@ -50,6 +50,31 @@ fn golden_conformance_hash_on_cuda() {
 }
 
 #[test]
+fn load_with_the_cpu_model_gives_the_golden_hash_and_another_file_keeps_its_hash() {
+    let Some(dev) = device("load_with_the_cpu_model") else { return };
+    let b = build(tiny_dims(), 0x7ac0_0001, 64);
+    let cpu = Model::load(&b.bytes).unwrap();
+    let m = CudaModel::load_with(&dev, &b.bytes, &cpu).unwrap();
+    assert_eq!(format!("{}", m.hash()), GOLDEN_MODEL);
+    let mut s = CudaSession::new(&m).unwrap();
+    let mut h = Sha256::new();
+    for x in s.start_block().unwrap() {
+        h.update(x.to_le_bytes());
+    }
+    for t in tokens(0x7ac0_0002, 150, 300) {
+        for x in s.step(t).unwrap() {
+            h.update(x.to_le_bytes());
+        }
+    }
+    assert_eq!(hex(&h.finalize()), GOLDEN_OUTPUT);
+    // A CPU model of another file: the result is the model of the bytes, with their hash.
+    let other = build(tiny_dims(), 0x7ac0_0009, 64);
+    let m = CudaModel::load_with(&dev, &other.bytes, &cpu).unwrap();
+    assert_eq!(m.hash(), Model::load(&other.bytes).unwrap().hash());
+    assert_ne!(format!("{}", m.hash()), GOLDEN_MODEL);
+}
+
+#[test]
 fn golden_conformance_hash_with_prefill() {
     // The same vector in one call: 151 rows of one slot, with two restarts, in passes of 40 rows.
     let Some(dev) = device("golden_conformance_hash_with_prefill") else { return };

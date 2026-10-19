@@ -241,12 +241,37 @@ impl<'d> CudaModel<'d> {
     /// driver error (for example, not enough memory).
     pub fn load(dev: &'d CudaDevice, bytes: &[u8]) -> Result<Self> {
         let cpu = hardshell::gpt2::Model::load(bytes)?;
+        Self::load_with(dev, bytes, &cpu)
+    }
+
+    /// [`CudaModel::load`] for a caller that already loaded the CPU model `cpu` from `bytes`:
+    /// the CPU load is not made a second time. Cost: one parse of the file (one SHA-256) and
+    /// one upload.
+    ///
+    /// NOTE: the second CPU load cost about 0.4 s of each CUDA start on devbox (measured,
+    /// gpucli2 trace: `CudaModel::load` 0.6 to 0.9 s, the CLI model load 0.35 to 0.5 s).
+    ///
+    /// If `cpu` is not the model of `bytes` (the file hashes differ), this is
+    /// [`CudaModel::load`]: the result has the hash of `bytes`.
+    ///
+    /// # Errors
+    /// The errors of [`CudaModel::load`].
+    pub fn load_with(
+        dev: &'d CudaDevice,
+        bytes: &[u8],
+        cpu: &hardshell::gpt2::Model,
+    ) -> Result<Self> {
         // DETERMINISM: the kernels implement the rules of model-file version 1 and the three
         // rules of version 2 (ADR 0004 addendum B). tests/wide.rs proves them equal to the CPU
         // reference. A later version has a new reader, which `Model::load` refuses until then.
         let (eot, hash, wide) = (cpu.eot_token(), cpu.hash(), cpu.is_wide());
-        drop(cpu);
         let file = HsmFile::parse(bytes)?;
+        // INVARIANT: the hash of the file is the hash of `cpu`, so `Model::load` checked these
+        // bytes, and the version and the shapes are the ones that it accepts. Another file gets
+        // its own CPU load, as in `load`; the caller then sees its hash.
+        if file.hash() != hash {
+            return Self::load(dev, bytes);
+        }
         let c = file.config().clone();
         let head_dim = c.d_model / c.n_head.max(1);
         if !c.d_model.is_multiple_of(4) || !head_dim.is_multiple_of(4) || head_dim > 256 {
