@@ -1,0 +1,51 @@
+# The cross-machine conformance program of CI (docs/ci.md, plan §11.3).
+#
+# This package is its own workspace: it is not a member of the root workspace, so it does not
+# change the root Cargo.toml or Cargo.lock. Copy the root Cargo.lock here before a build, so
+# that it uses the same dependency versions (CI and docs/ci.md do this):
+#
+#   cp Cargo.lock scripts/conformance/Cargo.lock
+#   cargo run --manifest-path scripts/conformance/Cargo.toml -- --out <directory>
+[package]
+name = "taco-conformance"
+version = "0.1.0"
+description = "Folds fixed inputs with conformance/tiny.hsm and writes the SHA-256 of every output"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+license = "Apache-2.0"
+
+[workspace]
+
+[dependencies]
+hardshell = { path = "../../crates/hardshell" }
+taco = { path = "../../crates/taco" }
+taco-coder = { path = "../../crates/taco-coder" }
+taco-match = { path = "../../crates/taco-match" }
+sha2 = "0.10"
+
+[lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+float_arithmetic = "deny"
+
+# The same profiles as the root Cargo.toml, so that the kernels run at the same speed in the
+# dev profile.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 1
+debug = false
+
+[profile.dev.package.hardshell]
+opt-level = 2
+
+[profile.dev.package.taco-coder]
+opt-level = 2
