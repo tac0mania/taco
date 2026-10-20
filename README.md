@@ -23,12 +23,26 @@ are shortened; the full output is in [`docs/img/try-output/`](docs/img/try-outpu
 > slow, and it is not a replacement for zstd or xz. Keep a second copy of data that you fold. Read
 > [Limits](#limits) before you use it.
 
-> [!NOTE]
-> **How this code was written.** Most of the code, the tests and the documents in this
-> repository were written by Claude (an AI model by Anthropic) with Claude Code, under the
-> direction of the author, to get to results faster. The author made the design decisions.
-> Trust the code only as far as the tests show: conformance vectors, the cross-machine check,
-> fuzzing and the comparison of every fast path with the reference path.
+## A note from me
+
+Hi, I made Taco. I work in ML and backend. I don't know Rust, CUDA or Vulkan.
+
+LLM compressors get great ratios, but they have one ugly problem: the model runs on floats,
+and floats round a little differently on different CPUs and GPUs. Compress on one machine,
+decompress on another, and one tiny difference can break the whole file. So moving a
+compressed file to different hardware is risky.
+
+My idea was simple: take floats out of the model completely. Convert GPT-2 to integers
+once, run every step in integer math, and every machine has to get the same answer. The
+design is mine. Claude (with Claude Code) wrote almost all of the code, the tests and the
+docs, because I can't write the GPU stuff myself. That's also why the docs below read like
+Claude. So don't trust the code because I say so, trust the tests: conformance hashes, the
+cross-machine check, fuzzing, and every fast path checked against the slow reference.
+
+It's slow and it's an alpha. The one thing I want you to try: run `./try` from the
+[release](https://github.com/tac0mania/taco/releases), and check that you get the same hash
+as everyone else. If your machine gives a different hash, that's a bug, and I really want to
+know about it. Open an issue.
 
 ## Contents
 
