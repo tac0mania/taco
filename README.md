@@ -13,6 +13,11 @@ taco fold notes.txt          # makes notes.txt.taco
 taco unfold notes.txt.taco   # restores notes.txt, byte for byte
 ```
 
+![The same compressed bytes on macOS, Linux and Windows](docs/img/try-3os.gif)
+
+*Real `./try` output of the 0.1.0 release on macOS (CPU), Linux (CUDA) and Windows (CUDA). Long lines
+are shortened; the full output is in [`docs/img/try-output/`](docs/img/try-output/).*
+
 > [!WARNING]
 > **Alpha: a proof of concept (version 0.1.0, 2026-10-19).** Taco is an experiment. It is
 > slow, and it is not a replacement for zstd or xz. Keep a second copy of data that you fold. Read

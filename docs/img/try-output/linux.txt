@@ -1,0 +1,10 @@
+Taco demo: fold and unfold 3672 bytes. This takes about 15 s to 1 minute.
+
+taco: fold ~/taco-demo-0.1.0/samples/sample.txt -> /tmp/taco-demo.pLhNbg/sample.txt.taco: 3672 -> 648 bytes, ratio 5.666, 1.411 bits per byte, profile text, blocks of 16384 bytes, overlap 0, 1 of 1 blocks coded and 0 mixed (profile text: 648 bytes), 829 tokens, backend cuda (NVIDIA GeForce RTX 3060 Laptop GPU), 2.4s (model load 272.8ms)
+taco: unfold /tmp/taco-demo.pLhNbg/sample.txt.taco -> /tmp/taco-demo.pLhNbg/sample.txt: 648 -> 3672 bytes, container version 2, checksum verified, backend cuda (NVIDIA GeForce RTX 3060 Laptop GPU), 2.3s (model load 238.1ms)
+
+PASS: the file came back byte for byte.
+Original: 3672 bytes. Folded: 648 bytes.
+Fold: 2 s. Unfold: 2 s.
+SHA-256 of the .taco file: 2fab1ef7a1c70cd4e39ddfd88a8d66389ae07a403111db131326ae425460652e
+Compare it with the value in README.md. It must be the same on every machine.

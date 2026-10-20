@@ -1,0 +1,53 @@
+name: Hash report
+description: Run ./try on your machine and report the hash. Each new machine extends the proof.
+title: "Hash report: <CPU or GPU>, <OS>"
+labels: ["hash-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you. Download `taco-demo-0.1.0.zip` from the Releases page, unpack it, and run
+        `./try` (macOS, Linux) or `try.cmd` (Windows). To test one backend, add
+        `--backend cpu`, `--backend cuda` or `--backend gpu`.
+
+        The expected SHA-256 is
+        `2fab1ef7a1c70cd4e39ddfd88a8d66389ae07a403111db131326ae425460652e`.
+  - type: dropdown
+    id: match
+    attributes:
+      label: Did your hash match?
+      options:
+        - "Yes, the same hash"
+        - "No, a different hash"
+        - "The demo did not run (error)"
+    validations:
+      required: true
+  - type: input
+    id: hash
+    attributes:
+      label: The SHA-256 that ./try printed
+      placeholder: 2fab1ef7...
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: CPU and GPU
+      placeholder: "e.g. Intel Core i7-12700H, Intel Iris Xe; or AMD Radeon RX 7800 XT"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version
+      placeholder: "e.g. Ubuntu 24.04, Windows 11 23H2, macOS 15.1"
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: The output of ./try (and ./taco --version)
+      description: Paste the whole output. The line "backend ..." shows which backend ran.
+      render: text
+    validations:
+      required: true
